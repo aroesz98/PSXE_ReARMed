@@ -32,6 +32,13 @@
 // #include "../mem_track.h"
 #endif
 
+// PXP hardware scaling definitions
+#define APP_PXP PXP
+#define APP_PXP_PS_FORMAT  kPXP_PsPixelFormatRGB565
+#define APP_PXP_OUT_FORMAT kPXP_OutputPixelFormatRGB565
+
+// Dynamic scaling selection: PXP for downscaling, software for upscaling
+
 // GPIO mapping for buttons (example - adjust based on your hardware)
 #define BUTTON_GPIO_PORT GPIO1
 #define BUTTON_CROSS_PIN 20
@@ -55,6 +62,15 @@ uint32_t screen_get_button_from_gpio(void)
     return button_mask;
 }
 
+// Static buffer for screen instance
+static psxe_screen_t g_screen_instance;
+static int32_t g_screen_instance_used = 0;
+
+// PXP configuration for hardware scaling
+static pxp_output_buffer_config_t g_pxp_output_config;
+static pxp_ps_buffer_config_t g_pxp_ps_config;
+static bool g_pxp_initialized = false;
+
 int32_t screen_get_base_width(psxe_screen_t *screen)
 {
     int32_t width = psx_get_dmode_width(screen->psx);
@@ -72,9 +88,48 @@ int32_t screen_get_base_width(psxe_screen_t *screen)
     return 320;
 }
 
-// Static buffer for screen instance
-static psxe_screen_t g_screen_instance;
-static int32_t g_screen_instance_used = 0;
+// Initialize PXP hardware scaling engine
+static void psxe_screen_init_pxp(void)
+{
+    if (g_pxp_initialized) {
+        return; // Already initialized
+    }
+
+    // Initialize PXP peripheral
+    PXP_Init(APP_PXP);
+
+    // Configure Process Surface (input) - will be updated per frame
+    g_pxp_ps_config.pixelFormat = APP_PXP_PS_FORMAT;
+    g_pxp_ps_config.swapByte = false;
+    g_pxp_ps_config.bufferAddr = 0U; // Will be set per frame
+    g_pxp_ps_config.bufferAddrU = 0U;
+    g_pxp_ps_config.bufferAddrV = 0U;
+    g_pxp_ps_config.pitchBytes = 0U; // Will be set per frame
+
+    // Set background color to black
+#if defined(FSL_FEATURE_PXP_V3) && FSL_FEATURE_PXP_V3
+    PXP_SetProcessSurfaceBackGroundColor(APP_PXP, 0U, 0U);
+#else
+    PXP_SetProcessSurfaceBackGroundColor(APP_PXP, 0U);
+#endif
+
+    // Disable Alpha Surface (AS)
+    PXP_SetAlphaSurfacePosition(APP_PXP, 0xFFFFU, 0xFFFFU, 0U, 0U);
+
+    // Configure Output buffer - will be updated per frame
+    g_pxp_output_config.pixelFormat = APP_PXP_OUT_FORMAT;
+    g_pxp_output_config.interlacedMode = kPXP_OutputProgressive;
+    g_pxp_output_config.buffer0Addr = 0U; // Will be set per frame
+    g_pxp_output_config.buffer1Addr = 0U;
+    g_pxp_output_config.pitchBytes = LCD_WIDTH * 2; // RGB565 = 2 bytes per pixel
+    g_pxp_output_config.width = LCD_WIDTH;  // Will be updated per frame
+    g_pxp_output_config.height = LCD_HEIGHT; // Will be updated per frame
+
+    // Disable CSC1 (Color Space Conversion)
+    PXP_EnableCsc1(APP_PXP, false);
+
+    g_pxp_initialized = true;
+}
 
 // static uint16_t __attribute__((section(".bss.$BOARD_SDRAM"))) g_temp_framebuffer[LCD_WIDTH * LCD_HEIGHT];
 
@@ -120,6 +175,9 @@ void psxe_screen_init(psxe_screen_t *screen, psx_t *psx)
 
     // Initialize MCU display system
     DEMO_InitLcd();
+
+    // Initialize PXP hardware scaling
+    psxe_screen_init_pxp();
 
     // Initialize framebuffer pointers using display support functions
     screen->framebuffer = (void *)DEMO_GetCurrentFrameBuffer();
@@ -374,54 +432,100 @@ void psxe_screen_update(psxe_screen_t *screen)
     int32_t x_offset = (dst_width - scaled_width) / 2;
     int32_t y_offset = (dst_height - scaled_height) / 2;
 
+    // Determine if we're downscaling or upscaling
+    // Downscaling: PSX resolution is larger than LCD resolution
+    // Upscaling: PSX resolution is smaller than LCD resolution
+    int32_t is_downscaling = (src_width > dst_width) || (src_height > dst_height);
+    int32_t use_pxp_scaling = is_downscaling;
+
     // Debug log occasionally
     static int32_t last_src_width = 0, last_src_height = 0;
     if (frame_count % 120 == 0 || src_width != last_src_width || src_height != last_src_height)
     {
-        PRINTF("Software scaling: %dx%d -> %dx%d, offset=(%d,%d)\r\n",
-               src_width, src_height, scaled_width, scaled_height, x_offset, y_offset);
+        if (use_pxp_scaling) {
+            PRINTF("PXP hardware scaling (downscale): %dx%d -> %dx%d, offset=(%d,%d)\r\n",
+                   src_width, src_height, scaled_width, scaled_height, x_offset, y_offset);
+            PRINTF("PSX buffer: 0x%08X, stride: %d, dst buffer: 0x%08X\r\n", 
+                   (uint32_t)src, PSX_GPU_FB_STRIDE, (uint32_t)dst);
+        } else {
+            PRINTF("Software scaling (upscale): %dx%d -> %dx%d, offset=(%d,%d)\r\n",
+                   src_width, src_height, scaled_width, scaled_height, x_offset, y_offset);
+        }
         last_src_width = src_width;
         last_src_height = src_height;
     }
 
-    // Clear the entire framebuffer to black
+    // Clear the entire framebuffer to black first
     memset(dst, 0, dst_width * dst_height * sizeof(uint16_t));
 
-    // Scale the PSX output to fit the MCU display with optimized scaling
-    // Pre-calculate fixed-point scale factors to avoid float division in loops
-    const int32_t scale_x_fp = (int32_t)((float)dst_width * 65536.0f / (float)src_width); // 16.16 fixed point
-    const int32_t scale_y_fp = (int32_t)((float)dst_height * 65536.0f / (float)src_height);
-    const int32_t scale_fp = (scale_x_fp < scale_y_fp) ? scale_x_fp : scale_y_fp;
-
-    // Use the smaller scale to maintain aspect ratio
-    const int32_t actual_scaled_width = (src_width * scale_fp) >> 16;
-    const int32_t actual_scaled_height = (src_height * scale_fp) >> 16;
-    const int32_t x_offset_opt = (dst_width - actual_scaled_width) / 2;
-    const int32_t y_offset_opt = (dst_height - actual_scaled_height) / 2;
-
-    // Pre-calculate source stride
-    const int32_t src_stride = PSX_GPU_FB_STRIDE / 2;
-    const int32_t max_src_idx = PSX_GPU_FB_STRIDE * PSX_GPU_FB_HEIGHT / 2;
-    const int32_t max_dst_idx = dst_width * dst_height;
-
-    for (int32_t dst_y = 0; dst_y < actual_scaled_height; dst_y++)
+    if (use_pxp_scaling)
     {
-        // Calculate source Y once per row using fixed-point
-        const int32_t src_y = (dst_y * 65536) / scale_fp;
-        const int32_t src_y_stride = src_y * src_stride;
-        const int32_t dst_y_offset = (dst_y + y_offset_opt) * dst_width + x_offset_opt;
+        // === Hardware PXP Scaling for Downscaling ===
+        
+        // Configure PXP Process Surface (input buffer)
+        g_pxp_ps_config.bufferAddr = (uint32_t)src;
+        // Use the correct PSX framebuffer stride - always use the full VRAM stride for PSX
+        g_pxp_ps_config.pitchBytes = PSX_GPU_FB_STRIDE; // PSX VRAM stride in bytes
+        PXP_SetProcessSurfaceBufferConfig(APP_PXP, &g_pxp_ps_config);
 
-        for (int32_t dst_x = 0; dst_x < actual_scaled_width; dst_x++)
+        // Configure PXP scaling: scale from source dimensions to output dimensions
+        PXP_SetProcessSurfaceScaler(APP_PXP, src_width, src_height, dst_width, dst_height);
+        
+        // Set the source region (what part of the input buffer to use)
+        // This defines the input area to be scaled - use full source area
+        PXP_SetProcessSurfacePosition(APP_PXP, 0, 0, src_width - 1U, src_height - 1U);
+
+        // Configure PXP output buffer - scale to full output size, we'll letterbox by clearing first
+        g_pxp_output_config.buffer0Addr = (uint32_t)dst;
+        g_pxp_output_config.width = dst_width;   // Full output width
+        g_pxp_output_config.height = dst_height; // Full output height
+        g_pxp_output_config.pitchBytes = dst_width * 2; // RGB565 = 2 bytes per pixel
+        PXP_SetOutputBufferConfig(APP_PXP, &g_pxp_output_config);
+
+        // Start PXP processing
+        PXP_Start(APP_PXP);
+
+        // Wait for PXP to complete processing
+        while (!(kPXP_CompleteFlag & PXP_GetStatusFlags(APP_PXP)))
         {
-            // Calculate source X using fixed-point arithmetic
-            const int32_t src_x = (dst_x * 65536) / scale_fp;
-            const int32_t src_idx = src_y_stride + src_x;
-            const int32_t dst_idx = dst_y_offset + dst_x;
+            // Hardware scaling in progress
+        }
 
-            // Simplified bounds checking
-            if (src_idx < max_src_idx && dst_idx < max_dst_idx)
+        // Clear completion flag
+        PXP_ClearStatusFlags(APP_PXP, kPXP_CompleteFlag);
+    }
+    else
+    {
+        // === Software Scaling for Upscaling ===
+        
+        // Pre-calculate source stride
+        const int32_t src_stride = PSX_GPU_FB_STRIDE / 2;
+        const int32_t max_src_idx = PSX_GPU_FB_STRIDE * PSX_GPU_FB_HEIGHT / 2;
+        const int32_t max_dst_idx = dst_width * dst_height;
+
+        // Use fixed-point arithmetic for better performance
+        const int32_t scale_x_fp = (src_width << 16) / scaled_width;   // 16.16 fixed point
+        const int32_t scale_y_fp = (src_height << 16) / scaled_height;
+
+        for (int32_t dst_y = 0; dst_y < scaled_height; dst_y++)
+        {
+            // Calculate source Y using fixed-point
+            const int32_t src_y = (dst_y * scale_y_fp) >> 16;
+            const int32_t src_y_stride = src_y * src_stride;
+            const int32_t dst_y_offset = (dst_y + y_offset) * dst_width + x_offset;
+
+            for (int32_t dst_x = 0; dst_x < scaled_width; dst_x++)
             {
-                dst[dst_idx] = src[src_idx];
+                // Calculate source X using fixed-point arithmetic
+                const int32_t src_x = (dst_x * scale_x_fp) >> 16;
+                const int32_t src_idx = src_y_stride + src_x;
+                const int32_t dst_idx = dst_y_offset + dst_x;
+
+                // Bounds checking
+                if (src_idx < max_src_idx && dst_idx < max_dst_idx)
+                {
+                    dst[dst_idx] = src[src_idx];
+                }
             }
         }
     }
