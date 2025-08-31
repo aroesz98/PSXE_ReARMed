@@ -1,0 +1,711 @@
+#include "mdec.h"
+#include "log.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <stdint.h>
+#include "jpeglib.h"
+
+// Static buffers for MDEC to avoid dynamic allocation
+#define MDEC_MAX_OUTPUT_SIZE (16 * 1024 * 1024) // 16MB max output buffer
+#define MDEC_MAX_INPUT_SIZE (64 * 1024)         // 64KB max input buffer (should be enough)
+
+static uint8_t __attribute__((section(".bss.$BOARD_SDRAM"))) g_mdec_output_buffer[MDEC_MAX_OUTPUT_SIZE];
+static uint32_t __attribute__((section(".bss.$SRAM_DTC"))) g_mdec_input_buffer[MDEC_MAX_INPUT_SIZE / sizeof(uint32_t)];
+static psx_mdec_t g_mdec_instance;
+static int32_t g_mdec_instance_in_use = 0;
+
+int32_t zigzag[] = {
+    0, 1, 5, 6, 14, 15, 27, 28,
+    2, 4, 7, 13, 16, 26, 29, 42,
+    3, 8, 12, 17, 25, 30, 41, 43,
+    9, 11, 18, 24, 31, 40, 44, 53,
+    10, 19, 23, 32, 39, 45, 52, 54,
+    20, 22, 33, 38, 46, 51, 55, 60,
+    21, 34, 37, 47, 50, 56, 59, 61,
+    35, 36, 48, 49, 57, 58, 62, 63};
+
+int32_t zagzig[] = {
+    0, 1, 8, 16, 9, 2, 3, 10,
+    17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13, 6, 7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63};
+
+// JPEG decode function adapted from sd_jpeg.c for MDEC motion JPEG decoding
+int32_t mdec_jpeg_decode(const uint8_t *jpeg_data, size_t jpeg_size, uint8_t *output_buffer,
+                         size_t output_width, size_t output_height, int32_t output_depth)
+{
+    struct jpeg_decompress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    JSAMPROW row_pointer[1] = {0};
+    uint32_t row_stride = 0;
+    int32_t ret = 0;
+    uint8_t *jpg_buffer = NULL;
+    uint8_t *jpg_buffer_aligned;
+    uint8_t *buffer;
+
+    // Step 1: allocate and initialize JPEG decompression object
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_decompress(&cinfo);
+
+    // Allocate aligned buffer for JPEG data (similar to sd_jpeg.c)
+    jpg_buffer = (uint8_t *)malloc(jpeg_size + 64);
+    if (jpg_buffer == NULL)
+    {
+        log_error("MDEC JPEG: memory allocation error for %zu bytes", jpeg_size);
+        ret = -1;
+        goto cleanup;
+    }
+
+    // Align buffer to cache line if needed (from sd_jpeg.c pattern)
+    jpg_buffer_aligned = (uint8_t *)(((uintptr_t)jpg_buffer + 31) & ~31);
+    memcpy(jpg_buffer_aligned, jpeg_data, jpeg_size);
+
+    // Step 3: Set source for decompression (memory source)
+    jpeg_mem_src(&cinfo, jpg_buffer_aligned, jpeg_size);
+
+    // Step 4: read image parameters with jpeg_read_header()
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK)
+    {
+        log_error("MDEC JPEG: Failed to read JPEG header");
+        ret = -1;
+        goto cleanup;
+    }
+
+    // Step 5: set parameters for decompression (from sd_jpeg.c)
+    cinfo.dct_method = JDCT_FLOAT;
+
+    // Resize to fit the output dimensions (scaling logic from sd_jpeg.c)
+    if ((cinfo.image_width * output_height) > (cinfo.image_height * output_width))
+    {
+        cinfo.scale_num = output_width * 8 / cinfo.image_width;
+    }
+    else
+    {
+        cinfo.scale_num = output_height * 8 / cinfo.image_height;
+    }
+
+    if (cinfo.scale_num < 1)
+    {
+        cinfo.scale_num = 1;
+    }
+    else if (cinfo.scale_num > 16)
+    {
+        cinfo.scale_num = 16;
+    }
+
+    // Step 6: start decompressor
+    jpeg_start_decompress(&cinfo);
+
+    // Calculate stride based on output depth
+    if (output_depth == 3)
+    {
+        row_stride = output_width * 2; // 15-bit RGB (2 bytes per pixel)
+    }
+    else
+    {
+        row_stride = output_width * 3; // 24-bit RGB (3 bytes per pixel)
+    }
+
+    // Place the output image to the center of the buffer (from sd_jpeg.c)
+    buffer = output_buffer;
+    buffer += row_stride * ((output_height - cinfo.output_height) / 2);
+
+    if (output_depth == 3)
+    {
+        buffer += 2 * ((output_width - cinfo.output_width) / 2); // 2 bytes per pixel for 15-bit
+    }
+    else
+    {
+        buffer += 3 * ((output_width - cinfo.output_width) / 2); // 3 bytes per pixel for 24-bit
+    }
+
+    // Step 7: Decompress scanlines
+    while (cinfo.output_scanline < cinfo.output_height)
+    {
+        row_pointer[0] = &buffer[cinfo.output_scanline * row_stride];
+        jpeg_read_scanlines(&cinfo, row_pointer, 1);
+    }
+
+    // Step 8: Finish decompression
+    jpeg_finish_decompress(&cinfo);
+
+    log_info("MDEC JPEG: Successfully decoded %ux%u image to %zux%zu output",
+             cinfo.image_width, cinfo.image_height, output_width, output_height);
+
+cleanup:
+    // Step 9: Release JPEG decompression object
+    jpeg_destroy_decompress(&cinfo);
+
+    if (jpg_buffer)
+    {
+        free(jpg_buffer);
+    }
+
+    return ret;
+}
+
+#define EXTS10(v) (((int16_t)((v) << 6)) >> 6)
+#define CLAMP(v, l, h) ((v <= l) ? l : ((v >= h) ? h : v))
+
+void real_idct(int16_t *blk, int16_t *scale)
+{
+    int16_t buf[64];
+
+    int16_t *src = blk;
+    int16_t *dst = buf;
+
+    for (int32_t pass = 0; pass < 2; pass++)
+    {
+        for (int32_t x = 0; x < 8; x++)
+        {
+            for (int32_t y = 0; y < 8; y++)
+            {
+                int32_t sum = 0;
+
+                for (int32_t z = 0; z < 8; z++)
+                    sum += (int32_t)src[y + z * 8] * ((int32_t)scale[x + z * 8] / 8);
+
+                dst[x + y * 8] = (sum + 0xfff) / 0x2000;
+            }
+        }
+
+        int16_t *temp = src;
+
+        src = dst;
+        dst = temp;
+    }
+}
+
+#define IDCT_FUNC(blk, scale) real_idct(blk, scale)
+
+uint16_t *rl_decode_block(int16_t *blk, uint16_t *src, uint8_t *quant, int16_t *scale)
+{
+    int32_t k = 0;
+
+    for (int32_t i = 0; i < 64; i++)
+        blk[i] = 0;
+
+    uint16_t n = *src;
+
+    ++src;
+
+    while (n == 0xfe00)
+    {
+        n = *src;
+
+        ++src;
+    }
+
+    int32_t q_scale = (n >> 10) & 0x3f;
+
+    int16_t val = EXTS10(n & 0x3ff) * quant[k];
+
+    while (k < 64)
+    {
+        if (!q_scale)
+            val = EXTS10(n & 0x3ff) * 2;
+
+        val = CLAMP(val, -0x400, 0x3ff);
+        // val *= scalezag[k]; // For fast IDCT
+
+        if (q_scale > 0)
+            blk[zagzig[k]] = val;
+
+        if (!q_scale)
+            blk[k] = val;
+
+        n = *src;
+
+        if (k == 63)
+            break;
+
+        ++src;
+
+        k += ((n >> 10) & 0x3f) + 1;
+
+        val = (EXTS10(n & 0x3ff) * quant[k] * q_scale + 4) / 8;
+    }
+
+    IDCT_FUNC(blk, scale);
+
+    return src;
+}
+
+//   for y=0 to 7
+//     for x=0 to 7
+//       R=[Crblk+((x+xx)/2)+((y+yy)/2)*8], B=[Cbblk+((x+xx)/2)+((y+yy)/2)*8]
+//       G=(-0.3437*B)+(-0.7143*R), R=(1.402*R), B=(1.772*B)
+//       Y=[Yblk+(x)+(y)*8]
+//       R=MinMax(-128,127,(Y+R))
+//       G=MinMax(-128,127,(Y+G))
+//       B=MinMax(-128,127,(Y+B))
+//       if unsigned then BGR=BGR xor 808080h  ;aka add 128 to the R,G,B values
+//       dst[(x+xx)+(y+yy)*16]=BGR
+//     next x
+//   next y
+
+void yuv_to_rgb(psx_mdec_t *mdec, uint8_t *buf, int32_t xx, int32_t yy)
+{
+    for (int32_t y = 0; y < 8; y++)
+    {
+        for (int32_t x = 0; x < 8; x++)
+        {
+            int16_t r = mdec->crblk[((x + xx) >> 1) + ((y + yy) >> 1) * 8];
+            int16_t b = mdec->cbblk[((x + xx) >> 1) + ((y + yy) >> 1) * 8];
+            int16_t g = (-0.3437 * (float)b) + (-0.7143 * (float)r);
+
+            r = (1.402 * (float)r);
+            b = (1.772 * (float)b);
+
+            int16_t l = mdec->yblk[x + y * 8];
+
+            r = CLAMP(l + r, -128, 127);
+            g = CLAMP(l + g, -128, 127);
+            b = CLAMP(l + b, -128, 127);
+
+            if (!mdec->output_signed)
+            {
+                r ^= 0x80;
+                g ^= 0x80;
+                b ^= 0x80;
+            }
+
+            if (mdec->output_depth == 3)
+            {
+                uint16_t r5 = ((uint8_t)r) >> 3;
+                uint16_t g5 = ((uint8_t)g) >> 3;
+                uint16_t b5 = ((uint8_t)b) >> 3;
+
+                uint16_t rgb = (b5 << 10) | (g5 << 5) | r5;
+
+                if (mdec->output_bit15)
+                    rgb |= 0x8000;
+
+                buf[0 + ((x + xx) + (y + yy) * 16) * 2] = rgb & 0xff;
+                buf[1 + ((x + xx) + (y + yy) * 16) * 2] = rgb >> 8;
+            }
+            else
+            {
+                buf[0 + ((x + xx) + (y + yy) * 16) * 3] = r & 0xff;
+                buf[1 + ((x + xx) + (y + yy) * 16) * 3] = g & 0xff;
+                buf[2 + ((x + xx) + (y + yy) * 16) * 3] = b & 0xff;
+            }
+        }
+    }
+}
+
+void mdec_nop(psx_mdec_t *mdec) { /* Do nothing */ }
+
+void mdec_decode_macroblock(psx_mdec_t *mdec)
+{
+    if (mdec->output_depth < 2)
+    {
+        // Use static buffer instead of dynamic allocation
+        mdec->output = g_mdec_output_buffer;
+
+        rl_decode_block(mdec->yblk, (uint16_t *)mdec->input, mdec->y_quant_table, mdec->scale_table);
+
+        for (int32_t i = 0; i < 64; i++)
+        {
+            int16_t y = mdec->yblk[i] & 0xff;
+
+            if (mdec->output_depth == 1)
+            {
+                mdec->output[i] = y;
+            }
+            else
+            {
+                // To-do
+                mdec->output[i] = 0;
+            }
+        }
+
+        mdec->output_words_remaining = ((mdec->output_depth == 1) ? 64 : 32) >> 2;
+        mdec->output_empty = 0;
+        mdec->output_index = 0;
+    }
+    else
+    {
+        uint16_t *in = (uint16_t *)mdec->input;
+        unsigned long block_size = (mdec->output_depth == 3) ? 512 : 768;
+        unsigned long bytes_processed = 0;
+        unsigned long estimated_blocks = (mdec->input_size / 8) + 1; // Conservative estimate
+        unsigned long max_output_size = estimated_blocks * block_size;
+        const unsigned long MAX_MDEC_OUTPUT = 16 * 1024 * 1024;
+        int32_t block_count = 0;
+
+        // Check if input looks like JPEG data (starts with JPEG SOI marker 0xFFD8)
+        if (mdec->input_size >= 2 && ((uint8_t *)mdec->input)[0] == 0xFF && ((uint8_t *)mdec->input)[1] == 0xD8)
+        {
+            log_info("MDEC: Detected JPEG data, using JPEG decoder");
+
+            mdec->output = g_mdec_output_buffer;
+
+            // Calculate output dimensions (16x16 blocks for MDEC)
+            {
+                unsigned long output_width = 16;
+                unsigned long output_height = 16;
+
+                int32_t result = mdec_jpeg_decode((uint8_t *)mdec->input, mdec->input_size,
+                                                  mdec->output, output_width, output_height,
+                                                  mdec->output_depth);
+
+                if (result == 0)
+                {
+                    mdec->output_words_remaining = block_size >> 2;
+                    mdec->output_empty = 0;
+                    mdec->output_index = 0;
+                    return;
+                }
+                else
+                {
+                    log_warn("MDEC: JPEG decode failed, falling back to traditional MDEC decode");
+                }
+            }
+        }
+
+        // Traditional MDEC decoding (existing code)
+        // Cap the maximum output to prevent excessive memory usage (16MB max)
+        if (max_output_size > MAX_MDEC_OUTPUT)
+        {
+            max_output_size = MAX_MDEC_OUTPUT;
+            estimated_blocks = max_output_size / block_size;
+        }
+
+        // Always allocate a fresh buffer to avoid realloc issues
+        // Use static buffer instead of dynamic allocation
+        mdec->output = g_mdec_output_buffer;
+
+        // Debug logging for large allocations
+        if (max_output_size > 1024 * 1024)
+        { // Log if > 1MB
+            log_info("MDEC: Using static buffer for %lu bytes (%.1f MB), input_size=%zu, estimated_blocks=%lu",
+                     max_output_size, (float)max_output_size / (1024 * 1024), mdec->input_size, estimated_blocks);
+        }
+
+        // No need to check allocation failure with static buffer
+
+        while (bytes_processed < mdec->input_size && block_count < estimated_blocks)
+        {
+            in = rl_decode_block(mdec->crblk, in, mdec->uv_quant_table, mdec->scale_table);
+            in = rl_decode_block(mdec->cbblk, in, mdec->uv_quant_table, mdec->scale_table);
+            in = rl_decode_block(mdec->yblk, in, mdec->y_quant_table, mdec->scale_table);
+            yuv_to_rgb(mdec, &mdec->output[block_count * block_size], 0, 0);
+            in = rl_decode_block(mdec->yblk, in, mdec->y_quant_table, mdec->scale_table);
+            yuv_to_rgb(mdec, &mdec->output[block_count * block_size], 8, 0);
+            in = rl_decode_block(mdec->yblk, in, mdec->y_quant_table, mdec->scale_table);
+            yuv_to_rgb(mdec, &mdec->output[block_count * block_size], 0, 8);
+            in = rl_decode_block(mdec->yblk, in, mdec->y_quant_table, mdec->scale_table);
+            yuv_to_rgb(mdec, &mdec->output[block_count * block_size], 8, 8);
+
+            bytes_processed = (uintptr_t)in - (uintptr_t)mdec->input;
+
+            ++block_count;
+        }
+
+        mdec->output_words_remaining = (block_count * block_size) >> 2;
+        mdec->output_empty = 0;
+        mdec->output_index = 0;
+
+        // printf("output words remaining: %d (%x) count=%d block_size=%lld size=%lld\n", mdec->output_words_remaining, mdec->output_words_remaining, block_count, block_size, size);
+
+        // log_set_quiet(0);
+        // log_fatal("Finished decoding %u-bit MDEC data input=(%04x -> %08x)",
+        //     (mdec->output_depth == 3) ? 15 : 24,
+        //     mdec->input_size,
+        //     mdec->output_words_remaining
+        // );
+        // log_set_quiet(1);
+    }
+}
+
+void mdec_set_iqtab(psx_mdec_t *mdec)
+{
+    memcpy(mdec->y_quant_table, mdec->input, 64);
+
+    if (mdec->recv_color)
+        memcpy(mdec->uv_quant_table, &mdec->input[16], 64);
+}
+
+void mdec_set_scale(psx_mdec_t *mdec)
+{
+    memcpy(mdec->scale_table, mdec->input, 128);
+}
+
+mdec_fn_t g_mdec_cmd_table[] = {
+    mdec_nop,
+    mdec_decode_macroblock,
+    mdec_set_iqtab,
+    mdec_set_scale,
+    mdec_nop,
+    mdec_nop,
+    mdec_nop,
+    mdec_nop};
+
+psx_mdec_t *psx_mdec_create(void)
+{
+    if (g_mdec_instance_in_use)
+    {
+        log_fatal("MDEC: Only one instance allowed!");
+        return NULL;
+    }
+
+    g_mdec_instance_in_use = 1;
+
+    return &g_mdec_instance;
+}
+
+void psx_mdec_init(psx_mdec_t *mdec)
+{
+    memset(mdec, 0, sizeof(psx_mdec_t));
+
+    mdec->io_base = PSX_MDEC_BEGIN;
+    mdec->io_size = PSX_MDEC_SIZE;
+
+    mdec->state = MDEC_RECV_CMD;
+}
+
+uint32_t psx_mdec_read32(psx_mdec_t *mdec, uint32_t offset)
+{
+    switch (offset)
+    {
+    case 0:
+    {
+        // printf("mdec data read\n");
+        // mdec->output_empty = 1;
+        // mdec->output_index = 0;
+        // mdec->output_request = 0;
+
+        // return 0xaaaaaaaa;
+
+        if (mdec->output_words_remaining)
+        {
+            --mdec->output_words_remaining;
+
+            // log_set_quiet(0);
+            // log_fatal("output read %08x", 0);
+            // log_set_quiet(1);
+
+            return ((uint32_t *)mdec->output)[mdec->output_index++];
+        }
+        else
+        {
+            // printf("no read words remaining\n");
+            mdec->output_empty = 0;
+            mdec->output_index = 0;
+            mdec->output_request = 0;
+
+            return 0xaaaaaaaa;
+        }
+    }
+    break;
+    case 4:
+    {
+        // printf("mdec status read\n");
+        uint32_t status = 0;
+
+        status |= mdec->words_remaining;
+        status |= mdec->current_block << 16;
+        status |= mdec->output_bit15 << 23;
+        status |= mdec->output_signed << 24;
+        status |= mdec->output_depth << 25;
+        status |= mdec->output_request << 27;
+        status |= mdec->input_request << 28;
+        status |= mdec->busy << 29;
+        status |= mdec->input_full << 30;
+        status |= mdec->output_empty << 31;
+
+        return status;
+    }
+    break;
+    }
+
+    return 0x0;
+}
+
+uint16_t psx_mdec_read16(psx_mdec_t *mdec, uint32_t offset)
+{
+    PRINTF("Unhandled 16-bit MDEC read offset=%lu\n", offset);
+
+    exit(1);
+}
+
+uint8_t psx_mdec_read8(psx_mdec_t *mdec, uint32_t offset)
+{
+    PRINTF("Unhandled 8-bit MDEC read offset=%lu\n", offset);
+
+    exit(1);
+}
+
+void psx_mdec_write32(psx_mdec_t *mdec, uint32_t offset, uint32_t value)
+{
+    switch (offset)
+    {
+    case 0:
+    {
+        // printf("mdec data write\n");
+        if (mdec->words_remaining)
+        {
+            mdec->input[mdec->input_index++] = value;
+
+            --mdec->words_remaining;
+
+            if (!mdec->words_remaining)
+            {
+                // printf("no words remaining\n");
+                mdec->output_empty = 0;
+                mdec->input_full = 1;
+                mdec->input_request = 0;
+                mdec->busy = 0;
+                mdec->output_request = mdec->enable_dma1;
+
+                g_mdec_cmd_table[mdec->cmd >> 29](mdec);
+
+                // No need to free static buffer - just clear pointer
+                mdec->input = NULL;
+            }
+
+            break;
+        }
+
+        mdec->cmd = value;
+        mdec->output_request = 0;
+        mdec->output_empty = 1;
+        mdec->output_bit15 = (value >> 25) & 1;
+        mdec->output_signed = (value >> 26) & 1;
+        mdec->output_depth = (value >> 27) & 3;
+        mdec->input_index = 0;
+        mdec->input_full = 0;
+        mdec->busy = 1;
+
+        // log_set_quiet(0);
+        switch (mdec->cmd >> 29)
+        {
+        case MDEC_CMD_NOP:
+        {
+            // printf("mdec nop\n");
+            mdec->busy = 0;
+            mdec->words_remaining = 0;
+
+            log_info("MDEC %08x: NOP", mdec->cmd);
+        }
+        break;
+
+        case MDEC_CMD_DECODE:
+        {
+            // printf("mdec decode\n");
+            mdec->words_remaining = mdec->cmd & 0xffff;
+
+            // printf("MDEC %08x: decode macroblock %04x\n",
+            //     mdec->cmd,
+            //     mdec->words_remaining
+            // );
+        }
+        break;
+
+        case MDEC_CMD_SET_QT:
+        {
+            // printf("mdec setqt\n");
+            mdec->recv_color = mdec->cmd & 1;
+            mdec->words_remaining = mdec->recv_color ? 32 : 16;
+
+            log_info("MDEC %08x: set quant tables %04x",
+                     mdec->cmd,
+                     mdec->words_remaining);
+        }
+        break;
+
+        case MDEC_CMD_SET_ST:
+        {
+            // printf("mdec setst\n");
+            mdec->words_remaining = 32;
+
+            log_info("MDEC %08x: set scale table %04x",
+                     mdec->cmd,
+                     mdec->words_remaining);
+        }
+        break;
+        }
+        // log_set_quiet(1);
+
+        if (mdec->words_remaining)
+        {
+            mdec->input_request = 1;
+            mdec->input_size = mdec->words_remaining * sizeof(uint32_t);
+            mdec->input_full = 0;
+            mdec->input_index = 0;
+
+            // Check if the requested size fits in our static buffer
+            if (mdec->input_size > MDEC_MAX_INPUT_SIZE)
+            {
+                log_warn("MDEC input size %zu exceeds static buffer size %d, clamping",
+                         mdec->input_size, MDEC_MAX_INPUT_SIZE);
+                mdec->input_size = MDEC_MAX_INPUT_SIZE;
+                mdec->words_remaining = MDEC_MAX_INPUT_SIZE / sizeof(uint32_t);
+            }
+
+            mdec->input = g_mdec_input_buffer;
+        }
+    }
+    break;
+
+    case 4:
+    {
+        // printf("mdec status write\n");
+        mdec->enable_dma0 = (value & 0x40000000) != 0;
+        mdec->enable_dma1 = (value & 0x20000000) != 0;
+
+        // Reset
+        if (value & 0x80000000)
+        {
+            // status = 80040000h
+            mdec->busy = 0;
+            mdec->words_remaining = 0;
+            mdec->output_bit15 = 0;
+            mdec->output_signed = 0;
+            mdec->output_depth = 0;
+            mdec->input_request = 0;
+            mdec->output_request = 0;
+            mdec->input_full = 0;
+            mdec->output_empty = 1;
+            mdec->current_block = 4;
+        }
+    }
+    break;
+    }
+
+    // log_fatal("32-bit MDEC write offset=%u, value=%08x", offset, value);
+}
+
+void psx_mdec_write16(psx_mdec_t *mdec, uint32_t offset, uint16_t value)
+{
+    PRINTF("Unhandled 16-bit MDEC write offset=%lu, value=%04x\n", offset, value);
+}
+
+void psx_mdec_write8(psx_mdec_t *mdec, uint32_t offset, uint8_t value)
+{
+    PRINTF("Unhandled 8-bit MDEC write offset=%lu, value=%02x\n", offset, value);
+}
+
+void psx_mdec_destroy(psx_mdec_t *mdec)
+{
+    if (mdec && mdec == &g_mdec_instance)
+    {
+        // Clear pointers but don't free static buffers
+        mdec->input = NULL;
+        mdec->output = NULL;
+
+        // Mark instance as available
+        g_mdec_instance_in_use = 0;
+    }
+}
+
+#undef CLAMP
+#undef MAX

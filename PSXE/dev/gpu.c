@@ -1,0 +1,2453 @@
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#include "gpu.h"
+#include "log.h"
+#include "fixed_math.h"
+#include "fsl_debug_console.h"
+
+#define SE10(v) ((int16_t)((v) << 5) >> 5)
+#define swap_coord(a, b)    \
+    do                      \
+    {                       \
+        int32_t temp = (a); \
+        (a) = (b);          \
+        (b) = temp;         \
+    } while (0)
+
+int g_psx_gpu_dither_kernel[] = {
+    -4,
+    +0,
+    -3,
+    +1,
+    +2,
+    -2,
+    +3,
+    -1,
+    -3,
+    +1,
+    -4,
+    +0,
+    +3,
+    -1,
+    +2,
+    -2,
+};
+
+static inline uint16_t rgb888_to_rgb565(uint32_t color)
+{
+    uint16_t bgr = ((color & 0x0000f8) >> 3) | ((color & 0x00f800) >> 6) | ((color & 0xf80000) >> 9);
+
+    uint16_t b = (bgr >> 10) & 0x1F; // Blue: bits 14-10
+    uint16_t g = (bgr >> 5) & 0x1F;  // Green: bits 9-5
+    uint16_t r = (bgr >> 0) & 0x1F;  // Red: bits 4-0
+    return (r << 11) | (g << 6) | b;
+}
+
+int min3(int a, int b, int c)
+{
+    int m = (a <= b) ? a : b;
+
+    return (m <= c) ? m : c;
+}
+
+int max3(int a, int b, int c)
+{
+    int m = (a > b) ? a : b;
+
+    return (m > c) ? m : c;
+}
+
+psx_gpu_t *psx_gpu_create(void)
+{
+    psx_gpu_t *gpu = (psx_gpu_t *)malloc(sizeof(psx_gpu_t));
+    if (gpu)
+    {
+        memset(gpu, 0, sizeof(psx_gpu_t));
+    }
+    return gpu;
+}
+
+void psx_gpu_init(psx_gpu_t *gpu, psx_ic_t *ic)
+{
+    memset(gpu, 0, sizeof(psx_gpu_t));
+
+    gpu->io_base = PSX_GPU_BEGIN;
+    gpu->io_size = PSX_GPU_SIZE;
+
+    gpu->vram = (uint16_t *)malloc(PSX_GPU_VRAM_SIZE);
+    gpu->empty = malloc(PSX_GPU_VRAM_SIZE);
+
+    memset(gpu->vram, 0, PSX_GPU_VRAM_SIZE);
+    memset(gpu->empty, 0, PSX_GPU_VRAM_SIZE);
+
+    gpu->state = GPU_STATE_RECV_CMD;
+    gpu->gpustat |= 0x800000;
+
+    // Default window size, this is not normally needed
+    gpu->display_mode = 1;
+
+    gpu->ic = ic;
+}
+
+uint32_t psx_gpu_read32(psx_gpu_t *gpu, uint32_t offset)
+{
+    switch (offset)
+    {
+    case 0x00:
+    {
+        uint32_t data = 0x0;
+
+        if (gpu->c0_tsiz)
+        {
+            data |= gpu->vram[gpu->c0_addr + (gpu->c0_xcnt + (gpu->c0_ycnt * 1024))];
+
+            gpu->c0_xcnt += 1;
+
+            if (gpu->c0_xcnt == gpu->c0_xsiz)
+            {
+                gpu->c0_ycnt += 1;
+                gpu->c0_xcnt = 0;
+            }
+
+            data |= gpu->vram[gpu->c0_addr + (gpu->c0_xcnt + (gpu->c0_ycnt * 1024))] << 16;
+
+            gpu->c0_xcnt += 1;
+
+            if (gpu->c0_xcnt == gpu->c0_xsiz)
+            {
+                gpu->c0_ycnt += 1;
+                gpu->c0_xcnt = 0;
+            }
+
+            gpu->c0_tsiz -= 2;
+        }
+
+        if (gpu->gp1_10h_req)
+        {
+            switch (gpu->gp1_10h_req & 7)
+            {
+            case 2:
+            {
+                data = ((gpu->texw_oy / 8) << 15) | ((gpu->texw_ox / 8) << 10) | ((gpu->texw_my / 8) << 5) | (gpu->texw_mx / 8);
+            }
+            break;
+            case 3:
+            {
+                data = (gpu->draw_y1 << 10) | gpu->draw_x1;
+            }
+            break;
+            case 4:
+            {
+                data = (gpu->draw_y2 << 10) | gpu->draw_x2;
+            }
+            break;
+            case 5:
+            {
+                data = (gpu->off_y << 10) | gpu->off_x;
+            }
+            break;
+            }
+
+            gpu->gp1_10h_req = 0;
+        }
+
+        return data;
+    }
+    break;
+    case 0x04:
+        return gpu->gpustat | 0x1c000000;
+    }
+
+    log_warn("Unhandled 32-bit GPU read at offset %08x", offset);
+
+    return 0x0;
+}
+
+uint16_t psx_gpu_read16(psx_gpu_t *gpu, uint32_t offset)
+{
+    PRINTF("Unhandled 16-bit GPU read at offset %08lX\n", offset);
+
+    return 0;
+
+    // exit(1);
+}
+
+uint8_t psx_gpu_read8(psx_gpu_t *gpu, uint32_t offset)
+{
+    PRINTF("Unhandled 8-bit GPU read at offset %08lX\n", offset);
+
+    return 0;
+
+    // exit(1);
+}
+
+int min(int x0, int x1)
+{
+    return (x0 <= x1) ? x0 : x1;
+}
+
+int max(int x0, int x1)
+{
+    return (x0 >= x1) ? x0 : x1;
+}
+
+#define EDGE(a, b, c) ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x))
+
+uint16_t gpu_fetch_texel(psx_gpu_t *gpu, uint16_t tx, uint16_t ty, uint32_t tpx, uint32_t tpy, uint16_t clutx, uint16_t cluty, int depth)
+{
+    tx = (tx & ~gpu->texw_mx) | (gpu->texw_ox & gpu->texw_mx);
+    ty = (ty & ~gpu->texw_my) | (gpu->texw_oy & gpu->texw_my);
+    tx &= 0xff;
+    ty &= 0xff;
+
+    switch (depth)
+    {
+    // 4-bit
+    case 0:
+    {
+        uint16_t texel = gpu->vram[(tpx + (tx >> 2)) + ((tpy + ty) * 1024)];
+
+        int index = (texel >> ((tx & 0x3) << 2)) & 0xf;
+
+        return gpu->vram[(clutx + index) + (cluty * 1024)];
+    }
+    break;
+
+    // 8-bit
+    case 1:
+    {
+        uint16_t texel = gpu->vram[(tpx + (tx >> 1)) + ((tpy + ty) * 1024)];
+
+        int index = (texel >> ((tx & 0x1) << 3)) & 0xff;
+
+        return gpu->vram[(clutx + index) + (cluty * 1024)];
+    }
+    break;
+
+    // 15-bit
+    default:
+    {
+        return gpu->vram[(tpx + tx) + ((tpy + ty) * 1024)];
+    }
+    break;
+    }
+}
+
+uint16_t gpu_fetch_texel_bilinear(psx_gpu_t *gpu, float tx, float ty, uint32_t tpx, uint32_t tpy, uint16_t clutx, uint16_t cluty, int depth)
+{
+    float txf = floorf(tx);
+    float tyf = floorf(ty);
+    float txc = txf + 1.0f;
+    float tyc = tyf + 1.0f;
+
+    int s0 = gpu_fetch_texel(gpu, (int)txf, (int)tyf, tpx, tpy, clutx, cluty, depth);
+
+    if (!s0)
+        return 0;
+
+    int s1 = gpu_fetch_texel(gpu, (int)txc, (int)tyf, tpx, tpy, clutx, cluty, depth);
+    int s2 = gpu_fetch_texel(gpu, (int)txf, (int)tyc, tpx, tpy, clutx, cluty, depth);
+    int s3 = gpu_fetch_texel(gpu, (int)txc, (int)tyc, tpx, tpy, clutx, cluty, depth);
+
+    float s0r = (s0 >> 11) & 0x1f; // RGB565: Red bits 15-11
+    float s0g = (s0 >> 5) & 0x3f;  // RGB565: Green bits 10-5
+    float s0b = (s0 >> 0) & 0x1f;  // RGB565: Blue bits 4-0
+    float s1r = (s1 >> 11) & 0x1f;
+    float s1g = (s1 >> 5) & 0x3f;
+    float s1b = (s1 >> 0) & 0x1f;
+    float s2r = (s2 >> 11) & 0x1f;
+    float s2g = (s2 >> 5) & 0x3f;
+    float s2b = (s2 >> 0) & 0x1f;
+    float s3r = (s3 >> 11) & 0x1f;
+    float s3g = (s3 >> 5) & 0x3f;
+    float s3b = (s3 >> 0) & 0x1f;
+
+    float q1r = s0r * (txc - tx) + s1r * (tx - txf);
+    float q1g = s0g * (txc - tx) + s1g * (tx - txf);
+    float q1b = s0b * (txc - tx) + s1b * (tx - txf);
+    float q2r = s2r * (txc - tx) + s3r * (tx - txf);
+    float q2g = s2g * (txc - tx) + s3g * (tx - txf);
+    float q2b = s2b * (txc - tx) + s3b * (tx - txf);
+    int qr = q1r * (tyc - ty) + q2r * (ty - tyf);
+    int qg = q1g * (tyc - ty) + q2g * (ty - tyf);
+    int qb = q1b * (tyc - ty) + q2b * (ty - tyf);
+
+    return (qr << 11) | (qg << 5) | qb | (s0 & 0x8000) | (s1 & 0x8000) | (s2 & 0x8000) | (s3 & 0x8000);
+}
+
+#define TL(z, a, b) \
+    ((z < 0) || ((z == 0) && ((b.y > a.y) || ((b.y == a.y) && (b.x < a.x)))))
+
+// Fast saturate for color clamping using bit operations
+static inline unsigned int fast_saturate_u8(int val)
+{
+    if (val > 255)
+        return 255;
+    if (val < 0)
+        return 0;
+    return (unsigned int)val;
+}
+
+void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, poly_data_t data, int edge)
+{
+    // --- Rasterizer-style triangle setup ---
+    vertex_t a, b, c;
+    // Precompute texture and clut parameters
+    const int tpx = (data.texp & 0xf) << 6;
+    const int tpy = (data.texp & 0x10) << 4;
+    const int clutx = (data.clut & 0x3f) << 4;
+    const int cluty = (data.clut >> 6) & 0x1ff;
+    const int depth = (data.texp >> 7) & 3;
+    const int is_textured = (data.attrib & PA_TEXTURED) != 0;
+    const int is_shaded = (data.attrib & PA_SHADED) != 0;
+    const int is_raw = (data.attrib & PA_RAW) != 0;
+    int transp = (data.attrib & PA_TRANSP) != 0;
+    const int transp_mode = is_textured ? ((data.texp >> 5) & 3) : ((gpu->gpustat >> 5) & 3);
+
+    a = v0;
+    // Ensure the winding order is correct (CCW)
+    if (EDGE(v0, v1, v2) < 0)
+    {
+        b = v2;
+        c = v1;
+    }
+    else
+    {
+        b = v1;
+        c = v2;
+    }
+
+    // Apply offset once
+    const int off_x = gpu->off_x;
+    const int off_y = gpu->off_y;
+    a.x += off_x;
+    b.x += off_x;
+    c.x += off_x;
+    a.y += off_y;
+    b.y += off_y;
+    c.y += off_y;
+
+    // Rasterizer-style bounding box
+    int xmin = max(min3(a.x, b.x, c.x), gpu->draw_x1);
+    int ymin = max(min3(a.y, b.y, c.y), gpu->draw_y1);
+    int xmax = min(max3(a.x, b.x, c.x), min(gpu->draw_x2, 1023));
+    int ymax = min(max3(a.y, b.y, c.y), min(gpu->draw_y2, 511));
+
+    if (xmin > xmax || ymin > ymax)
+        return;
+
+    // Edge function setup (float for rasterizer style, but keep int64 for PSX precision)
+    int64_t area = (int64_t)(b.x - a.x) * (int64_t)(c.y - a.y) - (int64_t)(b.y - a.y) * (int64_t)(c.x - a.x);
+    if (area == 0)
+        return;
+    int64_t inv_area_fp = ((int64_t)1 << 32) / area;
+
+    uint32_t mod = is_shaded ? 0 : data.v[0].c;
+    int ac_r = is_shaded ? ((a.c >> 0) & 0xff) : 0;
+    int ac_g = is_shaded ? ((a.c >> 8) & 0xff) : 0;
+    int ac_b = is_shaded ? ((a.c >> 16) & 0xff) : 0;
+    int bc_r = is_shaded ? ((b.c >> 0) & 0xff) : 0;
+    int bc_g = is_shaded ? ((b.c >> 8) & 0xff) : 0;
+    int bc_b = is_shaded ? ((b.c >> 16) & 0xff) : 0;
+    int cc_r = is_shaded ? ((c.c >> 0) & 0xff) : 0;
+    int cc_g = is_shaded ? ((c.c >> 8) & 0xff) : 0;
+    int cc_b = is_shaded ? ((c.c >> 16) & 0xff) : 0;
+
+    // --- Rasterizer-style scan ---
+    for (int y = ymin; y <= ymax; ++y)
+    {
+        int y_offset = y * 1024;
+        int dy_dither = (y - ymin) & 3;
+        for (int x = xmin; x <= xmax; ++x)
+        {
+            // Edge functions (int64 for PSX precision)
+            int64_t e0 = (int64_t)(b.x - a.x) * (y - a.y) - (int64_t)(b.y - a.y) * (x - a.x);
+            int64_t e1 = (int64_t)(c.x - b.x) * (y - b.y) - (int64_t)(c.y - b.y) * (x - b.x);
+            int64_t e2 = (int64_t)(a.x - c.x) * (y - c.y) - (int64_t)(a.y - c.y) * (x - c.x);
+            // Top-left rule (same as original)
+            if (e0 < 0 || e1 < 0 || e2 < 0)
+                continue;
+
+            uint16_t color = 0;
+            if (is_shaded)
+            {
+                int64_t cr0 = e1 * ac_r, cr1 = e2 * bc_r, cr2 = e0 * cc_r;
+                int64_t cg0 = e1 * ac_g, cg1 = e2 * bc_g, cg2 = e0 * cc_g;
+                int64_t cb0 = e1 * ac_b, cb1 = e2 * bc_b, cb2 = e0 * cc_b;
+                int64_t cr_fp = ((cr0 + cr1 + cr2) * inv_area_fp) >> 32;
+                int64_t cg_fp = ((cg0 + cg1 + cg2) * inv_area_fp) >> 32;
+                int64_t cb_fp = ((cb0 + cb1 + cb2) * inv_area_fp) >> 32;
+                int cr = (int)cr_fp, cg = (int)cg_fp, cb = (int)cb_fp;
+                int dx_dither = (x - xmin) & 3;
+                int dither = g_psx_gpu_dither_kernel[dx_dither + (dy_dither << 2)];
+                cr += dither;
+                cg += dither;
+                cb += dither;
+                unsigned int ucr = fast_saturate_u8(cr);
+                unsigned int ucg = fast_saturate_u8(cg);
+                unsigned int ucb = fast_saturate_u8(cb);
+                mod = (ucb << 16) | (ucg << 8) | ucr;
+            }
+            if (is_textured)
+            {
+                int64_t tx0 = e1 * a.tx, tx1 = e2 * b.tx, tx2 = e0 * c.tx;
+                int64_t ty0 = e1 * a.ty, ty1 = e2 * b.ty, ty2 = e0 * c.ty;
+                int64_t tx_fp = ((tx0 + tx1 + tx2) * inv_area_fp) >> 32;
+                int64_t ty_fp = ((ty0 + ty1 + ty2) * inv_area_fp) >> 32;
+                int tx = (int)tx_fp, ty = (int)ty_fp;
+                uint16_t texel = gpu_fetch_texel(gpu, tx, ty, tpx, tpy, clutx, cluty, depth);
+                if (!texel)
+                    continue;
+                if (data.attrib & PA_TRANSP)
+                    transp = (texel & 0x8000) != 0;
+                if (is_raw)
+                {
+                    color = texel;
+                }
+                else
+                {
+                    int tr = ((texel >> 0) & 0x1f) << 3;
+                    int tg = ((texel >> 5) & 0x1f) << 3;
+                    int tb = ((texel >> 10) & 0x1f) << 3;
+                    int mr = (mod >> 0) & 0xff;
+                    int mg = (mod >> 8) & 0xff;
+                    int mb = (mod >> 16) & 0xff;
+                    int cr = (tr * mr) >> 7;
+                    int cg = (tg * mg) >> 7;
+                    int cb = (tb * mb) >> 7;
+                    unsigned int ucr = fast_saturate_u8(cr);
+                    unsigned int ucg = fast_saturate_u8(cg);
+                    unsigned int ucb = fast_saturate_u8(cb);
+                    uint32_t rgb = ucr | (ucg << 8) | (ucb << 16);
+                    color = rgb888_to_rgb565(rgb);
+                }
+            }
+            else
+            {
+                color = rgb888_to_rgb565(mod);
+            }
+            if (__builtin_expect(transp, 0))
+            {
+                const uint16_t back = gpu->vram[x + y_offset];
+                int cr = (((color >> 11) & 0x1f) << 3) << 8; // RGB565: Red bits 15-11
+                int cg = (((color >> 5) & 0x3f) << 2) << 8;  // RGB565: Green bits 10-5
+                int cb = (((color >> 0) & 0x1f) << 3) << 8;  // RGB565: Blue bits 4-0
+                const int br = (((back >> 11) & 0x1f) << 3) << 8;
+                const int bg = (((back >> 5) & 0x3f) << 2) << 8;
+                const int bb = (((back >> 0) & 0x1f) << 3) << 8;
+                switch (transp_mode)
+                {
+                case 0:
+                    cr = (br * 128 + cr * 128) >> 8;
+                    cg = (bg * 128 + cg * 128) >> 8;
+                    cb = (bb * 128 + cb * 128) >> 8;
+                    break;
+                case 1:
+                    cr = (br + cr) >> 8;
+                    cg = (bg + cg) >> 8;
+                    cb = (bb + cb) >> 8;
+                    break;
+                case 2:
+                    cr = (br - cr) >> 8;
+                    cg = (bg - cg) >> 8;
+                    cb = (bb - cb) >> 8;
+                    break;
+                case 3:
+                    cr = (br + (cr * 64)) >> 8;
+                    cg = (bg + (cg * 64)) >> 8;
+                    cb = (bb + (cb * 64)) >> 8;
+                    break;
+                }
+                unsigned int ucr = fast_saturate_u8(cr);
+                unsigned int ucg = fast_saturate_u8(cg);
+                unsigned int ucb = fast_saturate_u8(cb);
+                uint32_t rgb = ucr | (ucg << 8) | (ucb << 16);
+                color = rgb888_to_rgb565(rgb);
+            }
+            gpu->vram[x + y_offset] = color;
+        }
+    }
+}
+
+#define CLAMP(v, d, u) ((v) <= (d)) ? (d) : (((v) >= (u)) ? (u) : (v))
+
+void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
+{
+    // Early rejection
+    if ((data.v0.x >= 1024) || (data.v0.y >= 512) ||
+        (data.v0.x <= -1024) || (data.v0.y <= -512))
+        return;
+
+    // Get rectangle dimensions
+    uint16_t width, height;
+    switch ((data.attrib >> 3) & 3)
+    {
+    case RS_VARIABLE:
+        width = data.width;
+        height = data.height;
+        break;
+    case RS_1X1:
+        width = 1;
+        height = 1;
+        break;
+    case RS_8X8:
+        width = 8;
+        height = 8;
+        break;
+    case RS_16X16:
+        width = 16;
+        height = 16;
+        break;
+    }
+
+    // Cache attributes
+    const int is_textured = (data.attrib & RA_TEXTURED) != 0;
+    int transp = (data.attrib & RA_TRANSP) != 0;
+    const int transp_mode = (gpu->gpustat >> 5) & 3;
+
+    // Texture parameters (computed once)
+    const int tpx = gpu->texp_x;
+    const int tpy = gpu->texp_y;
+    const int clutx = (data.clut & 0x3f) << 4;
+    const int cluty = (data.clut >> 6) & 0x1ff;
+    const int depth = gpu->texp_d;
+
+    // Apply GPU offset
+    int32_t x0 = data.v0.x + gpu->off_x;
+    int32_t y0 = data.v0.y + gpu->off_y;
+    int32_t x1 = x0 + width;
+    int32_t y1 = y0 + height;
+
+    // Clamp to drawing area
+    x0 = max(x0, gpu->draw_x1);
+    y0 = max(y0, gpu->draw_y1);
+    x1 = min(x1, gpu->draw_x2 + 1);
+    y1 = min(y1, gpu->draw_y2 + 1);
+
+    // Early rejection if completely clipped
+    if (x0 >= x1 || y0 >= y1)
+        return;
+
+    // For non-textured, non-transparent solid rectangles, use fast path
+    if (!is_textured && !transp)
+    {
+        const uint16_t color = rgb888_to_rgb565(data.v0.c);
+        const int w = x1 - x0;
+
+        // Optimized rectangle filling using word-aligned writes when possible
+        for (int32_t y = y0; y < y1; y++)
+        {
+            uint16_t *vram_line = &gpu->vram[x0 + y * 1024];
+
+            // Use memset-style filling for larger rectangles
+            if (w >= 8)
+            {
+                // Fill 4 pixels at a time using 64-bit writes if aligned
+                uint32_t color32 = (uint32_t)color | ((uint32_t)color << 16);
+                uint32_t *vram32 = (uint32_t *)vram_line;
+                int32_t w32 = w / 2;
+
+                for (int32_t i = 0; i < w32; i++)
+                {
+                    vram32[i] = color32;
+                }
+
+                // Handle remaining pixels
+                if (w & 1)
+                {
+                    vram_line[w - 1] = color;
+                }
+            }
+            else
+            {
+                // Small rectangles - simple loop
+                for (int32_t i = 0; i < w; i++)
+                {
+                    vram_line[i] = color;
+                }
+            }
+        }
+        return;
+    }
+
+    // Complex path for textured/transparent rectangles
+    int32_t tex_x = 0, tex_y = 0;
+
+    for (int32_t y = y0; y < y1; y++)
+    {
+        tex_x = 0;
+        uint16_t *vram_line = &gpu->vram[x0 + y * 1024];
+
+        for (int32_t x = x0; x < x1; x++)
+        {
+            uint16_t color;
+
+            if (is_textured)
+            {
+                const uint16_t texel = gpu_fetch_texel(
+                    gpu,
+                    data.v0.tx + tex_x, data.v0.ty + tex_y,
+                    tpx, tpy, clutx, cluty, depth);
+
+                if (!texel)
+                {
+                    tex_x++;
+                    continue;
+                }
+
+                if ((data.attrib & RA_TRANSP) != 0)
+                    transp = (texel & 0x8000) != 0;
+
+                // Optimized texture modulation
+                const float tr = ((texel >> 0) & 0x1f) << 3;
+                const float tg = ((texel >> 5) & 0x1f) << 3;
+                const float tb = ((texel >> 10) & 0x1f) << 3;
+
+                const float mr = (data.v0.c >> 0) & 0xff;
+                const float mg = (data.v0.c >> 8) & 0xff;
+                const float mb = (data.v0.c >> 16) & 0xff;
+
+                const float cr = (tr * mr) * (1.0f / 128.0f);
+                const float cg = (tg * mg) * (1.0f / 128.0f);
+                const float cb = (tb * mb) * (1.0f / 128.0f);
+
+                const unsigned int ucr = fast_saturate_u8(cr);
+                const unsigned int ucg = fast_saturate_u8(cg);
+                const unsigned int ucb = fast_saturate_u8(cb);
+
+                const uint32_t rgb = ucr | (ucg << 8) | (ucb << 16);
+                color = rgb888_to_rgb565(rgb);
+            }
+            else
+            {
+                color = rgb888_to_rgb565(data.v0.c);
+            }
+
+            // Transparency blending
+            if (__builtin_expect(transp, 0))
+            {
+                const uint16_t back = vram_line[x - x0];
+
+                float cr = ((color >> 0) & 0x1f) << 3;
+                float cg = ((color >> 5) & 0x1f) << 3;
+                float cb = ((color >> 10) & 0x1f) << 3;
+
+                const float br = ((back >> 0) & 0x1f) << 3;
+                const float bg = ((back >> 5) & 0x1f) << 3;
+                const float bb = ((back >> 10) & 0x1f) << 3;
+
+                switch (transp_mode)
+                {
+                case 0:
+                    cr = br * 0.5f + cr * 0.5f;
+                    cg = bg * 0.5f + cg * 0.5f;
+                    cb = bb * 0.5f + cb * 0.5f;
+                    break;
+                case 1:
+                    cr = br + cr;
+                    cg = bg + cg;
+                    cb = bb + cb;
+                    break;
+                case 2:
+                    cr = br - cr;
+                    cg = bg - cg;
+                    cb = bb - cb;
+                    break;
+                case 3:
+                    cr = br + cr * 0.25f;
+                    cg = bg + cg * 0.25f;
+                    cb = bb + cb * 0.25f;
+                    break;
+                }
+
+                const unsigned int ucr = fast_saturate_u8(cr);
+                const unsigned int ucg = fast_saturate_u8(cg);
+                const unsigned int ucb = fast_saturate_u8(cb);
+
+                const uint32_t rgb = ucr | (ucg << 8) | (ucb << 16);
+                color = rgb888_to_rgb565(rgb);
+            }
+
+            vram_line[x - x0] = color;
+            tex_x++;
+        }
+        tex_y++;
+    }
+}
+
+void plotLineLow(psx_gpu_t *gpu, int x0, int y0, int x1, int y1, uint16_t color)
+{
+    int dx = x1 - x0;
+    int dy = y1 - y0;
+    int yi = 1;
+    if (dy < 0)
+    {
+        yi = -1;
+        dy = -dy;
+    }
+    int d = (2 * dy) - dx;
+    int y = y0;
+
+    for (int x = x0; x < x1; x++)
+    {
+        int bc = (x >= gpu->draw_x1) && (x <= gpu->draw_x2) &&
+                 (y >= gpu->draw_y1) && (y <= gpu->draw_y2);
+
+        if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0) && bc)
+            gpu->vram[x + (y * 1024)] = color;
+
+        if (d > 0)
+        {
+            y += yi;
+            d += (2 * (dy - dx));
+        }
+        else
+        {
+            d += 2 * dy;
+        }
+    }
+}
+
+void plotLineHigh(psx_gpu_t *gpu, int x0, int y0, int x1, int y1, uint16_t color)
+{
+    int dx = x1 - x0;
+    int dy = y1 - y0;
+    int xi = 1;
+    if (dx < 0)
+    {
+        xi = -1;
+        dx = -dx;
+    }
+    int d = (2 * dx) - dy;
+    int x = x0;
+
+    for (int y = y0; y < y1; y++)
+    {
+        int bc = (x >= gpu->draw_x1) && (x <= gpu->draw_x2) &&
+                 (y >= gpu->draw_y1) && (y <= gpu->draw_y2);
+
+        if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0) && bc)
+            gpu->vram[x + (y * 1024)] = color;
+
+        if (d > 0)
+        {
+            x = x + xi;
+            d += (2 * (dx - dy));
+        }
+        else
+        {
+            d += 2 * dx;
+        }
+    }
+}
+
+void plotLine(psx_gpu_t *gpu, int x0, int y0, int x1, int y1, uint16_t color)
+{
+    if (abs(y1 - y0) < abs(x1 - x0))
+    {
+        if (x0 > x1)
+        {
+            plotLineLow(gpu, x1, y1, x0, y0, color);
+        }
+        else
+        {
+            plotLineLow(gpu, x0, y0, x1, y1, color);
+        }
+    }
+    else
+    {
+        if (y0 > y1)
+        {
+            plotLineHigh(gpu, x1, y1, x0, y0, color);
+        }
+        else
+        {
+            plotLineHigh(gpu, x0, y0, x1, y1, color);
+        }
+    }
+}
+
+void gpu_render_flat_line(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, uint32_t color)
+{
+    v0.x += gpu->off_x;
+    v0.y += gpu->off_y;
+    v1.x += gpu->off_x;
+    v1.y += gpu->off_y;
+
+    plotLine(gpu, v0.x, v0.y, v1.x, v1.y, color);
+}
+
+void gpu_render_flat_rectangle(psx_gpu_t *gpu, vertex_t v, uint32_t w, uint32_t h, uint32_t color)
+{
+    /* Offset coordinates */
+    v.x += gpu->off_x;
+    v.y += gpu->off_y;
+
+    /* Calculate bounding box */
+    int xmin = max(v.x, gpu->draw_x1);
+    int ymin = max(v.y, gpu->draw_y1);
+    int xmax = min(xmin + w, gpu->draw_x2);
+    int ymax = min(ymin + h, gpu->draw_y2);
+
+    /* Early exit if clipped completely */
+    if (xmin >= xmax || ymin >= ymax)
+        return;
+
+    uint32_t rect_width = xmax - xmin;
+    uint16_t color16 = (uint16_t)color;
+
+    /* Fast rectangle filling inspired by pushBlock16 approach */
+    for (uint32_t y = ymin; y < ymax; y++)
+    {
+        uint16_t *line_ptr = &gpu->vram[xmin + (y * 1024)];
+        uint32_t len = rect_width;
+
+        /* Unrolled loop for better performance - process 32 pixels at once */
+        while (len > 31)
+        {
+            line_ptr[0] = color16;
+            line_ptr[1] = color16;
+            line_ptr[2] = color16;
+            line_ptr[3] = color16;
+            line_ptr[4] = color16;
+            line_ptr[5] = color16;
+            line_ptr[6] = color16;
+            line_ptr[7] = color16;
+            line_ptr[8] = color16;
+            line_ptr[9] = color16;
+            line_ptr[10] = color16;
+            line_ptr[11] = color16;
+            line_ptr[12] = color16;
+            line_ptr[13] = color16;
+            line_ptr[14] = color16;
+            line_ptr[15] = color16;
+            line_ptr[16] = color16;
+            line_ptr[17] = color16;
+            line_ptr[18] = color16;
+            line_ptr[19] = color16;
+            line_ptr[20] = color16;
+            line_ptr[21] = color16;
+            line_ptr[22] = color16;
+            line_ptr[23] = color16;
+            line_ptr[24] = color16;
+            line_ptr[25] = color16;
+            line_ptr[26] = color16;
+            line_ptr[27] = color16;
+            line_ptr[28] = color16;
+            line_ptr[29] = color16;
+            line_ptr[30] = color16;
+            line_ptr[31] = color16;
+            line_ptr += 32;
+            len -= 32;
+        }
+
+        /* Process 8 pixels at once */
+        while (len > 7)
+        {
+            line_ptr[0] = color16;
+            line_ptr[1] = color16;
+            line_ptr[2] = color16;
+            line_ptr[3] = color16;
+            line_ptr[4] = color16;
+            line_ptr[5] = color16;
+            line_ptr[6] = color16;
+            line_ptr[7] = color16;
+            line_ptr += 8;
+            len -= 8;
+        }
+
+        /* Process remaining pixels */
+        while (len--)
+        {
+            *line_ptr++ = color16;
+        }
+    }
+}
+
+void gpu_render_textured_rectangle(psx_gpu_t *gpu, vertex_t v, uint32_t w, uint32_t h, uint16_t clutx, uint16_t cluty, uint32_t color)
+{
+    vertex_t a = v;
+
+    a.x += gpu->off_x;
+    a.y += gpu->off_y;
+
+    int xmin = max(a.x, gpu->draw_x1);
+    int ymin = max(a.y, gpu->draw_y1);
+    int xmax = min(xmin + w, gpu->draw_x2);
+    int ymax = min(ymin + h, gpu->draw_y2);
+
+    uint32_t xc = 0, yc = 0;
+
+    for (int y = ymin; y < ymax; y++)
+    {
+        for (int x = xmin; x < xmax; x++)
+        {
+            uint16_t texel = gpu_fetch_texel(
+                gpu,
+                a.tx + xc, a.ty + yc,
+                gpu->texp_x, gpu->texp_y,
+                clutx, cluty,
+                gpu->texp_d);
+
+            ++xc;
+
+            gpu->vram[x + (y * 1024)] = texel;
+        }
+
+        xc = 0;
+
+        ++yc;
+    }
+}
+
+void gpu_render_flat_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, uint32_t color)
+{
+    vertex_t a, b, c;
+    uint16_t rgb = color & 0xFFFF;
+
+    a = v0;
+
+    /* Ensure the winding order is correct */
+    if (EDGE(v0, v1, v2) < 0)
+    {
+        b = v2;
+        c = v1;
+    }
+    else
+    {
+        b = v1;
+        c = v2;
+    }
+
+    a.x += gpu->off_x;
+    a.y += gpu->off_y;
+    b.x += gpu->off_x;
+    b.y += gpu->off_y;
+    c.x += gpu->off_x;
+    c.y += gpu->off_y;
+
+    int xmin = max(min(min(a.x, b.x), c.x), gpu->draw_x1);
+    int ymin = max(min(min(a.y, b.y), c.y), gpu->draw_y1);
+    int xmax = min(max(max(a.x, b.x), c.x), gpu->draw_x2);
+    int ymax = min(max(max(a.y, b.y), c.y), gpu->draw_y2);
+
+    for (int y = ymin; y < ymax; y++)
+    {
+        for (int x = xmin; x < xmax; x++)
+        {
+            int z0 = ((b.x - a.x) * (y - a.y)) - ((b.y - a.y) * (x - a.x));
+            int z1 = ((c.x - b.x) * (y - b.y)) - ((c.y - b.y) * (x - b.x));
+            int z2 = ((a.x - c.x) * (y - c.y)) - ((a.y - c.y) * (x - c.x));
+
+            if ((z0 >= 0) && (z1 >= 0) && (z2 >= 0))
+            {
+                gpu->vram[x + (y * 1024)] = rgb;
+            }
+        }
+    }
+}
+
+void gpu_render_shaded_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2)
+{
+    vertex_t a, b, c, p;
+
+    a = v0;
+
+    /* Ensure the winding order is correct */
+    if (EDGE(v0, v1, v2) < 0)
+    {
+        b = v2;
+        c = v1;
+    }
+    else
+    {
+        b = v1;
+        c = v2;
+    }
+
+    a.x += gpu->off_x;
+    a.y += gpu->off_y;
+    b.x += gpu->off_x;
+    b.y += gpu->off_y;
+    c.x += gpu->off_x;
+    c.y += gpu->off_y;
+
+    int xmin = max(min(min(a.x, b.x), c.x), gpu->draw_x1);
+    int ymin = max(min(min(a.y, b.y), c.y), gpu->draw_y1);
+    int xmax = min(max(max(a.x, b.x), c.x), gpu->draw_x2);
+    int ymax = min(max(max(a.y, b.y), c.y), gpu->draw_y2);
+
+    int area = EDGE(a, b, c);
+
+    for (int y = ymin; y < ymax; y++)
+    {
+        for (int x = xmin; x < xmax; x++)
+        {
+            p.x = x;
+            p.y = y;
+
+            float z0 = EDGE((float)b, (float)c, (float)p);
+            float z1 = EDGE((float)c, (float)a, (float)p);
+            float z2 = EDGE((float)a, (float)b, (float)p);
+
+            if ((z0 >= 0) && (z1 >= 0) && (z2 >= 0))
+            {
+                int cr = (z0 * ((a.c >> 0) & 0xff) + z1 * ((b.c >> 0) & 0xff) + z2 * ((c.c >> 0) & 0xff)) / area;
+                int cg = (z0 * ((a.c >> 8) & 0xff) + z1 * ((b.c >> 8) & 0xff) + z2 * ((c.c >> 8) & 0xff)) / area;
+                int cb = (z0 * ((a.c >> 16) & 0xff) + z1 * ((b.c >> 16) & 0xff) + z2 * ((c.c >> 16) & 0xff)) / area;
+
+                // Calculate positions within our 4x4 dither
+                // kernel
+                int dy = (y - ymin) % 4;
+                int dx = (x - xmin) % 4;
+
+                // Shift two pixels horizontally on the last
+                // two scanlines?
+                // if (dy > 1) {
+                //     dx = ((x + 2) - xmin) % 4;
+                // }
+
+                int dither = g_psx_gpu_dither_kernel[dx + (dy * 4)];
+
+                // Add to the original 8-bit color values
+                cr += dither;
+                cg += dither;
+                cb += dither;
+
+                // Saturate (clamp) to 00-ff
+                cr = (cr >= 0xff) ? 0xff : ((cr <= 0) ? 0 : cr);
+                cg = (cg >= 0xff) ? 0xff : ((cg <= 0) ? 0 : cg);
+                cb = (cb >= 0xff) ? 0xff : ((cb <= 0) ? 0 : cb);
+
+                uint32_t color = (cb << 16) | (cg << 8) | cr;
+
+                gpu->vram[x + (y * 1024)] = rgb888_to_rgb565(color);
+            }
+        }
+    }
+}
+
+void gpu_render_textured_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, uint32_t tpx, uint32_t tpy, uint16_t clutx, uint16_t cluty, int depth)
+{
+    vertex_t a, b, c;
+
+    a = v0;
+
+    /* Ensure the winding order is correct */
+    if (EDGE(v0, v1, v2) < 0)
+    {
+        b = v2;
+        c = v1;
+    }
+    else
+    {
+        b = v1;
+        c = v2;
+    }
+
+    a.x += gpu->off_x;
+    a.y += gpu->off_y;
+    b.x += gpu->off_x;
+    b.y += gpu->off_y;
+    c.x += gpu->off_x;
+    c.y += gpu->off_y;
+
+    int xmin = max(min(min(a.x, b.x), c.x), gpu->draw_x1);
+    int ymin = max(min(min(a.y, b.y), c.y), gpu->draw_y1);
+    int xmax = min(max(max(a.x, b.x), c.x), gpu->draw_x2);
+    int ymax = min(max(max(a.y, b.y), c.y), gpu->draw_y2);
+
+    uint32_t area = EDGE(a, b, c);
+
+    for (int y = ymin; y < ymax; y++)
+    {
+        for (int x = xmin; x < xmax; x++)
+        {
+            vertex_t p;
+
+            p.x = x;
+            p.y = y;
+
+            float z0 = EDGE((float)b, (float)c, (float)p);
+            float z1 = EDGE((float)c, (float)a, (float)p);
+            float z2 = EDGE((float)a, (float)b, (float)p);
+
+            if ((z0 >= 0) && (z1 >= 0) && (z2 >= 0))
+            {
+                uint32_t tx = ((z0 * a.tx) + (z1 * b.tx) + (z2 * c.tx)) / area;
+                uint32_t ty = ((z0 * a.ty) + (z1 * b.ty) + (z2 * c.ty)) / area;
+
+                uint16_t color = gpu_fetch_texel(
+                    gpu,
+                    tx, ty,
+                    tpx, tpy,
+                    clutx, cluty,
+                    depth);
+
+                if (!color)
+                    continue;
+
+                gpu->vram[x + (y * 1024)] = rgb888_to_rgb565(color);
+            }
+        }
+    }
+}
+
+#define I32(v, b) (((int32_t)((v) << (31 - b))) >> (31 - b))
+
+void gpu_rect(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+
+        int size = (gpu->buf[0] >> 27) & 3;
+        int textured = (gpu->buf[0] & 0x04000000) != 0;
+
+        gpu->cmd_args_remaining = 1 + (size == RS_VARIABLE) + textured;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            rect_data_t rect;
+
+            rect.attrib = gpu->buf[0] >> 24;
+
+            int textured = (rect.attrib & RA_TEXTURED) != 0;
+            int raw = (rect.attrib & RA_RAW) != 0;
+
+            // Add 1 if is textured
+            int size_offset = 2 + textured;
+
+            rect.v0.c = gpu->buf[0] & 0xffffff;
+            rect.v0.x = SE10(gpu->buf[1] & 0xffff);
+            rect.v0.y = SE10(gpu->buf[1] >> 16);
+            rect.v0.tx = (gpu->buf[2] >> 0) & 0xff;
+            rect.v0.ty = (gpu->buf[2] >> 8) & 0xff;
+            rect.clut = gpu->buf[2] >> 16;
+            rect.width = gpu->buf[size_offset] & 0xffff;
+            rect.height = gpu->buf[size_offset] >> 16;
+
+            if (textured && raw)
+                rect.v0.c = 0x808080;
+
+            gpu_render_rect(gpu, rect);
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void gpu_poly(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+
+        int shaded = (gpu->buf[0] & 0x10000000) != 0;
+        int quad = (gpu->buf[0] & 0x08000000) != 0;
+        int textured = (gpu->buf[0] & 0x04000000) != 0;
+
+        int fields_per_vertex = 1 + shaded + textured;
+        int vertices = 3 + quad;
+
+        gpu->cmd_args_remaining = (fields_per_vertex * vertices) - shaded;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            poly_data_t poly;
+
+            poly.attrib = gpu->buf[0] >> 24;
+
+            int shaded = (poly.attrib & PA_SHADED) != 0;
+            int textured = (poly.attrib & PA_TEXTURED) != 0;
+
+            int color_offset = shaded * (2 + textured);
+            int vert_offset = 1 + (textured | shaded) +
+                              (textured & shaded);
+            int texc_offset = textured * (2 + shaded);
+            int texp_offset = textured * (4 + shaded);
+
+            poly.clut = gpu->buf[2] >> 16;
+            poly.texp = gpu->buf[texp_offset] >> 16;
+
+            // Undocumented behavior?
+            // Fixes Mortal Kombat II, Bubble Bobble, Driver 1 & 2
+            if (textured)
+            {
+                gpu->texp_x = (poly.texp & 0xf) << 6;
+                gpu->texp_y = (poly.texp & 0x10) << 4;
+                gpu->texp_d = (poly.texp >> 7) & 0x3;
+                gpu->gpustat &= 0xfffffe00;
+                gpu->gpustat |= poly.texp & 0x1ff;
+            }
+
+            poly.v[0].c = gpu->buf[0 + 0 * color_offset] & 0xffffff;
+            poly.v[1].c = gpu->buf[0 + 1 * color_offset] & 0xffffff;
+            poly.v[2].c = gpu->buf[0 + 2 * color_offset] & 0xffffff;
+            poly.v[3].c = gpu->buf[0 + 3 * color_offset] & 0xffffff;
+            poly.v[0].x = SE10(gpu->buf[1 + 0 * vert_offset] & 0xffff);
+            poly.v[1].x = SE10(gpu->buf[1 + 1 * vert_offset] & 0xffff);
+            poly.v[2].x = SE10(gpu->buf[1 + 2 * vert_offset] & 0xffff);
+            poly.v[3].x = SE10(gpu->buf[1 + 3 * vert_offset] & 0xffff);
+            poly.v[0].y = SE10(gpu->buf[1 + 0 * vert_offset] >> 16);
+            poly.v[1].y = SE10(gpu->buf[1 + 1 * vert_offset] >> 16);
+            poly.v[2].y = SE10(gpu->buf[1 + 2 * vert_offset] >> 16);
+            poly.v[3].y = SE10(gpu->buf[1 + 3 * vert_offset] >> 16);
+            poly.v[0].tx = gpu->buf[2 + 0 * texc_offset] & 0xff;
+            poly.v[1].tx = gpu->buf[2 + 1 * texc_offset] & 0xff;
+            poly.v[2].tx = gpu->buf[2 + 2 * texc_offset] & 0xff;
+            poly.v[3].tx = gpu->buf[2 + 3 * texc_offset] & 0xff;
+            poly.v[0].ty = (gpu->buf[2 + 0 * texc_offset] >> 8) & 0xff;
+            poly.v[1].ty = (gpu->buf[2 + 1 * texc_offset] >> 8) & 0xff;
+            poly.v[2].ty = (gpu->buf[2 + 2 * texc_offset] >> 8) & 0xff;
+            poly.v[3].ty = (gpu->buf[2 + 3 * texc_offset] >> 8) & 0xff;
+
+            if (poly.attrib & PA_QUAD)
+            {
+                gpu_render_triangle(gpu, poly.v[0], poly.v[1], poly.v[2], poly, 1);
+                gpu_render_triangle(gpu, poly.v[1], poly.v[2], poly.v[3], poly, 1);
+            }
+            else
+            {
+                gpu_render_triangle(gpu, poly.v[0], poly.v[1], poly.v[2], poly, 0);
+            }
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void gpu_line(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+
+        int shaded = (gpu->buf[0] & 0x10000000) != 0;
+        int polyline = (gpu->buf[0] & 0x08000000) != 0;
+
+        gpu->cmd_args_remaining = polyline ? -1 : (shaded ? 3 : 2);
+        gpu->line_done = 0;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (gpu->buf[0] & 0x08000000)
+        {
+            if ((gpu->buf[gpu->buf_index - 1] & 0xf000f000) == 0x50005000)
+            {
+                gpu->state = GPU_STATE_RECV_CMD;
+
+                return;
+            }
+        }
+        else if (!gpu->cmd_args_remaining)
+        {
+            vertex_t v0, v1;
+
+            if (gpu->buf[0] & 0x10000000)
+            {
+                v0.c = gpu->buf[0] & 0xffffff;
+                v1.c = gpu->buf[2] & 0xffffff;
+                v0.x = gpu->buf[1] & 0xffff;
+                v0.y = gpu->buf[1] >> 16;
+                v1.x = gpu->buf[3] & 0xffff;
+                v1.y = gpu->buf[3] >> 16;
+            }
+            else
+            {
+                v0.c = gpu->buf[0] & 0xffffff;
+                v1.c = gpu->buf[0] & 0xffffff;
+                v0.x = gpu->buf[1] & 0xffff;
+                v0.y = gpu->buf[1] >> 16;
+                v1.x = gpu->buf[2] & 0xffff;
+                v1.y = gpu->buf[2] >> 16;
+            }
+
+            gpu_render_flat_line(gpu, v0, v1, rgb888_to_rgb565(gpu->buf[0] & 0xffffff));
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void gpu_cmd_a0(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 2;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            // Save static data
+            gpu->xpos = gpu->buf[1] & 0x3ff;
+            gpu->ypos = (gpu->buf[1] >> 16) & 0x1ff;
+            gpu->xsiz = gpu->buf[2] & 0xffff;
+            gpu->ysiz = gpu->buf[2] >> 16;
+            gpu->xsiz = ((gpu->xsiz - 1) & 0x3ff) + 1;
+            gpu->ysiz = ((gpu->ysiz - 1) & 0x1ff) + 1;
+            gpu->tsiz = ((gpu->xsiz * gpu->ysiz) + 1) & 0xfffffffe;
+            gpu->addr = gpu->xpos + (gpu->ypos * 1024);
+            gpu->xcnt = 0;
+            gpu->ycnt = 0;
+        }
+    }
+    break;
+
+    case GPU_STATE_RECV_DATA:
+    {
+        unsigned int xpos = (gpu->xpos + gpu->xcnt) & 0x3ff;
+        unsigned int ypos = (gpu->ypos + gpu->ycnt) & 0x1ff;
+
+        gpu->vram[xpos + (ypos * 1024)] = gpu->recv_data & 0xffff;
+
+        ++gpu->xcnt;
+
+        xpos = (gpu->xpos + gpu->xcnt) & 0x3ff;
+        ypos = (gpu->ypos + gpu->ycnt) & 0x1ff;
+
+        if (gpu->xcnt == gpu->xsiz)
+        {
+            ++gpu->ycnt;
+            gpu->xcnt = 0;
+
+            ypos = (gpu->ypos + gpu->ycnt) & 0x1ff;
+            xpos = (gpu->xpos + gpu->xcnt) & 0x3ff;
+        }
+
+        gpu->vram[xpos + (ypos * 1024)] = gpu->recv_data >> 16;
+
+        ++gpu->xcnt;
+
+        if (gpu->xcnt == gpu->xsiz)
+        {
+            ++gpu->ycnt;
+            gpu->xcnt = 0;
+
+            xpos = (gpu->xpos + gpu->xcnt) & 0x3ff;
+            ypos = (gpu->ypos + gpu->ycnt) & 0x1ff;
+        }
+
+        gpu->tsiz -= 2;
+
+        if (!gpu->tsiz)
+        {
+            gpu->xcnt = 0;
+            gpu->ycnt = 0;
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+// Monochrome Opaque Quadrilateral
+void gpu_cmd_28(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 4;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->v1.x = gpu->buf[2] & 0xffff;
+            gpu->v1.y = gpu->buf[2] >> 16;
+            gpu->v2.x = gpu->buf[3] & 0xffff;
+            gpu->v2.y = gpu->buf[3] >> 16;
+            gpu->v3.x = gpu->buf[4] & 0xffff;
+            gpu->v3.y = gpu->buf[4] >> 16;
+            gpu->color = gpu->buf[0] & 0xffffff;
+
+            gpu_render_flat_triangle(gpu, gpu->v0, gpu->v1, gpu->v2, rgb888_to_rgb565(gpu->color));
+            gpu_render_flat_triangle(gpu, gpu->v1, gpu->v2, gpu->v3, rgb888_to_rgb565(gpu->color));
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+// Monochrome Opaque Quadrilateral
+void gpu_cmd_30(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 5;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            gpu->v0.c = gpu->buf[0] & 0xffffff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->v1.c = gpu->buf[2] & 0xffffff;
+            gpu->v1.x = gpu->buf[3] & 0xffff;
+            gpu->v1.y = gpu->buf[3] >> 16;
+            gpu->v2.c = gpu->buf[4] & 0xffffff;
+            gpu->v2.x = gpu->buf[5] & 0xffff;
+            gpu->v2.y = gpu->buf[5] >> 16;
+
+            gpu_render_shaded_triangle(gpu, gpu->v0, gpu->v1, gpu->v2);
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+// Monochrome Opaque Quadrilateral
+void gpu_cmd_38(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 7;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            gpu->v0.c = gpu->buf[0] & 0xffffff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->v1.c = gpu->buf[2] & 0xffffff;
+            gpu->v1.x = gpu->buf[3] & 0xffff;
+            gpu->v1.y = gpu->buf[3] >> 16;
+            gpu->v2.c = gpu->buf[4] & 0xffffff;
+            gpu->v2.x = gpu->buf[5] & 0xffff;
+            gpu->v2.y = gpu->buf[5] >> 16;
+            gpu->v3.c = gpu->buf[6] & 0xffffff;
+            gpu->v3.x = gpu->buf[7] & 0xffff;
+            gpu->v3.y = gpu->buf[7] >> 16;
+
+            gpu_render_shaded_triangle(gpu, gpu->v0, gpu->v1, gpu->v2);
+            gpu_render_shaded_triangle(gpu, gpu->v1, gpu->v2, gpu->v3);
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+// Monochrome Opaque Quadrilateral
+void gpu_cmd_3c(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 11;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            uint32_t texp = gpu->buf[5] >> 16;
+            gpu->color = gpu->buf[0] & 0xffffff;
+            gpu->pal = gpu->buf[2] >> 16;
+            gpu->v0.tx = gpu->buf[2] & 0xff;
+            gpu->v0.ty = (gpu->buf[2] >> 8) & 0xff;
+            gpu->v1.tx = gpu->buf[5] & 0xff;
+            gpu->v1.ty = (gpu->buf[5] >> 8) & 0xff;
+            gpu->v2.tx = gpu->buf[8] & 0xff;
+            gpu->v2.ty = (gpu->buf[8] >> 8) & 0xff;
+            gpu->v3.tx = gpu->buf[11] & 0xff;
+            gpu->v3.ty = (gpu->buf[11] >> 8) & 0xff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->v1.x = gpu->buf[4] & 0xffff;
+            gpu->v1.y = gpu->buf[4] >> 16;
+            gpu->v2.x = gpu->buf[7] & 0xffff;
+            gpu->v2.y = gpu->buf[7] >> 16;
+            gpu->v3.x = gpu->buf[10] & 0xffff;
+            gpu->v3.y = gpu->buf[10] >> 16;
+
+            uint16_t clutx = (gpu->pal & 0x3f) << 4;
+            uint16_t cluty = (gpu->pal >> 6) & 0x1ff;
+            uint16_t tpx = (texp & 0xf) << 6;
+            uint16_t tpy = (texp & 0x10) << 4;
+            uint16_t depth = (texp >> 7) & 0x3;
+
+            gpu_render_textured_triangle(gpu, gpu->v0, gpu->v1, gpu->v2, tpx, tpy, clutx, cluty, depth);
+            gpu_render_textured_triangle(gpu, gpu->v1, gpu->v2, gpu->v3, tpx, tpy, clutx, cluty, depth);
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+// Monochrome Opaque Quadrilateral
+void gpu_cmd_2c(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 8;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            uint32_t texp = gpu->buf[4] >> 16;
+            gpu->color = gpu->buf[0] & 0xffffff;
+            gpu->pal = gpu->buf[2] >> 16;
+            gpu->v0.tx = gpu->buf[2] & 0xff;
+            gpu->v0.ty = (gpu->buf[2] >> 8) & 0xff;
+            gpu->v1.tx = gpu->buf[4] & 0xff;
+            gpu->v1.ty = (gpu->buf[4] >> 8) & 0xff;
+            gpu->v2.tx = gpu->buf[6] & 0xff;
+            gpu->v2.ty = (gpu->buf[6] >> 8) & 0xff;
+            gpu->v3.tx = gpu->buf[8] & 0xff;
+            gpu->v3.ty = (gpu->buf[8] >> 8) & 0xff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->v1.x = gpu->buf[3] & 0xffff;
+            gpu->v1.y = gpu->buf[3] >> 16;
+            gpu->v2.x = gpu->buf[5] & 0xffff;
+            gpu->v2.y = gpu->buf[5] >> 16;
+            gpu->v3.x = gpu->buf[7] & 0xffff;
+            gpu->v3.y = gpu->buf[7] >> 16;
+
+            uint16_t clutx = (gpu->pal & 0x3f) << 4;
+            uint16_t cluty = (gpu->pal >> 6) & 0x1ff;
+            uint16_t tpx = (texp & 0xf) << 6;
+            uint16_t tpy = (texp & 0x10) << 4;
+            uint16_t depth = (texp >> 7) & 0x3;
+
+            gpu_render_textured_triangle(gpu, gpu->v0, gpu->v1, gpu->v2, tpx, tpy, clutx, cluty, depth);
+            gpu_render_textured_triangle(gpu, gpu->v1, gpu->v2, gpu->v3, tpx, tpy, clutx, cluty, depth);
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+// Monochrome Opaque Quadrilateral
+void gpu_cmd_24(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 6;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            uint32_t texp = gpu->buf[4] >> 16;
+            gpu->color = gpu->buf[0] & 0xffffff;
+            gpu->pal = gpu->buf[2] >> 16;
+            gpu->v0.tx = gpu->buf[2] & 0xff;
+            gpu->v0.ty = (gpu->buf[2] >> 8) & 0xff;
+            gpu->v1.tx = gpu->buf[4] & 0xff;
+            gpu->v1.ty = (gpu->buf[4] >> 8) & 0xff;
+            gpu->v2.tx = gpu->buf[6] & 0xff;
+            gpu->v2.ty = (gpu->buf[6] >> 8) & 0xff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->v1.x = gpu->buf[3] & 0xffff;
+            gpu->v1.y = gpu->buf[3] >> 16;
+            gpu->v2.x = gpu->buf[5] & 0xffff;
+            gpu->v2.y = gpu->buf[5] >> 16;
+
+            uint16_t clutx = (gpu->pal & 0x3f) << 4;
+            uint16_t cluty = (gpu->pal >> 6) & 0x1ff;
+            uint16_t tpx = (texp & 0xf) << 6;
+            uint16_t tpy = (texp & 0x10) << 4;
+            uint16_t depth = (texp >> 7) & 0x3;
+
+            gpu_render_textured_triangle(gpu, gpu->v0, gpu->v1, gpu->v2, tpx, tpy, clutx, cluty, depth);
+            gpu_render_textured_triangle(gpu, gpu->v1, gpu->v2, gpu->v3, tpx, tpy, clutx, cluty, depth);
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+// Monochrome Opaque Quadrilateral
+void gpu_cmd_2d(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 8;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            uint32_t texp = gpu->buf[4] >> 16;
+            gpu->color = gpu->buf[0] & 0xffffff;
+            gpu->pal = gpu->buf[2] >> 16;
+            gpu->v0.tx = gpu->buf[2] & 0xff;
+            gpu->v0.ty = (gpu->buf[2] >> 8) & 0xff;
+            gpu->v1.tx = gpu->buf[4] & 0xff;
+            gpu->v1.ty = (gpu->buf[4] >> 8) & 0xff;
+            gpu->v2.tx = gpu->buf[6] & 0xff;
+            gpu->v2.ty = (gpu->buf[6] >> 8) & 0xff;
+            gpu->v3.tx = gpu->buf[8] & 0xff;
+            gpu->v3.ty = (gpu->buf[8] >> 8) & 0xff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->v1.x = gpu->buf[3] & 0xffff;
+            gpu->v1.y = gpu->buf[3] >> 16;
+            gpu->v2.x = gpu->buf[5] & 0xffff;
+            gpu->v2.y = gpu->buf[5] >> 16;
+            gpu->v3.x = gpu->buf[7] & 0xffff;
+            gpu->v3.y = gpu->buf[7] >> 16;
+
+            uint16_t clutx = (gpu->pal & 0x3f) << 4;
+            uint16_t cluty = (gpu->pal >> 6) & 0x1ff;
+            uint16_t tpx = (texp & 0xf) << 6;
+            uint16_t tpy = (texp & 0x10) << 4;
+            uint16_t depth = (texp >> 7) & 0x3;
+
+            gpu_render_textured_triangle(gpu, gpu->v0, gpu->v1, gpu->v2, tpx, tpy, clutx, cluty, depth);
+            gpu_render_textured_triangle(gpu, gpu->v1, gpu->v2, gpu->v3, tpx, tpy, clutx, cluty, depth);
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void gpu_cmd_64(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 3;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            gpu->color = gpu->buf[0] & 0xffffff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->v0.tx = gpu->buf[2] & 0xff;
+            gpu->v0.ty = (gpu->buf[2] >> 8) & 0xff;
+            gpu->pal = gpu->buf[2] >> 16;
+
+            uint32_t w = gpu->buf[3] & 0xffff;
+            uint32_t h = gpu->buf[3] >> 16;
+            uint16_t clutx = (gpu->pal & 0x3f) << 4;
+            uint16_t cluty = (gpu->pal >> 6) & 0x1ff;
+
+            gpu_render_textured_rectangle(gpu, gpu->v0, w, h, clutx, cluty, gpu->color);
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void gpu_cmd_7c(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 2;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            gpu->color = gpu->buf[0] & 0xffffff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->v0.tx = gpu->buf[2] & 0xff;
+            gpu->v0.ty = (gpu->buf[2] >> 8) & 0xff;
+            gpu->pal = gpu->buf[2] >> 16;
+
+            uint32_t w = 16;
+            uint32_t h = 16;
+            uint16_t clutx = (gpu->pal & 0x3f) << 4;
+            uint16_t cluty = (gpu->pal >> 6) & 0x1ff;
+
+            gpu_render_textured_rectangle(gpu, gpu->v0, w, h, clutx, cluty, gpu->color);
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void gpu_cmd_74(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 2;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            gpu->color = gpu->buf[0] & 0xffffff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->v0.tx = gpu->buf[2] & 0xff;
+            gpu->v0.ty = (gpu->buf[2] >> 8) & 0xff;
+            gpu->pal = gpu->buf[2] >> 16;
+
+            uint32_t w = 8;
+            uint32_t h = 8;
+            uint16_t clutx = (gpu->pal & 0x3f) << 4;
+            uint16_t cluty = (gpu->pal >> 6) & 0x1ff;
+
+            gpu_render_textured_rectangle(gpu, gpu->v0, w, h, clutx, cluty, rgb888_to_rgb565(gpu->color));
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void gpu_cmd_60(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 2;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            gpu->color = gpu->buf[0] & 0xffffff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->xsiz = gpu->buf[2] & 0xffff;
+            gpu->ysiz = gpu->buf[2] >> 16;
+
+            gpu->v0.x += gpu->off_x;
+            gpu->v0.y += gpu->off_y;
+
+            gpu_render_flat_rectangle(gpu, gpu->v0, gpu->xsiz, gpu->ysiz, rgb888_to_rgb565(gpu->color));
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void gpu_cmd_68(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 1;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            gpu->color = gpu->buf[0] & 0xffffff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+
+            gpu->v0.x += gpu->off_x;
+            gpu->v0.y += gpu->off_y;
+
+            gpu->vram[gpu->v0.x + (gpu->v0.y * 1024)] = rgb888_to_rgb565(gpu->color);
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void gpu_cmd_40(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 2;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->color = gpu->buf[0] & 0xffffff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->v1.x = gpu->buf[2] & 0xffff;
+            gpu->v1.y = gpu->buf[2] >> 16;
+
+            gpu_render_flat_line(gpu, gpu->v0, gpu->v1, rgb888_to_rgb565(gpu->color));
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void gpu_cmd_c0(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 2;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->c0_xcnt = 0;
+            gpu->c0_ycnt = 0;
+            uint32_t c0_xpos = gpu->buf[1] & 0xffff;
+            uint32_t c0_ypos = gpu->buf[1] >> 16;
+            gpu->c0_xsiz = gpu->buf[2] & 0xffff;
+            gpu->c0_ysiz = gpu->buf[2] >> 16;
+            c0_xpos = c0_xpos & 0x3ff;
+            c0_ypos = c0_ypos & 0x1ff;
+            gpu->c0_xsiz = ((gpu->c0_xsiz - 1) & 0x3ff) + 1;
+            gpu->c0_ysiz = ((gpu->c0_ysiz - 1) & 0x1ff) + 1;
+            gpu->c0_tsiz = ((gpu->c0_xsiz * gpu->c0_ysiz) + 1) & 0xfffffffe;
+            gpu->c0_addr = c0_xpos + (c0_ypos * 1024);
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void gpu_cmd_02(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 2;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            gpu->color = gpu->buf[0] & 0xffffff;
+            gpu->v0.x = gpu->buf[1] & 0xffff;
+            gpu->v0.y = gpu->buf[1] >> 16;
+            gpu->xsiz = gpu->buf[2] & 0xffff;
+            gpu->ysiz = gpu->buf[2] >> 16;
+
+            gpu->v0.x = (gpu->v0.x & 0x3f0);
+            gpu->v0.y = gpu->v0.y & 0x1ff;
+            gpu->xsiz = (((gpu->xsiz & 0x3ff) + 0x0f) & 0xfffffff0);
+            gpu->ysiz = gpu->ysiz & 0x1ff;
+
+            uint16_t color = rgb888_to_rgb565(gpu->color);
+
+            for (int y = gpu->v0.y; y < (gpu->v0.y + gpu->ysiz); y++)
+            {
+                for (int x = gpu->v0.x; x < (gpu->v0.x + gpu->xsiz); x++)
+                {
+                    if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0))
+                        gpu->vram[x + (y * 1024)] = color;
+                }
+            }
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void gpu_cmd_80(psx_gpu_t *gpu)
+{
+    switch (gpu->state)
+    {
+    case GPU_STATE_RECV_CMD:
+    {
+        gpu->state = GPU_STATE_RECV_ARGS;
+        gpu->cmd_args_remaining = 3;
+    }
+    break;
+
+    case GPU_STATE_RECV_ARGS:
+    {
+        if (!gpu->cmd_args_remaining)
+        {
+            gpu->state = GPU_STATE_RECV_DATA;
+
+            uint32_t srcx = gpu->buf[1] & 0xffff;
+            uint32_t srcy = gpu->buf[1] >> 16;
+            uint32_t dstx = gpu->buf[2] & 0xffff;
+            uint32_t dsty = gpu->buf[2] >> 16;
+            uint32_t xsiz = gpu->buf[3] & 0xffff;
+            uint32_t ysiz = gpu->buf[3] >> 16;
+
+            for (int y = 0; y < ysiz; y++)
+            {
+                for (int x = 0; x < xsiz; x++)
+                {
+                    int dstb = ((dstx + x) < 1024) && ((dsty + y) < 512);
+                    int srcb = ((srcx + x) < 1024) && ((srcy + y) < 512);
+
+                    if (dstb && srcb)
+                        gpu->vram[(dstx + x) + (dsty + y) * 1024] = gpu->vram[(srcx + x) + (srcy + y) * 1024];
+                }
+            }
+
+            gpu->state = GPU_STATE_RECV_CMD;
+        }
+    }
+    break;
+    }
+}
+
+void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_gpu_update_cmd(psx_gpu_t *gpu)
+{
+    int type = (gpu->buf[0] >> 29) & 7;
+
+    switch (type)
+    {
+    case 1:
+        gpu_poly(gpu);
+        return;
+    case 2:
+        gpu_line(gpu);
+        return;
+    case 3:
+        gpu_rect(gpu);
+        return;
+    }
+
+    switch (gpu->buf[0] >> 24)
+    {
+    case 0x00: /* nop */
+        break;
+    case 0x01: /* Cache clear */
+        break;
+    case 0x02:
+        gpu_cmd_02(gpu);
+        break;
+    case 0x24:
+        gpu_cmd_24(gpu);
+        break;
+    case 0x25:
+        gpu_cmd_24(gpu);
+        break;
+    case 0x26:
+        gpu_cmd_24(gpu);
+        break;
+    case 0x27:
+        gpu_cmd_24(gpu);
+        break;
+    case 0x28:
+        gpu_cmd_28(gpu);
+        break;
+    case 0x2a:
+        gpu_cmd_28(gpu);
+        break;
+    case 0x2c:
+        gpu_cmd_2d(gpu);
+        break;
+    case 0x2d:
+        gpu_cmd_2d(gpu);
+        break;
+    case 0x2e:
+        gpu_cmd_2d(gpu);
+        break;
+    case 0x2f:
+        gpu_cmd_2d(gpu);
+        break;
+    case 0x30:
+        gpu_cmd_30(gpu);
+        break;
+    case 0x32:
+        gpu_cmd_30(gpu);
+        break;
+    case 0x38:
+        gpu_cmd_38(gpu);
+        break;
+    case 0x3c:
+        gpu_cmd_3c(gpu);
+        break;
+    case 0x3e:
+        gpu_cmd_3c(gpu);
+        break;
+    case 0x40:
+        gpu_cmd_40(gpu);
+        break;
+    case 0x60:
+        gpu_cmd_60(gpu);
+        break;
+    case 0x62:
+        gpu_cmd_60(gpu);
+        break;
+    case 0x64:
+        gpu_cmd_64(gpu);
+        break;
+    case 0x65:
+        gpu_cmd_64(gpu);
+        break;
+    case 0x66:
+        gpu_cmd_64(gpu);
+        break;
+    case 0x67:
+        gpu_cmd_64(gpu);
+        break;
+    case 0x68:
+        gpu_cmd_68(gpu);
+        break;
+    case 0x74:
+        gpu_cmd_74(gpu);
+        break;
+    case 0x75:
+        gpu_cmd_74(gpu);
+        break;
+    case 0x76:
+        gpu_cmd_74(gpu);
+        break;
+    case 0x77:
+        gpu_cmd_74(gpu);
+        break;
+    case 0x7c:
+        gpu_cmd_7c(gpu);
+        break;
+    case 0x7d:
+        gpu_cmd_7c(gpu);
+        break;
+    case 0x7e:
+        gpu_cmd_7c(gpu);
+        break;
+    case 0x7f:
+        gpu_cmd_7c(gpu);
+        break;
+    case 0x80:
+        gpu_cmd_80(gpu);
+        break;
+    case 0xa0:
+        gpu_cmd_a0(gpu);
+        break;
+    case 0xc0:
+        gpu_cmd_c0(gpu);
+        break;
+    case 0xe1:
+    {
+        gpu->gpustat &= 0xfffff800;
+        gpu->gpustat |= gpu->buf[0] & 0x7ff;
+        gpu->texp_x = (gpu->gpustat & 0xf) << 6;
+        gpu->texp_y = (gpu->gpustat & 0x10) << 4;
+        gpu->texp_d = (gpu->gpustat >> 7) & 0x3;
+    }
+    break;
+    case 0xe2:
+    {
+        gpu->texw_mx = ((gpu->buf[0] >> 0) & 0x1f) << 3;
+        gpu->texw_my = ((gpu->buf[0] >> 5) & 0x1f) << 3;
+        gpu->texw_ox = ((gpu->buf[0] >> 10) & 0x1f) << 3;
+        gpu->texw_oy = ((gpu->buf[0] >> 15) & 0x1f) << 3;
+    }
+    break;
+    case 0xe3:
+    {
+        gpu->draw_x1 = (gpu->buf[0] >> 0) & 0x3ff;
+        gpu->draw_y1 = (gpu->buf[0] >> 10) & 0x1ff;
+    }
+    break;
+    case 0xe4:
+    {
+        gpu->draw_x2 = (gpu->buf[0] >> 0) & 0x3ff;
+        gpu->draw_y2 = (gpu->buf[0] >> 10) & 0x1ff;
+    }
+    break;
+    case 0xe5:
+    {
+        gpu->off_x = ((int32_t)(((gpu->buf[0] >> 0) & 0x7ff) << 21)) >> 21;
+        gpu->off_y = ((int32_t)(((gpu->buf[0] >> 11) & 0x7ff) << 21)) >> 21;
+    }
+    break;
+    case 0xe6:
+    {
+        /* To-do: Implement mask bit thing */
+    }
+    break;
+    default:
+    {
+        // log_set_quiet(0);
+        // log_fatal("Unhandled GP0(%02Xh)", gpu->buf[0] >> 24);
+        // log_set_quiet(1);
+
+        // exit(1);
+    }
+    break;
+    }
+}
+
+void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value)
+{
+    switch (offset)
+    {
+    // GP0
+    case 0x00:
+    {
+        switch (gpu->state)
+        {
+        case GPU_STATE_RECV_CMD:
+        {
+            gpu->buf_index = 0;
+            gpu->buf[gpu->buf_index++] = value;
+
+            psx_gpu_update_cmd(gpu);
+        }
+        break;
+
+        case GPU_STATE_RECV_ARGS:
+        {
+            gpu->buf[gpu->buf_index++] = value;
+            gpu->cmd_args_remaining--;
+
+            psx_gpu_update_cmd(gpu);
+        }
+        break;
+
+        case GPU_STATE_RECV_DATA:
+        {
+            gpu->recv_data = value;
+
+            psx_gpu_update_cmd(gpu);
+        }
+        break;
+        }
+
+        return;
+    }
+    break;
+
+    // GP1
+    case 0x04:
+    {
+        uint8_t cmd = value >> 24;
+
+        switch (cmd)
+        {
+        // Display enable
+        case 0x03:
+        {
+            gpu->gpustat &= ~0x00800000;
+            gpu->gpustat |= (value << 23) & 0x00800000;
+        }
+        break;
+        case 0x04:
+        {
+        }
+        break;
+        case 0x05:
+        {
+            gpu->disp_x = value & 0x3ff;
+            gpu->disp_y = (value >> 10) & 0x1ff;
+        }
+        break;
+        case 0x06:
+        {
+            gpu->disp_x1 = value & 0xfff;
+            gpu->disp_x2 = (value >> 12) & 0xfff;
+        }
+        break;
+        case 0x07:
+        {
+            gpu->disp_y1 = value & 0x1ff;
+            gpu->disp_y2 = (value >> 10) & 0x1ff;
+        }
+        break;
+        case 0x08:
+            gpu->display_mode = value & 0xffffff;
+
+            if (gpu->event_cb_table[GPU_EVENT_DMODE])
+                gpu->event_cb_table[GPU_EVENT_DMODE](gpu);
+            break;
+
+        case 0x10:
+        {
+            gpu->gp1_10h_req = value & 7;
+        }
+        break;
+        }
+
+        // log_error("GP1(%02Xh) args=%06x", value >> 24, value & 0xffffff);
+
+        return;
+    }
+    break;
+    }
+
+    log_warn("Unhandled 32-bit GPU write at offset %08x (%08x)", offset, value);
+}
+
+void psx_gpu_write16(psx_gpu_t *gpu, uint32_t offset, uint16_t value)
+{
+    PRINTF("Unhandled 16-bit GPU write at offset %08x (%04x)\r\n", offset, value);
+}
+
+void psx_gpu_write8(psx_gpu_t *gpu, uint32_t offset, uint8_t value)
+{
+    PRINTF("Unhandled 8-bit GPU write at offset %08x (%02x)\r\n", offset, value);
+}
+
+void psx_gpu_set_event_callback(psx_gpu_t *gpu, int event, psx_gpu_event_callback_t cb)
+{
+    gpu->event_cb_table[event] = cb;
+}
+
+void psx_gpu_set_udata(psx_gpu_t *gpu, int index, void *udata)
+{
+    gpu->udata[index] = udata;
+}
+
+#define GPU_CYCLES_PER_HDRAW_NTSC 2560.0f
+#define GPU_CYCLES_PER_SCANL_NTSC 3413.0f
+#define GPU_SCANS_PER_VDRAW_NTSC 240
+#define GPU_SCANS_PER_FRAME_NTSC 263
+#define GPU_CYCLES_PER_SCANL_PAL 3406.0f
+#define GPU_SCANS_PER_FRAME_PAL 314
+
+void gpu_hblank_event(psx_gpu_t *gpu)
+{
+    if (gpu->line < GPU_SCANS_PER_VDRAW_NTSC)
+    {
+        if (gpu->line & 1)
+        {
+            gpu->gpustat |= 1 << 31;
+        }
+        else
+        {
+            gpu->gpustat &= ~(1 << 31);
+        }
+
+        // HACK!! More games are fine with this
+        // but others, like Dead or Alive, will refuse
+        // to boot because this frequency is not fast
+        // enough. Sending T2 IRQs every line fixes DoA
+        // but breaks a bunch of games, so I'll keep this
+        // like this until I actually fix the timers
+        // Games that seem to care about T2 timing:
+        // - Street Fighter Alpha 2
+        // - Dead or Alive
+        // - NBA Jam
+        // - Doom
+        // - Devil Dice
+        // - Zanac x Zanac
+        // - Soukyugurentai
+        // - Mortal Kombat
+        // - PaRappa the Rapper
+        // - In The Hunt
+        // - Crash Bandicoot
+        // - Jackie Chan Stuntmaster
+        // - etc.
+        // Masking with 7 breaks Street Fighter Alpha 2. The game
+        // just stops sending commands to the CDROM while on
+        // Player Select. It probably uses T2 IRQs to time
+        // GetlocP commands, if the timer is too slow it will
+        // break.
+        // if (!(gpu->line & 7))
+        //     psx_ic_irq(gpu->ic, IC_SPU);
+        // psx_ic_irq(gpu->ic, IC_SPU);
+    }
+    else
+    {
+        gpu->gpustat &= ~(1 << 31);
+    }
+
+    gpu->line++;
+
+    if (gpu->line == GPU_SCANS_PER_VDRAW_NTSC)
+    {
+        if (gpu->event_cb_table[GPU_EVENT_VBLANK])
+            gpu->event_cb_table[GPU_EVENT_VBLANK](gpu);
+
+        psx_ic_irq(gpu->ic, IC_VBLANK);
+    }
+    else if (gpu->line == GPU_SCANS_PER_FRAME_NTSC)
+    {
+        if (gpu->event_cb_table[GPU_EVENT_VBLANK_END])
+            gpu->event_cb_table[GPU_EVENT_VBLANK_END](gpu);
+
+        gpu->line = 0;
+    }
+}
+
+void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_gpu_update(psx_gpu_t *gpu, int cyc)
+{
+    int prev_hblank = (gpu->cycles >= GPU_CYCLES_PER_HDRAW_NTSC) &&
+                      (gpu->cycles <= GPU_CYCLES_PER_SCANL_NTSC);
+
+    // Convert CPU (~33.8 MHz) cycles to GPU (~53.7 MHz) cycles
+    gpu->cycles += (float)cyc * (PSX_GPU_CLOCK_FREQ_NTSC / PSX_CPU_FREQ);
+
+    int curr_hblank = (gpu->cycles >= GPU_CYCLES_PER_HDRAW_NTSC) &&
+                      (gpu->cycles <= GPU_CYCLES_PER_SCANL_NTSC);
+
+    if (curr_hblank && !prev_hblank)
+    {
+        if (gpu->event_cb_table[GPU_EVENT_HBLANK])
+            gpu->event_cb_table[GPU_EVENT_HBLANK](gpu);
+
+        gpu_hblank_event(gpu);
+    }
+    else if (prev_hblank && !curr_hblank)
+    {
+        if (gpu->event_cb_table[GPU_EVENT_HBLANK_END])
+            gpu->event_cb_table[GPU_EVENT_HBLANK_END](gpu);
+
+        gpu->cycles -= (float)GPU_CYCLES_PER_SCANL_NTSC;
+    }
+}
+
+void *psx_gpu_get_display_buffer(psx_gpu_t *gpu)
+{
+    if (gpu->gpustat & 0x800000)
+        return gpu->empty;
+
+    return gpu->vram + (gpu->disp_x + (gpu->disp_y * 1024));
+}
+
+void psx_gpu_destroy(psx_gpu_t *gpu)
+{
+    free(gpu->vram);
+    free(gpu->empty); // Missing free for the empty buffer!
+    free(gpu);
+}
