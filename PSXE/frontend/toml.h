@@ -159,7 +159,7 @@ TOML_EXTERN const char *toml_table_key(const toml_table_t *tab);
  */
 TOML_EXTERN int32_t toml_utf8_to_ucs(const char *orig, int32_t len, int64_t *ret);
 TOML_EXTERN int32_t toml_ucs_to_utf8(int64_t code, char buf[6]);
-TOML_EXTERN void toml_set_memutil(void *(*xxmalloc)(uint32_t),
+TOML_EXTERN void toml_set_memutil(void *(*xxmalloc)(size_t),
                                   void (*xxfree)(void *));
 
 /*--------------------------------------------------------------

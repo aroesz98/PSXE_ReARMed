@@ -35,10 +35,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void *(*ppmalloc)(uint32_t) = malloc;
+static void *(*ppmalloc)(size_t) = malloc;
 static void (*ppfree)(void *) = free;
 
-void toml_set_memutil(void *(*xxmalloc)(uint32_t), void (*xxfree)(void *))
+void toml_set_memutil(void *(*xxmalloc)(size_t), void (*xxfree)(void *))
 {
     if (xxmalloc)
         ppmalloc = xxmalloc;

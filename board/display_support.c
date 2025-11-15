@@ -27,6 +27,7 @@
 #include "fsl_debug_console.h"
 #include "fsl_pxp.h"
 #include "core_cm7.h"
+#include "pxp_smart.h"
 
 // Suppress warnings for static functions that may not be used
 #pragma GCC diagnostic push
@@ -430,12 +431,6 @@ void DEMO_DisplayColorTest(uint16_t background_color)
 
 void DEMO_DrawRectangle(int x, int y, int w, int h, uint16_t color)
 {
-    // Try PXP acceleration first for rectangles
-    if (PXP_FillRectAccel(x, y, w, h, color))
-    {
-        return; // PXP succeeded
-    }
-    
     // Fallback to CPU implementation
     // Bounds checking
     if (x < 0 || y < 0 || x >= LCD_WIDTH || y >= LCD_HEIGHT)
