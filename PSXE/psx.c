@@ -7,7 +7,7 @@
 #include "task.h"
 
 // Static buffer for PSX instance
-static psx_t g_psx_instance;
+psx_t g_psx_instance;
 static int32_t g_psx_instance_used = 0;
 
 psx_t *psx_create(void)
@@ -48,6 +48,8 @@ uint32_t last_update_time = 0;
 uint32_t loop_cnt = 0;
 volatile uint32_t g_cycles_wm = 0;
 uint32_t frame_count = 0;
+
+// #define PSX_DEBUG_PERFORMANCE
 
 void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_update(psx_t *psx)
 {

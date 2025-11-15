@@ -6,9 +6,16 @@
 #include <string.h>
 
 #include "cpu_debug.h"
+#include "core_cm7.h"
 
 /* FATFS includes */
 #include "ff.h"
+
+// DWT (Data Watchpoint and Trace) registers for cycle counting
+#define DWT_CONTROL             (*((volatile uint32_t*)0xE0001000))
+#define DWT_CYCCNT              (*((volatile uint32_t*)0xE0001004))
+#define DEM_CR                  (*((volatile uint32_t*)0xE000EDFC))
+#define DEM_CR_TRCENA           (1 << 24)
 
 static const uint32_t g_psx_cpu_cop0_write_mask_table[] = {
     0x00000000, // cop0r0   - N/A
@@ -382,7 +389,8 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_cycle(psx_cpu_t *cpu
     cpu->pc = cpu->next_pc;
     cpu->next_pc += 4;
 
-    if (psx_cpu_check_irq(cpu))
+    int32_t irq_pending = psx_cpu_check_irq(cpu);
+    if (irq_pending)
     {
         // GTE instructions "win" over interrupts (fast path)
         if ((cpu->opcode & 0xfe000000) == 0x4a000000)
@@ -726,7 +734,7 @@ static inline void psx_cpu_i_lui(psx_cpu_t *cpu)
     cpu->r[T] = IMM16 << 16;
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_OC"))) psx_cpu_i_lb(psx_cpu_t *cpu)
+static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lb(psx_cpu_t *cpu)
 {
     TRACE_M("lb");
 
@@ -739,7 +747,7 @@ static inline void __attribute__((section(".ramfunc.$SRAM_OC"))) psx_cpu_i_lb(ps
     cpu->load_v = SE8(psx_bus_read8(cpu->bus, s + IMM16S));
 }
 
-static inline void psx_cpu_i_lh(psx_cpu_t *cpu)
+static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lh(psx_cpu_t *cpu)
 {
     TRACE_M("lh");
 
@@ -814,7 +822,7 @@ static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lw(p
     }
 }
 
-static inline void psx_cpu_i_lbu(psx_cpu_t *cpu)
+static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lbu(psx_cpu_t *cpu)
 {
     TRACE_M("lbu");
 
@@ -827,7 +835,7 @@ static inline void psx_cpu_i_lbu(psx_cpu_t *cpu)
     cpu->load_v = psx_bus_read8(cpu->bus, s + IMM16S);
 }
 
-static inline void psx_cpu_i_lhu(psx_cpu_t *cpu)
+static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lhu(psx_cpu_t *cpu)
 {
     TRACE_M("lhu");
 
@@ -880,7 +888,7 @@ static inline void psx_cpu_i_lwr(psx_cpu_t *cpu)
     // );
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_OC"))) psx_cpu_i_sb(psx_cpu_t *cpu)
+static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_sb(psx_cpu_t *cpu)
 {
     TRACE_M("sb");
 
@@ -889,18 +897,14 @@ static inline void __attribute__((section(".ramfunc.$SRAM_OC"))) psx_cpu_i_sb(ps
 
     DO_PENDING_LOAD;
 
-    // Cache isolated
-    if (cpu->cop0_r[COP0_SR] & SR_ISC)
+    // Optimized: fast path for non-isolated cache (common case)
+    if (!(cpu->cop0_r[COP0_SR] & SR_ISC))
     {
-        log_debug("Ignoring write while cache is isolated");
-
-        return;
+        psx_bus_write8(cpu->bus, s + IMM16S, t);
     }
-
-    psx_bus_write8(cpu->bus, s + IMM16S, t);
 }
 
-static inline void psx_cpu_i_sh(psx_cpu_t *cpu)
+static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_sh(psx_cpu_t *cpu)
 {
     TRACE_M("sh");
 
@@ -910,21 +914,17 @@ static inline void psx_cpu_i_sh(psx_cpu_t *cpu)
 
     DO_PENDING_LOAD;
 
-    // Cache isolated
-    if (cpu->cop0_r[COP0_SR] & SR_ISC)
+    // Optimized: fast path for non-isolated cache (common case)
+    if (!(cpu->cop0_r[COP0_SR] & SR_ISC))
     {
-        log_debug("Ignoring write while cache is isolated");
-
-        return;
-    }
-
-    if (addr & 0x1)
-    {
-        psx_cpu_exception(cpu, CAUSE_ADES);
-    }
-    else
-    {
-        psx_bus_write16(cpu->bus, addr, t);
+        if (addr & 0x1)
+        {
+            psx_cpu_exception(cpu, CAUSE_ADES);
+        }
+        else
+        {
+            psx_bus_write16(cpu->bus, addr, t);
+        }
     }
 }
 

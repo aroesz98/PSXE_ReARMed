@@ -1,6 +1,8 @@
 #ifndef BUS_INIT_H
 #define BUS_INIT_H
 
+#include <stdint.h>
+
 #include "dev/cdrom/cdrom.h"
 #include "dev/bios.h"
 #include "dev/ram.h"
@@ -17,6 +19,35 @@
 #include "dev/timer.h"
 #include "dev/pad.h"
 #include "dev/mdec.h"
+
+typedef enum
+{
+    PSX_BUS_DEVICE_NONE = 0,
+    PSX_BUS_DEVICE_BIOS,
+    PSX_BUS_DEVICE_RAM,
+    PSX_BUS_DEVICE_DMA,
+    PSX_BUS_DEVICE_EXP1,
+    PSX_BUS_DEVICE_EXP2,
+    PSX_BUS_DEVICE_MC1,
+    PSX_BUS_DEVICE_MC2,
+    PSX_BUS_DEVICE_MC3,
+    PSX_BUS_DEVICE_IC,
+    PSX_BUS_DEVICE_SCRATCHPAD,
+    PSX_BUS_DEVICE_GPU,
+    PSX_BUS_DEVICE_SPU,
+    PSX_BUS_DEVICE_TIMER,
+    PSX_BUS_DEVICE_CDROM,
+    PSX_BUS_DEVICE_PAD,
+    PSX_BUS_DEVICE_MDEC,
+} psx_bus_device_kind_t;
+
+typedef struct
+{
+    psx_bus_device_kind_t kind;
+    uint32_t base;
+    uint32_t size;
+    uint32_t delay;
+} psx_bus_cache_t;
 
 struct psx_bus_t
 {
@@ -38,6 +69,7 @@ struct psx_bus_t
     psx_mdec_t *mdec;
 
     uint32_t access_cycles;
+    psx_bus_cache_t cache;
 };
 
 void psx_bus_init_bios(psx_bus_t *, psx_bios_t *);

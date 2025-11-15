@@ -253,6 +253,7 @@ void psx_cpu_destroy(psx_cpu_t *);
 void psx_cpu_force_reset_singleton(void); // For testing only
 void psx_cpu_cycle(psx_cpu_t *);
 void psx_cpu_set_irq_pending(psx_cpu_t *);
+void psx_cpu_print_profiling(void);
 
 // Instruction cache functions
 void psx_cpu_cache_instruction(psx_cpu_t *cpu, uint32_t pc, uint32_t opcode, void (*func)(psx_cpu_t *), int32_t cycles);

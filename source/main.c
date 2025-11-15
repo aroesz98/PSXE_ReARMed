@@ -38,6 +38,8 @@
 #include "cpu.h"
 #include "frontend/screen.h"
 #include "log.h"
+#include "dev/gpu.h"
+#include "dev/gpu_test.h"
 
 /* Standard type includes */
 #include <stdint.h>
@@ -304,16 +306,18 @@ static void psx_emulator_task(void *pvParameters)
         }
     }
 
-    /* Load executable if specified */
-    if (g_psxConfig.exe_path)
-    {
-        PRINTF("Loading PSX executable: %s\r\n", g_psxConfig.exe_path);
-        /* Wait for CPU to be ready */
-        while (g_psx->cpu->pc != 0x80030000)
-        {
-            psx_update(g_psx);
-        }
-    }
+    run_all_tests();
+
+//    /* Load executable if specified */
+//    if (g_psxConfig.exe_path)
+//    {
+//        PRINTF("Loading PSX executable: %s\r\n", g_psxConfig.exe_path);
+//        /* Wait for CPU to be ready */
+//        while (g_psx->cpu->pc != 0x80030000)
+//        {
+//            psx_update(g_psx);
+//        }
+//    }
 
     /* Main emulation loop */
     PRINTF("Starting PSX emulation loop...\r\n");

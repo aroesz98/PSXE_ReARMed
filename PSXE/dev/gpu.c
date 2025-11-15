@@ -291,11 +291,138 @@ static inline unsigned int fast_saturate_u8(int val)
     return (unsigned int)val;
 }
 
+static inline uint16_t gpu_blend_rgb565(uint16_t src, uint16_t dst, int transp_mode)
+{
+    int cr = (((src >> 11) & 0x1f) << 3) << 8;
+    int cg = (((src >> 5) & 0x3f) << 2) << 8;
+    int cb = (((src >> 0) & 0x1f) << 3) << 8;
+    const int br = (((dst >> 11) & 0x1f) << 3) << 8;
+    const int bg = (((dst >> 5) & 0x3f) << 2) << 8;
+    const int bb = (((dst >> 0) & 0x1f) << 3) << 8;
+
+    switch (transp_mode)
+    {
+    case 0:
+        cr = (br * 128 + cr * 128) >> 8;
+        cg = (bg * 128 + cg * 128) >> 8;
+        cb = (bb * 128 + cb * 128) >> 8;
+        break;
+    case 1:
+        cr = (br + cr) >> 8;
+        cg = (bg + cg) >> 8;
+        cb = (bb + cb) >> 8;
+        break;
+    case 2:
+        cr = (br - cr) >> 8;
+        cg = (bg - cg) >> 8;
+        cb = (bb - cb) >> 8;
+        break;
+    case 3:
+        cr = (br + (cr * 64)) >> 8;
+        cg = (bg + (cg * 64)) >> 8;
+        cb = (bb + (cb * 64)) >> 8;
+        break;
+    }
+
+    unsigned int ucr = fast_saturate_u8(cr);
+    unsigned int ucg = fast_saturate_u8(cg);
+    unsigned int ucb = fast_saturate_u8(cb);
+    uint32_t rgb = ucr | (ucg << 8) | (ucb << 16);
+    return rgb888_to_rgb565(rgb);
+}
+
+#define ATTR_FRAC_BITS 12
+
+typedef struct
+{
+    int32_t a;
+    int32_t b;
+    int32_t c;
+} edge_func_t;
+
+typedef struct
+{
+    int32_t dx;
+    int32_t dy;
+    int32_t row;
+} plane_attr_t;
+
+static inline edge_func_t edge_setup(vertex_t v0, vertex_t v1)
+{
+    edge_func_t edge;
+    edge.a = v0.y - v1.y;
+    edge.b = v1.x - v0.x;
+    edge.c = (v0.x * v1.y) - (v0.y * v1.x);
+    return edge;
+}
+
+static inline int32_t edge_eval(const edge_func_t *edge, int32_t x, int32_t y)
+{
+    return (edge->a * x) + (edge->b * y) + edge->c;
+}
+
+static inline plane_attr_t plane_setup(const vertex_t *va,
+                                       const vertex_t *vb,
+                                       const vertex_t *vc,
+                                       int32_t area,
+                                       int attr_a,
+                                       int attr_b,
+                                       int attr_c,
+                                       int32_t frac_bits,
+                                       int32_t xmin,
+                                       int32_t ymin)
+{
+    plane_attr_t plane;
+    int64_t num_dx = (int64_t)attr_a * (vb->y - vc->y) +
+                     (int64_t)attr_b * (vc->y - va->y) +
+                     (int64_t)attr_c * (va->y - vb->y);
+
+    int64_t num_dy = (int64_t)attr_a * (vc->x - vb->x) +
+                     (int64_t)attr_b * (va->x - vc->x) +
+                     (int64_t)attr_c * (vb->x - va->x);
+
+    plane.dx = (int32_t)((num_dx << frac_bits) / area);
+    plane.dy = (int32_t)((num_dy << frac_bits) / area);
+
+    int32_t base = attr_a << frac_bits;
+    int32_t x_off = xmin - va->x;
+    int32_t y_off = ymin - va->y;
+
+    plane.row = base + plane.dx * x_off + plane.dy * y_off;
+    return plane;
+}
+
+#define CLAMP(v, d, u) ((v) <= (d)) ? (d) : (((v) >= (u)) ? (u) : (v))
+
+static inline void gpu_fill_span(uint16_t *dst, uint16_t color, int count)
+{
+    if (count <= 0)
+        return;
+
+    if (((uintptr_t)dst & 0x2) && count)
+    {
+        *dst++ = color;
+        --count;
+    }
+
+    uint32_t packed = (uint32_t)color | ((uint32_t)color << 16);
+    uint32_t *dst32 = (uint32_t *)dst;
+    while (count >= 2)
+    {
+        *dst32++ = packed;
+        count -= 2;
+    }
+
+    if (count)
+    {
+        uint16_t *tail = (uint16_t *)dst32;
+        *tail = color;
+    }
+}
+
 void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, poly_data_t data, int edge)
 {
-    // --- Rasterizer-style triangle setup ---
     vertex_t a, b, c;
-    // Precompute texture and clut parameters
     const int tpx = (data.texp & 0xf) << 6;
     const int tpy = (data.texp & 0x10) << 4;
     const int clutx = (data.clut & 0x3f) << 4;
@@ -304,11 +431,10 @@ void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, 
     const int is_textured = (data.attrib & PA_TEXTURED) != 0;
     const int is_shaded = (data.attrib & PA_SHADED) != 0;
     const int is_raw = (data.attrib & PA_RAW) != 0;
-    int transp = (data.attrib & PA_TRANSP) != 0;
+    const int transparency_enabled = (data.attrib & PA_TRANSP) != 0;
     const int transp_mode = is_textured ? ((data.texp >> 5) & 3) : ((gpu->gpustat >> 5) & 3);
 
     a = v0;
-    // Ensure the winding order is correct (CCW)
     if (EDGE(v0, v1, v2) < 0)
     {
         b = v2;
@@ -320,7 +446,6 @@ void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, 
         c = v2;
     }
 
-    // Apply offset once
     const int off_x = gpu->off_x;
     const int off_y = gpu->off_y;
     a.x += off_x;
@@ -330,7 +455,6 @@ void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, 
     b.y += off_y;
     c.y += off_y;
 
-    // Rasterizer-style bounding box
     int xmin = max(min3(a.x, b.x, c.x), gpu->draw_x1);
     int ymin = max(min3(a.y, b.y, c.y), gpu->draw_y1);
     int xmax = min(max3(a.x, b.x, c.x), min(gpu->draw_x2, 1023));
@@ -339,342 +463,555 @@ void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, 
     if (xmin > xmax || ymin > ymax)
         return;
 
-    // Edge function setup (float for rasterizer style, but keep int64 for PSX precision)
-    int64_t area = (int64_t)(b.x - a.x) * (int64_t)(c.y - a.y) - (int64_t)(b.y - a.y) * (int64_t)(c.x - a.x);
-    if (area == 0)
+    int64_t area64 = (int64_t)(b.x - a.x) * (int64_t)(c.y - a.y) - (int64_t)(b.y - a.y) * (int64_t)(c.x - a.x);
+    if (area64 <= 0)
         return;
-    int64_t inv_area_fp = ((int64_t)1 << 32) / area;
+    int32_t area = (int32_t)area64;
 
-    uint32_t mod = is_shaded ? 0 : data.v[0].c;
-    int ac_r = is_shaded ? ((a.c >> 0) & 0xff) : 0;
-    int ac_g = is_shaded ? ((a.c >> 8) & 0xff) : 0;
-    int ac_b = is_shaded ? ((a.c >> 16) & 0xff) : 0;
-    int bc_r = is_shaded ? ((b.c >> 0) & 0xff) : 0;
-    int bc_g = is_shaded ? ((b.c >> 8) & 0xff) : 0;
-    int bc_b = is_shaded ? ((b.c >> 16) & 0xff) : 0;
-    int cc_r = is_shaded ? ((c.c >> 0) & 0xff) : 0;
-    int cc_g = is_shaded ? ((c.c >> 8) & 0xff) : 0;
-    int cc_b = is_shaded ? ((c.c >> 16) & 0xff) : 0;
+    edge_func_t edge0 = edge_setup(a, b);
+    edge_func_t edge1 = edge_setup(b, c);
+    edge_func_t edge2 = edge_setup(c, a);
 
-    // --- Rasterizer-style scan ---
-    for (int y = ymin; y <= ymax; ++y)
+    int32_t e0_row = edge_eval(&edge0, xmin, ymin);
+    int32_t e1_row = edge_eval(&edge1, xmin, ymin);
+    int32_t e2_row = edge_eval(&edge2, xmin, ymin);
+
+    uint16_t *__restrict vram = gpu->vram;
+    const uint32_t flat_color = data.v[0].c;
+    const uint16_t flat_color565 = rgb888_to_rgb565(flat_color);
+    const int32_t edge0_a = edge0.a;
+    const int32_t edge1_a = edge1.a;
+    const int32_t edge2_a = edge2.a;
+    const int32_t edge0_b = edge0.b;
+    const int32_t edge1_b = edge1.b;
+    const int32_t edge2_b = edge2.b;
+
+    if (!is_textured && !is_shaded && !transparency_enabled)
     {
-        int y_offset = y * 1024;
-        int dy_dither = (y - ymin) & 3;
-        for (int x = xmin; x <= xmax; ++x)
-        {
-            // Edge functions (int64 for PSX precision)
-            int64_t e0 = (int64_t)(b.x - a.x) * (y - a.y) - (int64_t)(b.y - a.y) * (x - a.x);
-            int64_t e1 = (int64_t)(c.x - b.x) * (y - b.y) - (int64_t)(c.y - b.y) * (x - b.x);
-            int64_t e2 = (int64_t)(a.x - c.x) * (y - c.y) - (int64_t)(a.y - c.y) * (x - c.x);
-            // Top-left rule (same as original)
-            if (e0 < 0 || e1 < 0 || e2 < 0)
-                continue;
+        const uint16_t out_color = flat_color565;
+        int vram_row = ymin * 1024;
 
-            uint16_t color = 0;
-            if (is_shaded)
+        for (int y = ymin; y <= ymax; ++y, vram_row += 1024)
+        {
+            int32_t e0 = e0_row;
+            int32_t e1 = e1_row;
+            int32_t e2 = e2_row;
+            int x = xmin;
+
+            while (x <= xmax && (e0 | e1 | e2) < 0)
             {
-                int64_t cr0 = e1 * ac_r, cr1 = e2 * bc_r, cr2 = e0 * cc_r;
-                int64_t cg0 = e1 * ac_g, cg1 = e2 * bc_g, cg2 = e0 * cc_g;
-                int64_t cb0 = e1 * ac_b, cb1 = e2 * bc_b, cb2 = e0 * cc_b;
-                int64_t cr_fp = ((cr0 + cr1 + cr2) * inv_area_fp) >> 32;
-                int64_t cg_fp = ((cg0 + cg1 + cg2) * inv_area_fp) >> 32;
-                int64_t cb_fp = ((cb0 + cb1 + cb2) * inv_area_fp) >> 32;
-                int cr = (int)cr_fp, cg = (int)cg_fp, cb = (int)cb_fp;
-                int dx_dither = (x - xmin) & 3;
-                int dither = g_psx_gpu_dither_kernel[dx_dither + (dy_dither << 2)];
-                cr += dither;
-                cg += dither;
-                cb += dither;
-                unsigned int ucr = fast_saturate_u8(cr);
-                unsigned int ucg = fast_saturate_u8(cg);
-                unsigned int ucb = fast_saturate_u8(cb);
-                mod = (ucb << 16) | (ucg << 8) | ucr;
+                e0 += edge0_a;
+                e1 += edge1_a;
+                e2 += edge2_a;
+                ++x;
             }
-            if (is_textured)
+
+            if (x <= xmax)
             {
-                int64_t tx0 = e1 * a.tx, tx1 = e2 * b.tx, tx2 = e0 * c.tx;
-                int64_t ty0 = e1 * a.ty, ty1 = e2 * b.ty, ty2 = e0 * c.ty;
-                int64_t tx_fp = ((tx0 + tx1 + tx2) * inv_area_fp) >> 32;
-                int64_t ty_fp = ((ty0 + ty1 + ty2) * inv_area_fp) >> 32;
-                int tx = (int)tx_fp, ty = (int)ty_fp;
-                uint16_t texel = gpu_fetch_texel(gpu, tx, ty, tpx, tpy, clutx, cluty, depth);
-                if (!texel)
-                    continue;
-                if (data.attrib & PA_TRANSP)
-                    transp = (texel & 0x8000) != 0;
+                int start_x = x;
+                int count = 0;
+                do
+                {
+                    count++;
+                    e0 += edge0_a;
+                    e1 += edge1_a;
+                    e2 += edge2_a;
+                    ++x;
+                } while (x <= xmax && (e0 | e1 | e2) >= 0);
+                gpu_fill_span(&vram[vram_row + start_x], out_color, count);
+            }
+
+            e0_row += edge0_b;
+            e1_row += edge1_b;
+            e2_row += edge2_b;
+        }
+        return;
+    }
+
+    plane_attr_t r_plane = {0}, g_plane = {0}, b_plane = {0};
+    plane_attr_t tx_plane = {0}, ty_plane = {0};
+    int32_t r_row = 0, g_row = 0, b_row = 0;
+    int32_t tx_row = 0, ty_row = 0;
+
+    if (is_shaded)
+    {
+        r_plane = plane_setup(&a, &b, &c, area, (a.c >> 0) & 0xff, (b.c >> 0) & 0xff, (c.c >> 0) & 0xff, ATTR_FRAC_BITS, xmin, ymin);
+        g_plane = plane_setup(&a, &b, &c, area, (a.c >> 8) & 0xff, (b.c >> 8) & 0xff, (c.c >> 8) & 0xff, ATTR_FRAC_BITS, xmin, ymin);
+        b_plane = plane_setup(&a, &b, &c, area, (a.c >> 16) & 0xff, (b.c >> 16) & 0xff, (c.c >> 16) & 0xff, ATTR_FRAC_BITS, xmin, ymin);
+        r_row = r_plane.row;
+        g_row = g_plane.row;
+        b_row = b_plane.row;
+    }
+
+    if (is_textured)
+    {
+        tx_plane = plane_setup(&a, &b, &c, area, a.tx, b.tx, c.tx, ATTR_FRAC_BITS, xmin, ymin);
+        ty_plane = plane_setup(&a, &b, &c, area, a.ty, b.ty, c.ty, ATTR_FRAC_BITS, xmin, ymin);
+        tx_row = tx_plane.row;
+        ty_row = ty_plane.row;
+    }
+
+    if (!is_textured && !transparency_enabled)
+    {
+        int vram_row = ymin * 1024;
+        for (int y = ymin; y <= ymax; ++y, vram_row += 1024)
+        {
+            int32_t e0 = e0_row;
+            int32_t e1 = e1_row;
+            int32_t e2 = e2_row;
+            int32_t r_val = r_row;
+            int32_t g_val = g_row;
+            int32_t b_val = b_row;
+            uint16_t *dst = &vram[vram_row + xmin];
+            int x = xmin;
+            const int kernel_row = ((y - ymin) & 3) << 2;
+            int dx_dither = 0;
+
+            while (x <= xmax && (e0 | e1 | e2) < 0)
+            {
+                e0 += edge0_a;
+                e1 += edge1_a;
+                e2 += edge2_a;
+                r_val += r_plane.dx;
+                g_val += g_plane.dx;
+                b_val += b_plane.dx;
+                ++x;
+                ++dst;
+                dx_dither = (dx_dither + 1) & 3;
+            }
+
+            while (x <= xmax && (e0 | e1 | e2) >= 0)
+            {
+                int cr = r_val >> ATTR_FRAC_BITS;
+                int cg = g_val >> ATTR_FRAC_BITS;
+                int cb = b_val >> ATTR_FRAC_BITS;
+                const int dither = g_psx_gpu_dither_kernel[dx_dither | kernel_row];
+                cr = fast_saturate_u8(cr + dither);
+                cg = fast_saturate_u8(cg + dither);
+                cb = fast_saturate_u8(cb + dither);
+                const uint32_t mod_color = (cb << 16) | (cg << 8) | cr;
+                *dst++ = rgb888_to_rgb565(mod_color);
+
+                e0 += edge0_a;
+                e1 += edge1_a;
+                e2 += edge2_a;
+                r_val += r_plane.dx;
+                g_val += g_plane.dx;
+                b_val += b_plane.dx;
+                ++x;
+                dx_dither = (dx_dither + 1) & 3;
+            }
+
+            e0_row += edge0_b;
+            e1_row += edge1_b;
+            e2_row += edge2_b;
+            r_row += r_plane.dy;
+            g_row += g_plane.dy;
+            b_row += b_plane.dy;
+        }
+        return;
+    }
+
+    if (!is_textured)
+    {
+        if (is_shaded)
+        {
+            int vram_row = ymin * 1024;
+            for (int y = ymin; y <= ymax; ++y, vram_row += 1024)
+            {
+                int32_t e0 = e0_row;
+                int32_t e1 = e1_row;
+                int32_t e2 = e2_row;
+                int32_t r_val = r_row;
+                int32_t g_val = g_row;
+                int32_t b_val = b_row;
+                uint16_t *dst = &vram[vram_row + xmin];
+                int x = xmin;
+                const int kernel_row = ((y - ymin) & 3) << 2;
+                int dx_dither = 0;
+
+                while (x <= xmax && (e0 | e1 | e2) < 0)
+                {
+                    e0 += edge0_a;
+                    e1 += edge1_a;
+                    e2 += edge2_a;
+                    r_val += r_plane.dx;
+                    g_val += g_plane.dx;
+                    b_val += b_plane.dx;
+                    ++x;
+                    ++dst;
+                    dx_dither = (dx_dither + 1) & 3;
+                }
+
+                while (x <= xmax && (e0 | e1 | e2) >= 0)
+                {
+                    int cr = r_val >> ATTR_FRAC_BITS;
+                    int cg = g_val >> ATTR_FRAC_BITS;
+                    int cb = b_val >> ATTR_FRAC_BITS;
+                    const int dither = g_psx_gpu_dither_kernel[dx_dither | kernel_row];
+                    cr = fast_saturate_u8(cr + dither);
+                    cg = fast_saturate_u8(cg + dither);
+                    cb = fast_saturate_u8(cb + dither);
+                    const uint32_t mod_color = (cb << 16) | (cg << 8) | cr;
+                    const uint16_t out_color = rgb888_to_rgb565(mod_color);
+                    *dst = gpu_blend_rgb565(out_color, *dst, transp_mode);
+
+                    e0 += edge0_a;
+                    e1 += edge1_a;
+                    e2 += edge2_a;
+                    r_val += r_plane.dx;
+                    g_val += g_plane.dx;
+                    b_val += b_plane.dx;
+                    ++x;
+                    ++dst;
+                    dx_dither = (dx_dither + 1) & 3;
+                }
+
+                e0_row += edge0_b;
+                e1_row += edge1_b;
+                e2_row += edge2_b;
+                r_row += r_plane.dy;
+                g_row += g_plane.dy;
+                b_row += b_plane.dy;
+            }
+        }
+        else
+        {
+            int vram_row = ymin * 1024;
+            for (int y = ymin; y <= ymax; ++y, vram_row += 1024)
+            {
+                int32_t e0 = e0_row;
+                int32_t e1 = e1_row;
+                int32_t e2 = e2_row;
+                uint16_t *dst = &vram[vram_row + xmin];
+                int x = xmin;
+
+                while (x <= xmax && (e0 | e1 | e2) < 0)
+                {
+                    e0 += edge0_a;
+                    e1 += edge1_a;
+                    e2 += edge2_a;
+                    ++x;
+                    ++dst;
+                }
+
+                while (x <= xmax && (e0 | e1 | e2) >= 0)
+                {
+                    *dst = gpu_blend_rgb565(flat_color565, *dst, transp_mode);
+
+                    e0 += edge0_a;
+                    e1 += edge1_a;
+                    e2 += edge2_a;
+                    ++x;
+                    ++dst;
+                }
+
+                e0_row += edge0_b;
+                e1_row += edge1_b;
+                e2_row += edge2_b;
+            }
+        }
+        return;
+    }
+
+    if (is_shaded)
+    {
+        int vram_row = ymin * 1024;
+        for (int y = ymin; y <= ymax; ++y, vram_row += 1024)
+        {
+            int32_t e0 = e0_row;
+            int32_t e1 = e1_row;
+            int32_t e2 = e2_row;
+            int32_t r_val = r_row;
+            int32_t g_val = g_row;
+            int32_t b_val = b_row;
+            int32_t tx_val = tx_row;
+            int32_t ty_val = ty_row;
+            uint16_t *dst = &vram[vram_row + xmin];
+            int x = xmin;
+            const int kernel_row = ((y - ymin) & 3) << 2;
+            int dx_dither = 0;
+
+            while (x <= xmax && (e0 | e1 | e2) < 0)
+            {
+                e0 += edge0_a;
+                e1 += edge1_a;
+                e2 += edge2_a;
+                r_val += r_plane.dx;
+                g_val += g_plane.dx;
+                b_val += b_plane.dx;
+                tx_val += tx_plane.dx;
+                ty_val += ty_plane.dx;
+                ++x;
+                ++dst;
+                dx_dither = (dx_dither + 1) & 3;
+            }
+
+            while (x <= xmax && (e0 | e1 | e2) >= 0)
+            {
+                int cr = r_val >> ATTR_FRAC_BITS;
+                int cg = g_val >> ATTR_FRAC_BITS;
+                int cb = b_val >> ATTR_FRAC_BITS;
+                const int dither = g_psx_gpu_dither_kernel[dx_dither | kernel_row];
+                cr = fast_saturate_u8(cr + dither);
+                cg = fast_saturate_u8(cg + dither);
+                cb = fast_saturate_u8(cb + dither);
+                const uint32_t mod_color = (cb << 16) | (cg << 8) | cr;
+
+                const int tx = tx_val >> ATTR_FRAC_BITS;
+                const int ty = ty_val >> ATTR_FRAC_BITS;
+                const uint16_t texel = gpu_fetch_texel(gpu, tx, ty, tpx, tpy, clutx, cluty, depth);
+
+                if (__builtin_expect(texel != 0, 1))
+                {
+                    uint16_t out_color;
+                    if (is_raw)
+                    {
+                        out_color = texel;
+                    }
+                    else
+                    {
+                        const int tr = ((texel >> 0) & 0x1f) << 3;
+                        const int tg = ((texel >> 5) & 0x1f) << 3;
+                        const int tb = ((texel >> 10) & 0x1f) << 3;
+                        const int mr = (mod_color >> 0) & 0xff;
+                        const int mg = (mod_color >> 8) & 0xff;
+                        const int mb = (mod_color >> 16) & 0xff;
+                        const int pr = (tr * mr) >> 7;
+                        const int pg = (tg * mg) >> 7;
+                        const int pb = (tb * mb) >> 7;
+                        const unsigned int upr = fast_saturate_u8(pr);
+                        const unsigned int upg = fast_saturate_u8(pg);
+                        const unsigned int upb = fast_saturate_u8(pb);
+                        const uint32_t rgb = upr | (upg << 8) | (upb << 16);
+                        out_color = rgb888_to_rgb565(rgb);
+                    }
+
+                    if (transparency_enabled && (texel & 0x8000))
+                    {
+                        *dst = gpu_blend_rgb565(out_color, *dst, transp_mode);
+                    }
+                    else
+                    {
+                        *dst = out_color;
+                    }
+                }
+
+                e0 += edge0_a;
+                e1 += edge1_a;
+                e2 += edge2_a;
+                r_val += r_plane.dx;
+                g_val += g_plane.dx;
+                b_val += b_plane.dx;
+                tx_val += tx_plane.dx;
+                ty_val += ty_plane.dx;
+                ++x;
+                ++dst;
+                dx_dither = (dx_dither + 1) & 3;
+            }
+
+            e0_row += edge0_b;
+            e1_row += edge1_b;
+            e2_row += edge2_b;
+            r_row += r_plane.dy;
+            g_row += g_plane.dy;
+            b_row += b_plane.dy;
+            tx_row += tx_plane.dy;
+            ty_row += ty_plane.dy;
+        }
+        return;
+    }
+
+    const int mod_r = flat_color & 0xff;
+    const int mod_g = (flat_color >> 8) & 0xff;
+    const int mod_b = (flat_color >> 16) & 0xff;
+    int vram_row = ymin * 1024;
+
+    for (int y = ymin; y <= ymax; ++y, vram_row += 1024)
+    {
+        int32_t e0 = e0_row;
+        int32_t e1 = e1_row;
+        int32_t e2 = e2_row;
+        int32_t tx_val = tx_row;
+        int32_t ty_val = ty_row;
+        uint16_t *dst = &vram[vram_row + xmin];
+        int x = xmin;
+
+        while (x <= xmax && (e0 | e1 | e2) < 0)
+        {
+            e0 += edge0_a;
+            e1 += edge1_a;
+            e2 += edge2_a;
+            tx_val += tx_plane.dx;
+            ty_val += ty_plane.dx;
+            ++x;
+            ++dst;
+        }
+
+        while (x <= xmax && (e0 | e1 | e2) >= 0)
+        {
+            const int tx = tx_val >> ATTR_FRAC_BITS;
+            const int ty = ty_val >> ATTR_FRAC_BITS;
+            const uint16_t texel = gpu_fetch_texel(gpu, tx, ty, tpx, tpy, clutx, cluty, depth);
+
+            if (__builtin_expect(texel != 0, 1))
+            {
+                uint16_t out_color;
                 if (is_raw)
                 {
-                    color = texel;
+                    out_color = texel;
                 }
                 else
                 {
-                    int tr = ((texel >> 0) & 0x1f) << 3;
-                    int tg = ((texel >> 5) & 0x1f) << 3;
-                    int tb = ((texel >> 10) & 0x1f) << 3;
-                    int mr = (mod >> 0) & 0xff;
-                    int mg = (mod >> 8) & 0xff;
-                    int mb = (mod >> 16) & 0xff;
-                    int cr = (tr * mr) >> 7;
-                    int cg = (tg * mg) >> 7;
-                    int cb = (tb * mb) >> 7;
-                    unsigned int ucr = fast_saturate_u8(cr);
-                    unsigned int ucg = fast_saturate_u8(cg);
-                    unsigned int ucb = fast_saturate_u8(cb);
-                    uint32_t rgb = ucr | (ucg << 8) | (ucb << 16);
-                    color = rgb888_to_rgb565(rgb);
+                    const int tr = ((texel >> 0) & 0x1f) << 3;
+                    const int tg = ((texel >> 5) & 0x1f) << 3;
+                    const int tb = ((texel >> 10) & 0x1f) << 3;
+                    const int pr = (tr * mod_r) >> 7;
+                    const int pg = (tg * mod_g) >> 7;
+                    const int pb = (tb * mod_b) >> 7;
+                    const unsigned int upr = fast_saturate_u8(pr);
+                    const unsigned int upg = fast_saturate_u8(pg);
+                    const unsigned int upb = fast_saturate_u8(pb);
+                    const uint32_t rgb = upr | (upg << 8) | (upb << 16);
+                    out_color = rgb888_to_rgb565(rgb);
                 }
-            }
-            else
-            {
-                color = rgb888_to_rgb565(mod);
-            }
-            if (__builtin_expect(transp, 0))
-            {
-                const uint16_t back = gpu->vram[x + y_offset];
-                int cr = (((color >> 11) & 0x1f) << 3) << 8; // RGB565: Red bits 15-11
-                int cg = (((color >> 5) & 0x3f) << 2) << 8;  // RGB565: Green bits 10-5
-                int cb = (((color >> 0) & 0x1f) << 3) << 8;  // RGB565: Blue bits 4-0
-                const int br = (((back >> 11) & 0x1f) << 3) << 8;
-                const int bg = (((back >> 5) & 0x3f) << 2) << 8;
-                const int bb = (((back >> 0) & 0x1f) << 3) << 8;
-                switch (transp_mode)
+
+                if (transparency_enabled && (texel & 0x8000))
                 {
-                case 0:
-                    cr = (br * 128 + cr * 128) >> 8;
-                    cg = (bg * 128 + cg * 128) >> 8;
-                    cb = (bb * 128 + cb * 128) >> 8;
-                    break;
-                case 1:
-                    cr = (br + cr) >> 8;
-                    cg = (bg + cg) >> 8;
-                    cb = (bb + cb) >> 8;
-                    break;
-                case 2:
-                    cr = (br - cr) >> 8;
-                    cg = (bg - cg) >> 8;
-                    cb = (bb - cb) >> 8;
-                    break;
-                case 3:
-                    cr = (br + (cr * 64)) >> 8;
-                    cg = (bg + (cg * 64)) >> 8;
-                    cb = (bb + (cb * 64)) >> 8;
-                    break;
+                    *dst = gpu_blend_rgb565(out_color, *dst, transp_mode);
                 }
-                unsigned int ucr = fast_saturate_u8(cr);
-                unsigned int ucg = fast_saturate_u8(cg);
-                unsigned int ucb = fast_saturate_u8(cb);
-                uint32_t rgb = ucr | (ucg << 8) | (ucb << 16);
-                color = rgb888_to_rgb565(rgb);
+                else
+                {
+                    *dst = out_color;
+                }
             }
-            gpu->vram[x + y_offset] = color;
+
+            e0 += edge0_a;
+            e1 += edge1_a;
+            e2 += edge2_a;
+            tx_val += tx_plane.dx;
+            ty_val += ty_plane.dx;
+            ++x;
+            ++dst;
         }
+
+        e0_row += edge0_b;
+        e1_row += edge1_b;
+        e2_row += edge2_b;
+        tx_row += tx_plane.dy;
+        ty_row += ty_plane.dy;
     }
 }
 
-#define CLAMP(v, d, u) ((v) <= (d)) ? (d) : (((v) >= (u)) ? (u) : (v))
-
 void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
 {
-    // Early rejection
     if ((data.v0.x >= 1024) || (data.v0.y >= 512) ||
         (data.v0.x <= -1024) || (data.v0.y <= -512))
         return;
 
-    // Get rectangle dimensions
-    uint16_t width, height;
-    switch ((data.attrib >> 3) & 3)
-    {
-    case RS_VARIABLE:
-        width = data.width;
-        height = data.height;
-        break;
-    case RS_1X1:
-        width = 1;
-        height = 1;
-        break;
-    case RS_8X8:
-        width = 8;
-        height = 8;
-        break;
-    case RS_16X16:
-        width = 16;
-        height = 16;
-        break;
-    }
+    uint16_t width = data.width;
+    uint16_t height = data.height;
 
-    // Cache attributes
+    if (!width || !height)
+        return;
+
     const int is_textured = (data.attrib & RA_TEXTURED) != 0;
-    int transp = (data.attrib & RA_TRANSP) != 0;
+    const int base_transp = (data.attrib & RA_TRANSP) != 0;
+    const int is_raw = (data.attrib & RA_RAW) != 0;
     const int transp_mode = (gpu->gpustat >> 5) & 3;
 
-    // Texture parameters (computed once)
     const int tpx = gpu->texp_x;
     const int tpy = gpu->texp_y;
     const int clutx = (data.clut & 0x3f) << 4;
     const int cluty = (data.clut >> 6) & 0x1ff;
     const int depth = gpu->texp_d;
 
-    // Apply GPU offset
-    int32_t x0 = data.v0.x + gpu->off_x;
-    int32_t y0 = data.v0.y + gpu->off_y;
-    int32_t x1 = x0 + width;
-    int32_t y1 = y0 + height;
+    const int32_t screen_x0 = data.v0.x + gpu->off_x;
+    const int32_t screen_y0 = data.v0.y + gpu->off_y;
+    int32_t x0 = max(screen_x0, gpu->draw_x1);
+    int32_t y0 = max(screen_y0, gpu->draw_y1);
+    int32_t x1 = min(screen_x0 + width, gpu->draw_x2 + 1);
+    int32_t y1 = min(screen_y0 + height, gpu->draw_y2 + 1);
 
-    // Clamp to drawing area
-    x0 = max(x0, gpu->draw_x1);
-    y0 = max(y0, gpu->draw_y1);
-    x1 = min(x1, gpu->draw_x2 + 1);
-    y1 = min(y1, gpu->draw_y2 + 1);
-
-    // Early rejection if completely clipped
     if (x0 >= x1 || y0 >= y1)
         return;
 
-    // For non-textured, non-transparent solid rectangles, use fast path
-    if (!is_textured && !transp)
+    const int rect_w = x1 - x0;
+    const uint16_t solid_color = rgb888_to_rgb565(data.v0.c);
+
+    if (!is_textured && !base_transp)
     {
-        const uint16_t color = rgb888_to_rgb565(data.v0.c);
-        const int w = x1 - x0;
-
-        // Optimized rectangle filling using word-aligned writes when possible
-        for (int32_t y = y0; y < y1; y++)
+        for (int32_t y = y0; y < y1; ++y)
         {
-            uint16_t *vram_line = &gpu->vram[x0 + y * 1024];
+            uint16_t *dst = &gpu->vram[x0 + y * 1024];
+            gpu_fill_span(dst, solid_color, rect_w);
+        }
+        return;
+    }
 
-            // Use memset-style filling for larger rectangles
-            if (w >= 8)
+    if (!is_textured)
+    {
+        for (int32_t y = y0; y < y1; ++y)
+        {
+            uint16_t *dst = &gpu->vram[x0 + y * 1024];
+            for (int32_t i = 0; i < rect_w; ++i, ++dst)
             {
-                // Fill 4 pixels at a time using 64-bit writes if aligned
-                uint32_t color32 = (uint32_t)color | ((uint32_t)color << 16);
-                uint32_t *vram32 = (uint32_t *)vram_line;
-                int32_t w32 = w / 2;
-
-                for (int32_t i = 0; i < w32; i++)
-                {
-                    vram32[i] = color32;
-                }
-
-                // Handle remaining pixels
-                if (w & 1)
-                {
-                    vram_line[w - 1] = color;
-                }
-            }
-            else
-            {
-                // Small rectangles - simple loop
-                for (int32_t i = 0; i < w; i++)
-                {
-                    vram_line[i] = color;
-                }
+                *dst = gpu_blend_rgb565(solid_color, *dst, transp_mode);
             }
         }
         return;
     }
 
-    // Complex path for textured/transparent rectangles
-    int32_t tex_x = 0, tex_y = 0;
+    const int mod_r = (data.v0.c >> 0) & 0xff;
+    const int mod_g = (data.v0.c >> 8) & 0xff;
+    const int mod_b = (data.v0.c >> 16) & 0xff;
+    const int32_t tex_start_x = data.v0.tx + (x0 - screen_x0);
+    int32_t tex_y = data.v0.ty + (y0 - screen_y0);
 
-    for (int32_t y = y0; y < y1; y++)
+    for (int32_t y = y0; y < y1; ++y, ++tex_y)
     {
-        tex_x = 0;
-        uint16_t *vram_line = &gpu->vram[x0 + y * 1024];
+        uint16_t *dst = &gpu->vram[x0 + y * 1024];
+        int32_t tex_x = tex_start_x;
 
-        for (int32_t x = x0; x < x1; x++)
+        for (int32_t i = 0; i < rect_w; ++i, ++tex_x, ++dst)
         {
-            uint16_t color;
+            const uint16_t texel = gpu_fetch_texel(
+                gpu,
+                tex_x, tex_y,
+                tpx, tpy, clutx, cluty, depth);
 
-            if (is_textured)
+            if (!texel)
+                continue;
+
+            uint16_t out_color;
+            if (is_raw)
             {
-                const uint16_t texel = gpu_fetch_texel(
-                    gpu,
-                    data.v0.tx + tex_x, data.v0.ty + tex_y,
-                    tpx, tpy, clutx, cluty, depth);
-
-                if (!texel)
-                {
-                    tex_x++;
-                    continue;
-                }
-
-                if ((data.attrib & RA_TRANSP) != 0)
-                    transp = (texel & 0x8000) != 0;
-
-                // Optimized texture modulation
-                const float tr = ((texel >> 0) & 0x1f) << 3;
-                const float tg = ((texel >> 5) & 0x1f) << 3;
-                const float tb = ((texel >> 10) & 0x1f) << 3;
-
-                const float mr = (data.v0.c >> 0) & 0xff;
-                const float mg = (data.v0.c >> 8) & 0xff;
-                const float mb = (data.v0.c >> 16) & 0xff;
-
-                const float cr = (tr * mr) * (1.0f / 128.0f);
-                const float cg = (tg * mg) * (1.0f / 128.0f);
-                const float cb = (tb * mb) * (1.0f / 128.0f);
-
-                const unsigned int ucr = fast_saturate_u8(cr);
-                const unsigned int ucg = fast_saturate_u8(cg);
-                const unsigned int ucb = fast_saturate_u8(cb);
-
-                const uint32_t rgb = ucr | (ucg << 8) | (ucb << 16);
-                color = rgb888_to_rgb565(rgb);
+                out_color = texel;
             }
             else
             {
-                color = rgb888_to_rgb565(data.v0.c);
+                const int tr = ((texel >> 0) & 0x1f) << 3;
+                const int tg = ((texel >> 5) & 0x1f) << 3;
+                const int tb = ((texel >> 10) & 0x1f) << 3;
+                int cr = (tr * mod_r) >> 7;
+                int cg = (tg * mod_g) >> 7;
+                int cb = (tb * mod_b) >> 7;
+                unsigned int ucr = fast_saturate_u8(cr);
+                unsigned int ucg = fast_saturate_u8(cg);
+                unsigned int ucb = fast_saturate_u8(cb);
+                uint32_t rgb = ucr | (ucg << 8) | (ucb << 16);
+                out_color = rgb888_to_rgb565(rgb);
             }
 
-            // Transparency blending
-            if (__builtin_expect(transp, 0))
+            if (__builtin_expect(base_transp && (texel & 0x8000), 0))
             {
-                const uint16_t back = vram_line[x - x0];
-
-                float cr = ((color >> 0) & 0x1f) << 3;
-                float cg = ((color >> 5) & 0x1f) << 3;
-                float cb = ((color >> 10) & 0x1f) << 3;
-
-                const float br = ((back >> 0) & 0x1f) << 3;
-                const float bg = ((back >> 5) & 0x1f) << 3;
-                const float bb = ((back >> 10) & 0x1f) << 3;
-
-                switch (transp_mode)
-                {
-                case 0:
-                    cr = br * 0.5f + cr * 0.5f;
-                    cg = bg * 0.5f + cg * 0.5f;
-                    cb = bb * 0.5f + cb * 0.5f;
-                    break;
-                case 1:
-                    cr = br + cr;
-                    cg = bg + cg;
-                    cb = bb + cb;
-                    break;
-                case 2:
-                    cr = br - cr;
-                    cg = bg - cg;
-                    cb = bb - cb;
-                    break;
-                case 3:
-                    cr = br + cr * 0.25f;
-                    cg = bg + cg * 0.25f;
-                    cb = bb + cb * 0.25f;
-                    break;
-                }
-
-                const unsigned int ucr = fast_saturate_u8(cr);
-                const unsigned int ucg = fast_saturate_u8(cg);
-                const unsigned int ucb = fast_saturate_u8(cb);
-
-                const uint32_t rgb = ucr | (ucg << 8) | (ucb << 16);
-                color = rgb888_to_rgb565(rgb);
+                *dst = gpu_blend_rgb565(out_color, *dst, transp_mode);
             }
-
-            vram_line[x - x0] = color;
-            tex_x++;
+            else
+            {
+                *dst = out_color;
+            }
         }
-        tex_y++;
     }
 }
 
@@ -1123,6 +1460,7 @@ void gpu_rect(psx_gpu_t *gpu)
 
             int textured = (rect.attrib & RA_TEXTURED) != 0;
             int raw = (rect.attrib & RA_RAW) != 0;
+            int size_code = (rect.attrib >> 3) & 3;
 
             // Add 1 if is textured
             int size_offset = 2 + textured;
@@ -1133,8 +1471,19 @@ void gpu_rect(psx_gpu_t *gpu)
             rect.v0.tx = (gpu->buf[2] >> 0) & 0xff;
             rect.v0.ty = (gpu->buf[2] >> 8) & 0xff;
             rect.clut = gpu->buf[2] >> 16;
-            rect.width = gpu->buf[size_offset] & 0xffff;
-            rect.height = gpu->buf[size_offset] >> 16;
+
+            static const uint16_t rect_size_lut[4] = {0, 1, 8, 16};
+
+            if (size_code == RS_VARIABLE)
+            {
+                rect.width = gpu->buf[size_offset] & 0xffff;
+                rect.height = gpu->buf[size_offset] >> 16;
+            }
+            else
+            {
+                rect.width = rect_size_lut[size_code];
+                rect.height = rect_size_lut[size_code];
+            }
 
             if (textured && raw)
                 rect.v0.c = 0x808080;
@@ -2208,11 +2557,6 @@ void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_gpu_update_cmd(psx_gpu_t
     break;
     default:
     {
-        // log_set_quiet(0);
-        // log_fatal("Unhandled GP0(%02Xh)", gpu->buf[0] >> 24);
-        // log_set_quiet(1);
-
-        // exit(1);
     }
     break;
     }
@@ -2357,35 +2701,6 @@ void gpu_hblank_event(psx_gpu_t *gpu)
         {
             gpu->gpustat &= ~(1 << 31);
         }
-
-        // HACK!! More games are fine with this
-        // but others, like Dead or Alive, will refuse
-        // to boot because this frequency is not fast
-        // enough. Sending T2 IRQs every line fixes DoA
-        // but breaks a bunch of games, so I'll keep this
-        // like this until I actually fix the timers
-        // Games that seem to care about T2 timing:
-        // - Street Fighter Alpha 2
-        // - Dead or Alive
-        // - NBA Jam
-        // - Doom
-        // - Devil Dice
-        // - Zanac x Zanac
-        // - Soukyugurentai
-        // - Mortal Kombat
-        // - PaRappa the Rapper
-        // - In The Hunt
-        // - Crash Bandicoot
-        // - Jackie Chan Stuntmaster
-        // - etc.
-        // Masking with 7 breaks Street Fighter Alpha 2. The game
-        // just stops sending commands to the CDROM while on
-        // Player Select. It probably uses T2 IRQs to time
-        // GetlocP commands, if the timer is too slow it will
-        // break.
-        // if (!(gpu->line & 7))
-        //     psx_ic_irq(gpu->ic, IC_SPU);
-        // psx_ic_irq(gpu->ic, IC_SPU);
     }
     else
     {
