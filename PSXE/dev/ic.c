@@ -7,7 +7,7 @@
 #include "../log.h"
 
 // Static buffer for IC instance
-static psx_ic_t g_ic_instance;
+static psx_ic_t __attribute__((section(".bss.$SRAM_DTC"), aligned(4))) g_ic_instance;
 static int32_t g_ic_instance_used = 0;
 
 psx_ic_t *psx_ic_create(void)
@@ -203,7 +203,7 @@ void psx_ic_write8(psx_ic_t *ic, uint32_t offset, uint8_t value)
     }
 }
 
-void psx_ic_irq(psx_ic_t *ic, int32_t id)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_ic_irq(psx_ic_t *ic, int32_t id)
 {
     ic->stat |= id;
 

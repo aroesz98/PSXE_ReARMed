@@ -6,8 +6,8 @@
 #include "scratchpad.h"
 
 // Static buffer for scratchpad instance
-static psx_scratchpad_t g_scratchpad_instance;
-static uint8_t g_scratchpad_buffer[PSX_SCRATCHPAD_SIZE];
+static psx_scratchpad_t __attribute__((section(".bss.$SRAM_DTC"), aligned(4))) g_scratchpad_instance;
+static uint8_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) g_scratchpad_buffer[PSX_SCRATCHPAD_SIZE];
 static int32_t g_scratchpad_instance_used = 0;
 
 psx_scratchpad_t *psx_scratchpad_create(void)

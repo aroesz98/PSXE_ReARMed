@@ -1,5 +1,7 @@
 #include "cpu.h"
 #include "bus.h"
+#include "bus_init.h"
+#include "bus_fast.h"
 #include "log.h"
 
 #include <stdlib.h>
@@ -10,6 +12,9 @@
 
 /* FATFS includes */
 #include "ff.h"
+
+/* Hot interpreter code is executed from ITCM, not XIP flash */
+#define PSX_CPU_HOT __attribute__((section(".ramfunc.$SRAM_ITC")))
 
 // DWT (Data Watchpoint and Trace) registers for cycle counting
 #define DWT_CONTROL             (*((volatile uint32_t*)0xE0001000))
@@ -71,28 +76,28 @@ static const uint8_t g_psx_gte_unr_table[] = {
     0x03, 0x03, 0x02, 0x02, 0x01, 0x01, 0x00, 0x00,
     0x00};
 
-static inline void psx_gte_i_rtps(psx_cpu_t *);
-static inline void psx_gte_i_nclip(psx_cpu_t *);
-static inline void psx_gte_i_op(psx_cpu_t *);
-static inline void psx_gte_i_dpcs(psx_cpu_t *);
-static inline void psx_gte_i_intpl(psx_cpu_t *);
-static inline void psx_gte_i_mvmva(psx_cpu_t *);
-static inline void psx_gte_i_ncds(psx_cpu_t *);
-static inline void psx_gte_i_cdp(psx_cpu_t *);
-static inline void psx_gte_i_ncdt(psx_cpu_t *);
-static inline void psx_gte_i_nccs(psx_cpu_t *);
-static inline void psx_gte_i_cc(psx_cpu_t *);
-static inline void psx_gte_i_ncs(psx_cpu_t *);
-static inline void psx_gte_i_nct(psx_cpu_t *);
-static inline void psx_gte_i_sqr(psx_cpu_t *);
-static inline void psx_gte_i_dcpl(psx_cpu_t *);
-static inline void psx_gte_i_dpct(psx_cpu_t *);
-static inline void psx_gte_i_avsz3(psx_cpu_t *);
-static inline void psx_gte_i_avsz4(psx_cpu_t *);
-static inline void psx_gte_i_rtpt(psx_cpu_t *);
-static inline void psx_gte_i_gpf(psx_cpu_t *);
-static inline void psx_gte_i_gpl(psx_cpu_t *);
-static inline void psx_gte_i_ncct(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_rtps(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_nclip(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_op(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_dpcs(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_intpl(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_mvmva(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_ncds(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_cdp(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_ncdt(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_nccs(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_cc(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_ncs(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_nct(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_sqr(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_dcpl(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_dpct(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_avsz3(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_avsz4(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_rtpt(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_gpf(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_gpl(psx_cpu_t *);
+static inline PSX_CPU_HOT void psx_gte_i_ncct(psx_cpu_t *);
 
 // CPU instruction function declarations for caching
 static inline void psx_cpu_i_sll(psx_cpu_t *);
@@ -198,13 +203,30 @@ static inline void psx_cpu_i_swc3(psx_cpu_t *);
 #define SE8(v) ((int32_t)((int8_t)v))
 #define SE16(v) ((int32_t)((int16_t)v))
 
-#define BRANCH(offset)                          \
-    {                                           \
-        cpu->next_pc = cpu->next_pc + (offset); \
-        cpu->next_pc = cpu->next_pc - 4;        \
-        cpu->branch = 1;                        \
-        cpu->branch_taken = 1;                  \
-    }
+/* Optimized branch handling using inline ARM assembly
+   Combines arithmetic with flag setting in a single operation
+   Uses DSP extension for efficient 32-bit arithmetic */
+static inline void __attribute__((always_inline)) psx_cpu_branch(psx_cpu_t *cpu, int32_t offset)
+{
+    /* Perform: next_pc = next_pc + offset - 4 using ARM inline assembly
+       This is more efficient than C code as it uses a single ADD instruction */
+    
+    int32_t adjusted_offset = offset - 4;
+    
+    /* Use inline assembly for optimal performance */
+    __asm__ __volatile__(
+        "add %0, %0, %1"          /* ADD instruction with DSP support */
+        : "+r" (cpu->next_pc)     /* Output: cpu->next_pc (read-write) */
+        : "r" (adjusted_offset)   /* Input: adjusted_offset */
+        : /* No clobber list needed */
+    );
+    
+    /* Set branch flags atomically */
+    cpu->branch = 1;
+    cpu->branch_taken = 1;
+}
+
+#define BRANCH(offset) psx_cpu_branch(cpu, (offset))
 
 void cpu_a_kcall_hook(psx_cpu_t *cpu)
 {
@@ -220,13 +242,13 @@ void cpu_a_kcall_hook(psx_cpu_t *cpu)
     {
         uint32_t src = R_A0;
 
-        char c = psx_bus_read8(cpu->bus, src++);
+        char c = psx_bus_fast_read8(cpu->bus, src++);
 
         while (c)
         {
             putchar(c);
 
-            c = psx_bus_read8(cpu->bus, src++);
+            c = psx_bus_fast_read8(cpu->bus, src++);
         }
     }
     break;
@@ -247,13 +269,13 @@ void cpu_b_kcall_hook(psx_cpu_t *cpu)
     {
         uint32_t src = R_A0;
 
-        char c = psx_bus_read8(cpu->bus, src++);
+        char c = psx_bus_fast_read8(cpu->bus, src++);
 
         while (c)
         {
             putchar(c);
 
-            c = psx_bus_read8(cpu->bus, src++);
+            c = psx_bus_fast_read8(cpu->bus, src++);
         }
     }
     break;
@@ -261,7 +283,7 @@ void cpu_b_kcall_hook(psx_cpu_t *cpu)
 }
 
 // Static buffer for CPU instance
-static psx_cpu_t g_cpu_instance;
+static psx_cpu_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) g_cpu_instance;
 static int32_t g_cpu_instance_used = 0;
 
 psx_cpu_t *psx_cpu_create(void)
@@ -331,8 +353,6 @@ void psx_cpu_init(psx_cpu_t *cpu, psx_bus_t *bus)
     cpu->cop0_r[COP0_SR] = 0x10900000;
     cpu->cop0_r[COP0_PRID] = 0x00000002;
 
-    // Initialize instruction cache
-    psx_cpu_clear_cache(cpu);
 }
 
 static inline int32_t psx_cpu_check_irq(psx_cpu_t *cpu)
@@ -341,7 +361,7 @@ static inline int32_t psx_cpu_check_irq(psx_cpu_t *cpu)
            (cpu->cop0_r[COP0_SR] & cpu->cop0_r[COP0_CAUSE] & 0x00000700);
 }
 
-static inline void psx_cpu_exception(psx_cpu_t *cpu, uint32_t cause)
+static inline PSX_CPU_HOT void psx_cpu_exception(psx_cpu_t *cpu, uint32_t cause)
 {
     // Set excode and clear 3 LSBs
     cpu->cop0_r[COP0_CAUSE] &= 0xffffff80;
@@ -383,8 +403,8 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_cycle(psx_cpu_t *cpu
     if (cpu->saved_pc & 3)
         psx_cpu_exception(cpu, CAUSE_ADEL);
 
-    cpu->opcode = psx_bus_read32(cpu->bus, cpu->pc);
-    cpu->last_cycles = psx_bus_get_access_cycles(cpu->bus);
+    cpu->opcode = psx_bus_fast_read32(cpu->bus, cpu->pc);
+    cpu->last_cycles = psx_bus_fast_take_cycles(cpu->bus);
 
     cpu->pc = cpu->next_pc;
     cpu->next_pc += 4;
@@ -505,7 +525,7 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_cycle(psx_cpu_t *cpu
         return;
     }
 
-    int32_t cyc = psx_cpu_execute_cached(cpu);
+    int32_t cyc = psx_cpu_execute(cpu);
 
     if (!cyc)
     {
@@ -599,7 +619,7 @@ static inline void psx_cpu_i_jal(psx_cpu_t *cpu)
     cpu->next_pc = (cpu->next_pc & 0xf0000000) | (IMM26 << 2);
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_cpu_i_beq(psx_cpu_t *cpu)
+static inline void psx_cpu_i_beq(psx_cpu_t *cpu)
 {
     cpu->branch = 1;
     cpu->branch_taken = 0;
@@ -613,7 +633,7 @@ static inline void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_cpu_i_beq(
         BRANCH(IMM16S << 2);
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_cpu_i_bne(psx_cpu_t *cpu)
+static inline void psx_cpu_i_bne(psx_cpu_t *cpu)
 {
     cpu->branch = 1;
     cpu->branch_taken = 0;
@@ -673,7 +693,7 @@ static inline void psx_cpu_i_addi(psx_cpu_t *cpu)
     }
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_cpu_i_addiu(psx_cpu_t *cpu)
+static inline void psx_cpu_i_addiu(psx_cpu_t *cpu)
 {
     uint32_t s = cpu->r[S];
 
@@ -709,7 +729,7 @@ static inline void psx_cpu_i_andi(psx_cpu_t *cpu)
     cpu->r[T] = s & IMM16;
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_OC"))) psx_cpu_i_ori(psx_cpu_t *cpu)
+static inline void psx_cpu_i_ori(psx_cpu_t *cpu)
 {
     uint32_t s = cpu->r[S];
 
@@ -734,7 +754,7 @@ static inline void psx_cpu_i_lui(psx_cpu_t *cpu)
     cpu->r[T] = IMM16 << 16;
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lb(psx_cpu_t *cpu)
+static inline void psx_cpu_i_lb(psx_cpu_t *cpu)
 {
     TRACE_M("lb");
 
@@ -744,10 +764,10 @@ static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lb(p
         DO_PENDING_LOAD;
 
     cpu->load_d = T;
-    cpu->load_v = SE8(psx_bus_read8(cpu->bus, s + IMM16S));
+    cpu->load_v = SE8(psx_bus_fast_read8(cpu->bus, s + IMM16S));
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lh(psx_cpu_t *cpu)
+static inline void psx_cpu_i_lh(psx_cpu_t *cpu)
 {
     TRACE_M("lh");
 
@@ -765,7 +785,7 @@ static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lh(p
     else
     {
         cpu->load_d = T;
-        cpu->load_v = SE16(psx_bus_read16(cpu->bus, addr));
+        cpu->load_v = SE16(psx_bus_fast_read16(cpu->bus, addr));
     }
 }
 
@@ -778,7 +798,7 @@ static inline void psx_cpu_i_lwl(psx_cpu_t *cpu)
     uint32_t t = cpu->r[rt];
 
     uint32_t addr = s + IMM16S;
-    uint32_t load = psx_bus_read32(cpu->bus, addr & 0xfffffffc);
+    uint32_t load = psx_bus_fast_read32(cpu->bus, addr & 0xfffffffc);
 
     if (rt == cpu->load_d)
     {
@@ -801,7 +821,7 @@ static inline void psx_cpu_i_lwl(psx_cpu_t *cpu)
     // );
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lw(psx_cpu_t *cpu)
+static inline void psx_cpu_i_lw(psx_cpu_t *cpu)
 {
     TRACE_M("lw");
 
@@ -818,11 +838,11 @@ static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lw(p
     else
     {
         cpu->load_d = T;
-        cpu->load_v = psx_bus_read32(cpu->bus, addr);
+        cpu->load_v = psx_bus_fast_read32(cpu->bus, addr);
     }
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lbu(psx_cpu_t *cpu)
+static inline void psx_cpu_i_lbu(psx_cpu_t *cpu)
 {
     TRACE_M("lbu");
 
@@ -832,10 +852,10 @@ static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lbu(
         DO_PENDING_LOAD;
 
     cpu->load_d = T;
-    cpu->load_v = psx_bus_read8(cpu->bus, s + IMM16S);
+    cpu->load_v = psx_bus_fast_read8(cpu->bus, s + IMM16S);
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lhu(psx_cpu_t *cpu)
+static inline void psx_cpu_i_lhu(psx_cpu_t *cpu)
 {
     TRACE_M("lhu");
 
@@ -852,7 +872,7 @@ static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_lhu(
     else
     {
         cpu->load_d = T;
-        cpu->load_v = psx_bus_read16(cpu->bus, addr);
+        cpu->load_v = psx_bus_fast_read16(cpu->bus, addr);
     }
 }
 
@@ -865,7 +885,7 @@ static inline void psx_cpu_i_lwr(psx_cpu_t *cpu)
     uint32_t t = cpu->r[rt];
 
     uint32_t addr = s + IMM16S;
-    uint32_t load = psx_bus_read32(cpu->bus, addr & 0xfffffffc);
+    uint32_t load = psx_bus_fast_read32(cpu->bus, addr & 0xfffffffc);
 
     if (rt == cpu->load_d)
     {
@@ -888,7 +908,7 @@ static inline void psx_cpu_i_lwr(psx_cpu_t *cpu)
     // );
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_sb(psx_cpu_t *cpu)
+static inline void psx_cpu_i_sb(psx_cpu_t *cpu)
 {
     TRACE_M("sb");
 
@@ -900,11 +920,11 @@ static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_sb(p
     // Optimized: fast path for non-isolated cache (common case)
     if (!(cpu->cop0_r[COP0_SR] & SR_ISC))
     {
-        psx_bus_write8(cpu->bus, s + IMM16S, t);
+        psx_bus_fast_write8(cpu->bus, s + IMM16S, t);
     }
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_sh(psx_cpu_t *cpu)
+static inline void psx_cpu_i_sh(psx_cpu_t *cpu)
 {
     TRACE_M("sh");
 
@@ -923,7 +943,7 @@ static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_sh(p
         }
         else
         {
-            psx_bus_write16(cpu->bus, addr, t);
+            psx_bus_fast_write16(cpu->bus, addr, t);
         }
     }
 }
@@ -938,7 +958,7 @@ static inline void psx_cpu_i_swl(psx_cpu_t *cpu)
 
     uint32_t addr = s + IMM16S;
     uint32_t aligned = addr & 0xfffffffc;
-    uint32_t v = psx_bus_read32(cpu->bus, aligned);
+    uint32_t v = psx_bus_fast_read32(cpu->bus, aligned);
 
     switch (addr & 0x3)
     {
@@ -956,10 +976,10 @@ static inline void psx_cpu_i_swl(psx_cpu_t *cpu)
         break;
     }
 
-    psx_bus_write32(cpu->bus, aligned, v);
+    psx_bus_fast_write32(cpu->bus, aligned, v);
 }
 
-static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_sw(psx_cpu_t *cpu)
+static inline void psx_cpu_i_sw(psx_cpu_t *cpu)
 {
     TRACE_M("sw");
 
@@ -983,7 +1003,7 @@ static inline void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_i_sw(p
     }
     else
     {
-        psx_bus_write32(cpu->bus, addr, t);
+        psx_bus_fast_write32(cpu->bus, addr, t);
     }
 }
 
@@ -997,7 +1017,7 @@ static inline void psx_cpu_i_swr(psx_cpu_t *cpu)
 
     uint32_t addr = s + IMM16S;
     uint32_t aligned = addr & 0xfffffffc;
-    uint32_t v = psx_bus_read32(cpu->bus, aligned);
+    uint32_t v = psx_bus_fast_read32(cpu->bus, aligned);
 
     switch (addr & 0x3)
     {
@@ -1015,7 +1035,7 @@ static inline void psx_cpu_i_swr(psx_cpu_t *cpu)
         break;
     }
 
-    psx_bus_write32(cpu->bus, aligned, v);
+    psx_bus_fast_write32(cpu->bus, aligned, v);
 }
 
 static inline void psx_cpu_i_lwc0(psx_cpu_t *cpu)
@@ -1492,7 +1512,7 @@ static inline void gte_handle_lzcs_write(psx_cpu_t *cpu)
     cpu->cop2_dr.lzcr = __builtin_clz(b ? ~cpu->cop2_dr.lzcs : cpu->cop2_dr.lzcs);
 }
 
-uint32_t gte_read_register(psx_cpu_t *cpu, uint32_t r)
+PSX_CPU_HOT uint32_t gte_read_register(psx_cpu_t *cpu, uint32_t r)
 {
     switch (r)
     {
@@ -1631,7 +1651,7 @@ uint32_t gte_read_register(psx_cpu_t *cpu, uint32_t r)
     return 0x00000000;
 }
 
-static inline void gte_write_register(psx_cpu_t *cpu, uint32_t r, uint32_t value)
+static inline PSX_CPU_HOT void gte_write_register(psx_cpu_t *cpu, uint32_t r, uint32_t value)
 {
     switch (r)
     {
@@ -1844,7 +1864,7 @@ static inline void psx_cpu_i_lwc2(psx_cpu_t *cpu)
     }
     else
     {
-        gte_write_register(cpu, T, psx_bus_read32(cpu->bus, addr));
+        gte_write_register(cpu, T, psx_bus_fast_read32(cpu->bus, addr));
     }
 }
 
@@ -1869,7 +1889,7 @@ static inline void psx_cpu_i_swc2(psx_cpu_t *cpu)
     }
     else
     {
-        psx_bus_write32(cpu->bus, addr, gte_read_register(cpu, T));
+        psx_bus_fast_write32(cpu->bus, addr, gte_read_register(cpu, T));
     }
 }
 
@@ -1920,14 +1940,21 @@ static inline void psx_cpu_i_ctc2(psx_cpu_t *cpu)
 static inline int64_t gte_clamp_mac0(psx_cpu_t *cpu, int64_t value)
 {
     cpu->s_mac0 = value;
-
-    if (value < (-0x80000000ll))
+    
+    /* Classify overflow/underflow conditions */
+    int32_t overflow = (value < (-0x80000000ll)) ? 0 : (value > (0x7fffffffll)) ? 1 : 2;
+    
+    switch (overflow)
     {
+    case 0:  /* Underflow */
         R_FLAG |= 0x8000;
-    }
-    else if (value > (0x7fffffffll))
-    {
+        break;
+    case 1:  /* Overflow */
         R_FLAG |= 0x10000;
+        break;
+    case 2:  /* In range */
+    default:
+        break;
     }
 
     return value;
@@ -1938,13 +1965,20 @@ static inline int32_t gte_clamp_mac(psx_cpu_t *cpu, int32_t i, int64_t value)
     if (i == 3)
         cpu->s_mac3 = value;
 
-    if (value < -0x80000000000ll)
+    /* Classify MAC overflow conditions */
+    int32_t overflow = (value < -0x80000000000ll) ? 0 : (value > 0x7ffffffffffll) ? 1 : 2;
+    
+    switch (overflow)
     {
+    case 0:  /* Negative overflow */
         R_FLAG |= 0x8000000 >> (i - 1);
-    }
-    else if (value > 0x7ffffffffffll)
-    {
+        break;
+    case 1:  /* Positive overflow */
         R_FLAG |= 0x40000000 >> (i - 1);
+        break;
+    case 2:  /* In valid range */
+    default:
+        break;
     }
 
     return (int32_t)(((value << 20) >> 20) >> cpu->gte_sf);
@@ -1952,13 +1986,20 @@ static inline int32_t gte_clamp_mac(psx_cpu_t *cpu, int32_t i, int64_t value)
 
 static inline int64_t gte_check_mac(psx_cpu_t *cpu, int32_t i, int64_t value)
 {
-    if (value < -0x80000000000ll)
+    /* Classify MAC overflow conditions */
+    int32_t overflow = (value < -0x80000000000ll) ? 0 : (value > 0x7ffffffffffll) ? 1 : 2;
+    
+    switch (overflow)
     {
+    case 0:  /* Negative overflow */
         R_FLAG |= 0x8000000 >> (i - 1);
-    }
-    else if (value > 0x7ffffffffffll)
-    {
+        break;
+    case 1:  /* Positive overflow */
         R_FLAG |= 0x40000000 >> (i - 1);
+        break;
+    case 2:  /* In valid range */
+    default:
+        break;
     }
 
     return (value << 20) >> 20;
@@ -1966,98 +2007,111 @@ static inline int64_t gte_check_mac(psx_cpu_t *cpu, int32_t i, int64_t value)
 
 static inline int32_t gte_clamp_ir0(psx_cpu_t *cpu, int32_t value)
 {
-    if (value < 0)
+    /* Classify IR0 range conditions */
+    int32_t range = (value < 0) ? 0 : (value > 0x1000) ? 1 : 2;
+    
+    switch (range)
     {
+    case 0:  /* Underflow */
         R_FLAG |= 0x1000;
-
         return 0;
-    }
-    else if (value > 0x1000)
-    {
+    
+    case 1:  /* Overflow */
         R_FLAG |= 0x1000;
-
         return 0x1000;
+    
+    case 2:  /* In valid range [0, 0x1000] */
+    default:
+        return value;
     }
-
-    return value;
 }
 
 static inline int64_t gte_clamp_sxy(psx_cpu_t *cpu, int32_t i, int64_t value)
 {
-    if (value < -0x400)
+    /* Classify the value into ranges for switch optimization */
+    int32_t range = (value < -0x400) ? 0 : (value > 0x3ff) ? 1 : 2;
+    
+    switch (range)
     {
+    case 0:  /* value < -0x400 */
         R_FLAG |= (uint32_t)(0x4000 >> (i - 1));
-
         return -0x400;
-    }
-    else if (value > 0x3ff)
-    {
+    
+    case 1:  /* value > 0x3ff */
         R_FLAG |= (uint32_t)(0x4000 >> (i - 1));
-
         return 0x3ff;
+    
+    case 2:  /* value in valid range [-0x400, 0x3ff] */
+    default:
+        return value;
     }
-
-    return value;
 }
 
 static inline int32_t gte_clamp_sz3(psx_cpu_t *cpu, int32_t value)
 {
-    if (value < 0)
+    /* Classify depth value range conditions */
+    int32_t range = (value < 0) ? 0 : (value > 0xffff) ? 1 : 2;
+    
+    switch (range)
     {
+    case 0:  /* Underflow */
         R_FLAG |= 0x40000;
-
         return 0;
-    }
-    else if (value > 0xffff)
-    {
+    
+    case 1:  /* Overflow */
         R_FLAG |= 0x40000;
-
         return 0xffff;
+    
+    case 2:  /* In valid range [0, 0xffff] */
+    default:
+        return value;
     }
-
-    return value;
 }
 
 static inline uint8_t gte_clamp_rgb(psx_cpu_t *cpu, int32_t i, int32_t value)
 {
-    if (value < 0)
+    /* Classify RGB color range conditions */
+    int32_t range = (value < 0) ? 0 : (value > 0xff) ? 1 : 2;
+    
+    switch (range)
     {
+    case 0:  /* Underflow */
         R_FLAG |= (uint32_t)0x200000 >> (i - 1);
-
         return 0;
-    }
-    else if (value > 0xff)
-    {
+    
+    case 1:  /* Overflow */
         R_FLAG |= (uint32_t)0x200000 >> (i - 1);
-
         return 0xff;
+    
+    case 2:  /* In valid range [0, 0xff] */
+    default:
+        return (uint8_t)value;
     }
-
-    return (uint8_t)value;
 }
 
 static inline int32_t gte_clamp_ir(psx_cpu_t *cpu, int32_t i, int64_t value, int32_t lm)
 {
-    if (lm && (value < 0))
+    /* Classify IR clamping conditions based on lm flag and value range */
+    int32_t range = (lm && (value < 0)) ? 0 : ((value < -0x8000) && !lm) ? 1 : (value > 0x7fff) ? 2 : 3;
+    
+    switch (range)
     {
+    case 0:  /* lm=1 and value < 0 */
         R_FLAG |= (uint32_t)(0x1000000 >> (i - 1));
-
         return 0;
-    }
-    else if ((value < -0x8000) && !lm)
-    {
+    
+    case 1:  /* lm=0 and value < -0x8000 */
         R_FLAG |= (uint32_t)(0x1000000 >> (i - 1));
-
         return -0x8000;
-    }
-    else if (value > 0x7fff)
-    {
+    
+    case 2:  /* value > 0x7fff */
         R_FLAG |= (uint32_t)(0x1000000 >> (i - 1));
-
         return 0x7fff;
+    
+    case 3:  /* In valid range */
+    default:
+        return (int32_t)value;
     }
-
-    return (int32_t)value;
 }
 
 static inline int32_t gte_clamp_ir_z(psx_cpu_t *cpu, int64_t value, int32_t sf, int32_t lm)
@@ -2105,7 +2159,7 @@ static inline uint32_t gte_divide(psx_cpu_t *cpu, uint16_t n, uint16_t d)
     return MIN(0x1ffff, res);
 }
 
-static inline void psx_gte_i_invalid(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_invalid(psx_cpu_t *cpu)
 {
     log_fatal("invalid: Unimplemented GTE instruction %02x, %02x", cpu->opcode & 0x3f, cpu->opcode >> 25);
 }
@@ -2198,51 +2252,218 @@ static inline void psx_gte_i_invalid(psx_cpu_t *cpu)
 #define R_LB2 cpu->cop2_cr.lr.m[3].c[1]
 #define R_LB3 cpu->cop2_cr.lr.m33
 
-#define GTE_RTP_DQ(i)                                                                                                                                                                                     \
-    {                                                                                                                                                                                                     \
-        int64_t vx = (int64_t)((int16_t)cpu->cop2_dr.v[i].p[0]);                                                                                                                                          \
-        int64_t vy = (int64_t)((int16_t)cpu->cop2_dr.v[i].p[1]);                                                                                                                                          \
-        int64_t vz = (int64_t)cpu->cop2_dr.v[i].z;                                                                                                                                                        \
-        R_MAC1 = gte_clamp_mac(cpu, 1, gte_check_mac(cpu, 1, gte_check_mac(cpu, 1, (((int64_t)R_TRX) << 12) + (I64((int16_t)R_RT11) * vx)) + (I64((int16_t)R_RT12) * vy)) + (I64((int16_t)R_RT13) * vz)); \
-        R_MAC2 = gte_clamp_mac(cpu, 2, gte_check_mac(cpu, 2, gte_check_mac(cpu, 2, (((int64_t)R_TRY) << 12) + (I64((int16_t)R_RT21) * vx)) + (I64((int16_t)R_RT22) * vy)) + (I64((int16_t)R_RT23) * vz)); \
-        R_MAC3 = gte_clamp_mac(cpu, 3, gte_check_mac(cpu, 3, gte_check_mac(cpu, 3, (((int64_t)R_TRZ) << 12) + (I64((int16_t)R_RT31) * vx)) + (I64((int16_t)R_RT32) * vy)) + (I64((int16_t)R_RT33) * vz)); \
-        R_IR1 = gte_clamp_ir(cpu, 1, R_MAC1, cpu->gte_lm);                                                                                                                                                \
-        R_IR2 = gte_clamp_ir(cpu, 2, R_MAC2, cpu->gte_lm);                                                                                                                                                \
-        R_IR3 = gte_clamp_ir_z(cpu, cpu->s_mac3, cpu->gte_sf, cpu->gte_lm);                                                                                                                               \
-        R_SZ0 = R_SZ1;                                                                                                                                                                                    \
-        R_SZ1 = R_SZ2;                                                                                                                                                                                    \
-        R_SZ2 = R_SZ3;                                                                                                                                                                                    \
-        R_SZ3 = gte_clamp_sz3(cpu, cpu->s_mac3 >> 12);                                                                                                                                                    \
-        int32_t div = gte_divide(cpu, R_H, R_SZ3);                                                                                                                                                        \
-        R_SXY0 = R_SXY1;                                                                                                                                                                                  \
-        R_SXY1 = R_SXY2;                                                                                                                                                                                  \
-        R_SX2 = gte_clamp_sxy(cpu, 1, (gte_clamp_mac0(cpu, (int64_t)((int32_t)R_OFX) + ((int64_t)R_IR1 * div)) >> 16));                                                                                   \
-        R_SY2 = gte_clamp_sxy(cpu, 2, (gte_clamp_mac0(cpu, (int64_t)((int32_t)R_OFY) + ((int64_t)R_IR2 * div)) >> 16));                                                                                   \
-        R_MAC0 = gte_clamp_mac0(cpu, ((int64_t)R_DQB) + (((int64_t)R_DQA) * div));                                                                                                                        \
-        R_IR0 = gte_clamp_ir0(cpu, cpu->s_mac0 >> 12);                                                                                                                                                    \
+/* Optimized inline function for GTE RTP (Rotate, Translate, Perspective) with Depth Queuing */
+static inline void __attribute__((hot, optimize("O3"))) PSX_CPU_HOT gte_rtp_dq_impl(psx_cpu_t *cpu, uint32_t idx)
+{
+    /* Load vertex coordinates */
+    const int64_t vx = (int64_t)((int16_t)cpu->cop2_dr.v[idx].p[0]);
+    const int64_t vy = (int64_t)((int16_t)cpu->cop2_dr.v[idx].p[1]);
+    const int64_t vz = (int64_t)cpu->cop2_dr.v[idx].z;
+    
+    const int32_t sf = cpu->gte_sf;
+    const int32_t lm = cpu->gte_lm;
+    const int32_t ir_min = lm ? 0 : -0x8000;
+    
+    /* Matrix multiplication with nested overflow checking (matches macro exactly) */
+    /* MAC1 = TRX + RT11*vx + RT12*vy + RT13*vz with three nested gte_check_mac calls */
+    int64_t mac1 = (((int64_t)R_TRX) << 12) + (((int64_t)((int16_t)R_RT11)) * vx);
+    if ((mac1 < -0x80000000000ll) || (mac1 > 0x7ffffffffffll))
+        R_FLAG |= ((mac1 < -0x80000000000ll) ? 0x8000000 : 0x40000000);
+    mac1 = (mac1 << 20) >> 20;
+    
+    mac1 += ((int64_t)((int16_t)R_RT12)) * vy;
+    if ((mac1 < -0x80000000000ll) || (mac1 > 0x7ffffffffffll))
+        R_FLAG |= ((mac1 < -0x80000000000ll) ? 0x8000000 : 0x40000000);
+    mac1 = (mac1 << 20) >> 20;
+    
+    mac1 += ((int64_t)((int16_t)R_RT13)) * vz;
+    if ((mac1 < -0x80000000000ll) || (mac1 > 0x7ffffffffffll))
+        R_FLAG |= ((mac1 < -0x80000000000ll) ? 0x8000000 : 0x40000000);
+    mac1 = (mac1 << 20) >> 20;
+    
+    /* MAC2 = TRY + RT21*vx + RT22*vy + RT23*vz with three nested gte_check_mac calls */
+    int64_t mac2 = (((int64_t)R_TRY) << 12) + (((int64_t)((int16_t)R_RT21)) * vx);
+    if ((mac2 < -0x80000000000ll) || (mac2 > 0x7ffffffffffll))
+        R_FLAG |= ((mac2 < -0x80000000000ll) ? 0x4000000 : 0x20000000);
+    mac2 = (mac2 << 20) >> 20;
+    
+    mac2 += ((int64_t)((int16_t)R_RT22)) * vy;
+    if ((mac2 < -0x80000000000ll) || (mac2 > 0x7ffffffffffll))
+        R_FLAG |= ((mac2 < -0x80000000000ll) ? 0x4000000 : 0x20000000);
+    mac2 = (mac2 << 20) >> 20;
+    
+    mac2 += ((int64_t)((int16_t)R_RT23)) * vz;
+    if ((mac2 < -0x80000000000ll) || (mac2 > 0x7ffffffffffll))
+        R_FLAG |= ((mac2 < -0x80000000000ll) ? 0x4000000 : 0x20000000);
+    mac2 = (mac2 << 20) >> 20;
+    
+    /* MAC3 = TRZ + RT31*vx + RT32*vy + RT33*vz with three nested gte_check_mac calls */
+    int64_t mac3 = (((int64_t)R_TRZ) << 12) + (((int64_t)((int16_t)R_RT31)) * vx);
+    if ((mac3 < -0x80000000000ll) || (mac3 > 0x7ffffffffffll))
+        R_FLAG |= ((mac3 < -0x80000000000ll) ? 0x2000000 : 0x10000000);
+    mac3 = (mac3 << 20) >> 20;
+    
+    mac3 += ((int64_t)((int16_t)R_RT32)) * vy;
+    if ((mac3 < -0x80000000000ll) || (mac3 > 0x7ffffffffffll))
+        R_FLAG |= ((mac3 < -0x80000000000ll) ? 0x2000000 : 0x10000000);
+    mac3 = (mac3 << 20) >> 20;
+    
+    mac3 += ((int64_t)((int16_t)R_RT33)) * vz;
+    if ((mac3 < -0x80000000000ll) || (mac3 > 0x7ffffffffffll))
+        R_FLAG |= ((mac3 < -0x80000000000ll) ? 0x2000000 : 0x10000000);
+    mac3 = (mac3 << 20) >> 20;
+    
+    cpu->s_mac3 = mac3;
+    
+    /* Apply shift factor (gte_clamp_mac) */
+    R_MAC1 = (int32_t)(mac1 >> sf);
+    R_MAC2 = (int32_t)(mac2 >> sf);
+    R_MAC3 = (int32_t)(mac3 >> sf);
+    
+    /* Clamp to IR registers (gte_clamp_ir) */
+    int32_t ir1 = R_MAC1;
+    if ((ir1 < ir_min) || (ir1 > 0x7fff)) {
+        R_FLAG |= 0x1000000;
+        ir1 = (ir1 < ir_min) ? ir_min : 0x7fff;
     }
+    R_IR1 = ir1;
+    
+    int32_t ir2 = R_MAC2;
+    if ((ir2 < ir_min) || (ir2 > 0x7fff)) {
+        R_FLAG |= 0x800000;
+        ir2 = (ir2 < ir_min) ? ir_min : 0x7fff;
+    }
+    R_IR2 = ir2;
+    
+    /* gte_clamp_ir_z: Special IR3 handling */
+    const int32_t mac3_12 = mac3 >> 12;
+    if ((mac3_12 < -0x8000) || (mac3_12 > 0x7fff))
+        R_FLAG |= 0x400000;
+    
+    int32_t ir3 = R_MAC3;
+    if ((ir3 < ir_min) || (ir3 > 0x7fff))
+        ir3 = (ir3 < ir_min) ? ir_min : 0x7fff;
+    R_IR3 = ir3;
+    
+    /* Z-buffer management */
+    R_SZ0 = R_SZ1;
+    R_SZ1 = R_SZ2;
+    R_SZ2 = R_SZ3;
+    
+    /* gte_clamp_sz3 */
+    int32_t sz3 = mac3_12;
+    if ((sz3 < 0) || (sz3 > 0xffff)) {
+        R_FLAG |= 0x40000;
+        sz3 = (sz3 < 0) ? 0 : 0xffff;
+    }
+    R_SZ3 = sz3;
+    
+    /* gte_divide: Perspective division */
+    uint32_t div;
+    const uint16_t h = R_H;
+    
+    if ((sz3 == 0) || (h >= (sz3 << 1))) {
+        R_FLAG |= 0x80020000;
+        div = 0x1ffff;
+    } else {
+        const int32_t shift = __builtin_clz(sz3) - 16;
+        const int32_t r1 = (sz3 << shift) & 0x7fff;
+        const int32_t r2 = g_psx_gte_unr_table[((r1 + 0x40) >> 7)] + 0x101;
+        const int32_t r3 = ((0x80 - (r2 * (r1 + 0x8000))) >> 8) & 0x1ffff;
+        const uint32_t reciprocal = ((r2 * r3) + 0x80) >> 8;
+        div = ((((uint64_t)reciprocal * (h << shift)) + 0x8000) >> 16);
+        if (div > 0x1ffff) div = 0x1ffff;
+    }
+    
+    /* Screen coordinate calculation */
+    R_SXY0 = R_SXY1;
+    R_SXY1 = R_SXY2;
+    
+    /* Screen X with gte_clamp_mac0 and gte_clamp_sxy */
+    int64_t mac0 = (int64_t)((int32_t)R_OFX) + ((int64_t)R_IR1 * div);
+    cpu->s_mac0 = mac0;
+    if (mac0 < -0x80000000ll)
+        R_FLAG |= 0x8000;
+    else if (mac0 > 0x7fffffffll)
+        R_FLAG |= 0x10000;
+    
+    int32_t sx2 = mac0 >> 16;
+    if ((sx2 < -0x400) || (sx2 > 0x3ff)) {
+        R_FLAG |= 0x4000;
+        sx2 = (sx2 < -0x400) ? -0x400 : 0x3ff;
+    }
+    R_SX2 = (int16_t)sx2;
+    
+    /* Screen Y with gte_clamp_mac0 and gte_clamp_sxy */
+    mac0 = (int64_t)((int32_t)R_OFY) + ((int64_t)R_IR2 * div);
+    cpu->s_mac0 = mac0;
+    if (mac0 < -0x80000000ll)
+        R_FLAG |= 0x8000;
+    else if (mac0 > 0x7fffffffll)
+        R_FLAG |= 0x10000;
+    
+    int32_t sy2 = mac0 >> 16;
+    if ((sy2 < -0x400) || (sy2 > 0x3ff)) {
+        R_FLAG |= 0x2000;
+        sy2 = (sy2 < -0x400) ? -0x400 : 0x3ff;
+    }
+    R_SY2 = (int16_t)sy2;
+    
+    /* Depth queuing with gte_clamp_mac0 and gte_clamp_ir0 */
+    mac0 = ((int64_t)R_DQB) + (((int64_t)R_DQA) * div);
+    cpu->s_mac0 = mac0;
+    if (mac0 < -0x80000000ll)
+        R_FLAG |= 0x8000;
+    else if (mac0 > 0x7fffffffll)
+        R_FLAG |= 0x10000;
+    R_MAC0 = (int32_t)mac0;
+    
+    int32_t ir0 = (int32_t)(mac0 >> 12);
+    if ((ir0 < 0) || (ir0 > 0x1000)) {
+        R_FLAG |= 0x1000;
+        ir0 = (ir0 < 0) ? 0 : 0x1000;
+    }
+    R_IR0 = ir0;
+}
 
-#define GTE_RTP(i)                                                                                                                                                                                        \
-    {                                                                                                                                                                                                     \
-        int64_t vx = (int64_t)((int16_t)cpu->cop2_dr.v[i].p[0]);                                                                                                                                          \
-        int64_t vy = (int64_t)((int16_t)cpu->cop2_dr.v[i].p[1]);                                                                                                                                          \
-        int64_t vz = (int64_t)cpu->cop2_dr.v[i].z;                                                                                                                                                        \
-        R_MAC1 = gte_clamp_mac(cpu, 1, gte_check_mac(cpu, 1, gte_check_mac(cpu, 1, (((int64_t)R_TRX) << 12) + (I64((int16_t)R_RT11) * vx)) + (I64((int16_t)R_RT12) * vy)) + (I64((int16_t)R_RT13) * vz)); \
-        R_MAC2 = gte_clamp_mac(cpu, 2, gte_check_mac(cpu, 2, gte_check_mac(cpu, 2, (((int64_t)R_TRY) << 12) + (I64((int16_t)R_RT21) * vx)) + (I64((int16_t)R_RT22) * vy)) + (I64((int16_t)R_RT23) * vz)); \
-        R_MAC3 = gte_clamp_mac(cpu, 3, gte_check_mac(cpu, 3, gte_check_mac(cpu, 3, (((int64_t)R_TRZ) << 12) + (I64((int16_t)R_RT31) * vx)) + (I64((int16_t)R_RT32) * vy)) + (I64((int16_t)R_RT33) * vz)); \
-        R_IR1 = gte_clamp_ir(cpu, 1, R_MAC1, cpu->gte_lm);                                                                                                                                                \
-        R_IR2 = gte_clamp_ir(cpu, 2, R_MAC2, cpu->gte_lm);                                                                                                                                                \
-        R_IR3 = gte_clamp_ir_z(cpu, cpu->s_mac3, cpu->gte_sf, cpu->gte_lm);                                                                                                                               \
-        R_SZ0 = R_SZ1;                                                                                                                                                                                    \
-        R_SZ1 = R_SZ2;                                                                                                                                                                                    \
-        R_SZ2 = R_SZ3;                                                                                                                                                                                    \
-        R_SZ3 = gte_clamp_sz3(cpu, cpu->s_mac3 >> 12);                                                                                                                                                    \
-        int32_t div = gte_divide(cpu, R_H, R_SZ3);                                                                                                                                                        \
-        R_SXY0 = R_SXY1;                                                                                                                                                                                  \
-        R_SXY1 = R_SXY2;                                                                                                                                                                                  \
-        R_SX2 = gte_clamp_sxy(cpu, 1, (gte_clamp_mac0(cpu, (int64_t)((int32_t)R_OFX) + ((int64_t)R_IR1 * div)) >> 16));                                                                                   \
-        R_SY2 = gte_clamp_sxy(cpu, 2, (gte_clamp_mac0(cpu, (int64_t)((int32_t)R_OFY) + ((int64_t)R_IR2 * div)) >> 16));                                                                                   \
-    }
+/* Macro wrapper for backward compatibility */
+#define GTE_RTP_DQ(i) gte_rtp_dq_impl(cpu, i)
+
+static inline void __attribute__((always_inline)) gte_rtp(psx_cpu_t *cpu, uint32_t idx)
+{
+    int64_t vx = (int64_t)((int16_t)cpu->cop2_dr.v[idx].p[0]);
+    int64_t vy = (int64_t)((int16_t)cpu->cop2_dr.v[idx].p[1]);
+    int64_t vz = (int64_t)cpu->cop2_dr.v[idx].z;
+    
+    /* Compute MAC values with overflow checking */
+    int64_t mac1 = gte_check_mac(cpu, 1, gte_check_mac(cpu, 1, gte_check_mac(cpu, 1, (((int64_t)R_TRX) << 12) + (I64((int16_t)R_RT11) * vx)) + (I64((int16_t)R_RT12) * vy)) + (I64((int16_t)R_RT13) * vz));
+    int64_t mac2 = gte_check_mac(cpu, 2, gte_check_mac(cpu, 2, gte_check_mac(cpu, 2, (((int64_t)R_TRY) << 12) + (I64((int16_t)R_RT21) * vx)) + (I64((int16_t)R_RT22) * vy)) + (I64((int16_t)R_RT23) * vz));
+    int64_t mac3 = gte_check_mac(cpu, 3, gte_check_mac(cpu, 3, gte_check_mac(cpu, 3, (((int64_t)R_TRZ) << 12) + (I64((int16_t)R_RT31) * vx)) + (I64((int16_t)R_RT32) * vy)) + (I64((int16_t)R_RT33) * vz));
+    
+    cpu->s_mac3 = mac3;
+    
+    /* Store shifted MAC values */
+    R_MAC1 = (int32_t)(mac1 >> cpu->gte_sf);
+    R_MAC2 = (int32_t)(mac2 >> cpu->gte_sf);
+    R_MAC3 = (int32_t)(mac3 >> cpu->gte_sf);
+    
+    /* Clamp to IR registers using shifted MAC values */
+    R_IR1 = gte_clamp_ir(cpu, 1, R_MAC1, cpu->gte_lm);
+    R_IR2 = gte_clamp_ir(cpu, 2, R_MAC2, cpu->gte_lm);
+    R_IR3 = gte_clamp_ir_z(cpu, cpu->s_mac3, cpu->gte_sf, cpu->gte_lm);
+    
+    R_SZ0 = R_SZ1;
+    R_SZ1 = R_SZ2;
+    R_SZ2 = R_SZ3;
+    R_SZ3 = gte_clamp_sz3(cpu, cpu->s_mac3 >> 12);
+    
+    int32_t div = gte_divide(cpu, R_H, R_SZ3);
+    
+    R_SXY0 = R_SXY1;
+    R_SXY1 = R_SXY2;
+    R_SX2 = gte_clamp_sxy(cpu, 1, (gte_clamp_mac0(cpu, (int64_t)((int32_t)R_OFX) + ((int64_t)R_IR1 * div)) >> 16));
+    R_SY2 = gte_clamp_sxy(cpu, 2, (gte_clamp_mac0(cpu, (int64_t)((int32_t)R_OFY) + ((int64_t)R_IR2 * div)) >> 16));
+}
 
 #define DPCT1                                                                                                         \
     {                                                                                                                 \
@@ -2359,13 +2580,13 @@ static inline void psx_gte_i_invalid(psx_cpu_t *cpu)
         R_BC2 = gte_clamp_rgb(cpu, 3, R_MAC3 >> 4);                                                                                                                                           \
     }
 
-static inline void psx_gte_i_rtps(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_rtps(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     GTE_RTP_DQ(0);
 }
 
-static inline void psx_gte_i_nclip(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_nclip(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2376,7 +2597,7 @@ static inline void psx_gte_i_nclip(psx_cpu_t *cpu)
     R_MAC0 = (int)gte_clamp_mac0(cpu, value);
 }
 
-static inline void psx_gte_i_op(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_op(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2389,7 +2610,7 @@ static inline void psx_gte_i_op(psx_cpu_t *cpu)
     R_IR3 = gte_clamp_ir(cpu, 3, R_MAC3, cpu->gte_lm);
 }
 
-static inline void psx_gte_i_dpcs(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_dpcs(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2418,7 +2639,7 @@ static inline void psx_gte_i_dpcs(psx_cpu_t *cpu)
     R_BC2 = gte_clamp_rgb(cpu, 3, R_MAC3 >> 4);
 }
 
-static inline void psx_gte_i_intpl(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_intpl(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2464,7 +2685,7 @@ static inline void psx_gte_i_intpl(psx_cpu_t *cpu)
 #define R_CV2 cv.y
 #define R_CV3 cv.z
 
-static inline void psx_gte_i_mvmva(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_mvmva(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2580,14 +2801,14 @@ static inline void psx_gte_i_mvmva(psx_cpu_t *cpu)
 #undef R_CV3
 
 // To-do: Fix flags
-static inline void psx_gte_i_ncds(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_ncds(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
     NCDS(0);
 }
 
-static inline void psx_gte_i_cdp(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_cdp(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     R_MAC1 = gte_clamp_mac(cpu, 1, gte_check_mac(cpu, 1, gte_check_mac(cpu, 1, (I64(R_RBK) << 12) + (I64(R_LR1) * I64(R_IR1))) + (I64(R_LR2) * I64(R_IR2))) + (I64(R_LR3) * I64(R_IR3)));
@@ -2613,7 +2834,7 @@ static inline void psx_gte_i_cdp(psx_cpu_t *cpu)
     R_CD2 = R_CODE;
 }
 
-static inline void psx_gte_i_ncdt(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_ncdt(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     NCDS(0);
@@ -2621,13 +2842,13 @@ static inline void psx_gte_i_ncdt(psx_cpu_t *cpu)
     NCDS(2);
 }
 
-static inline void psx_gte_i_nccs(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_nccs(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     NCCS(0);
 }
 
-static inline void psx_gte_i_cc(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_cc(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     R_MAC1 = gte_clamp_mac(cpu, 1, gte_check_mac(cpu, 1, gte_check_mac(cpu, 1, (I64(R_RBK) << 12) + (I64(R_LR1) * I64(R_IR1))) + (I64(R_LR2) * I64(R_IR2))) + (I64(R_LR3) * I64(R_IR3)));
@@ -2650,13 +2871,13 @@ static inline void psx_gte_i_cc(psx_cpu_t *cpu)
     R_IR3 = gte_clamp_ir(cpu, 3, R_MAC3, cpu->gte_lm);
 }
 
-static inline void psx_gte_i_ncs(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_ncs(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     NCS(0);
 }
 
-static inline void psx_gte_i_nct(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_nct(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     NCS(0);
@@ -2664,7 +2885,7 @@ static inline void psx_gte_i_nct(psx_cpu_t *cpu)
     NCS(2);
 }
 
-static inline void psx_gte_i_sqr(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_sqr(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2677,7 +2898,7 @@ static inline void psx_gte_i_sqr(psx_cpu_t *cpu)
     R_IR3 = gte_clamp_ir(cpu, 3, R_MAC3, cpu->gte_lm);
 }
 
-static inline void psx_gte_i_dcpl(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_dcpl(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2701,7 +2922,7 @@ static inline void psx_gte_i_dcpl(psx_cpu_t *cpu)
     R_BC2 = gte_clamp_rgb(cpu, 3, R_MAC3 >> 4);
 }
 
-static inline void psx_gte_i_dpct(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_dpct(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     DPCT1;
@@ -2709,7 +2930,7 @@ static inline void psx_gte_i_dpct(psx_cpu_t *cpu)
     DPCT1;
 }
 
-static inline void psx_gte_i_avsz3(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_avsz3(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2719,7 +2940,7 @@ static inline void psx_gte_i_avsz3(psx_cpu_t *cpu)
     R_OTZ = gte_clamp_sz3(cpu, avg >> 12);
 }
 
-static inline void psx_gte_i_avsz4(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_avsz4(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2729,15 +2950,15 @@ static inline void psx_gte_i_avsz4(psx_cpu_t *cpu)
     R_OTZ = gte_clamp_sz3(cpu, avg >> 12);
 }
 
-static inline void psx_gte_i_rtpt(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_rtpt(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
-    GTE_RTP(0);
-    GTE_RTP(1);
+    gte_rtp(cpu, 0);
+    gte_rtp(cpu, 1);
     GTE_RTP_DQ(2);
 }
 
-static inline void psx_gte_i_gpf(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_gpf(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2755,7 +2976,7 @@ static inline void psx_gte_i_gpf(psx_cpu_t *cpu)
     R_BC2 = gte_clamp_rgb(cpu, 3, R_MAC3 >> 4);
 }
 
-static inline void psx_gte_i_gpl(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_gpl(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2773,7 +2994,7 @@ static inline void psx_gte_i_gpl(psx_cpu_t *cpu)
     R_BC2 = gte_clamp_rgb(cpu, 3, R_MAC3 >> 4);
 }
 
-static inline void psx_gte_i_ncct(psx_cpu_t *cpu)
+static inline PSX_CPU_HOT void psx_gte_i_ncct(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     NCCS(0);
@@ -2917,197 +3138,51 @@ static inline int32_t __attribute__((always_inline)) psx_cpu_exec_cop2(psx_cpu_t
 
 int32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_execute(psx_cpu_t *cpu)
 {
-    // Extract opcode once to reduce memory accesses
-    uint32_t op = cpu->opcode;
-    uint32_t opcode_class = op >> 26;
-    
-    // Fast path for most common instructions using computed goto would be ideal,
-    // but we'll use optimized switch with likely/unlikely hints
-    switch (opcode_class)
+    /* Straight switch dispatch: every handler is a static inline, so the
+       whole interpreter ends up as one branch-table driven function in
+       ITCM - no indirect calls, no software instruction cache. */
+    switch (cpu->opcode >> 26)
     {
-    case 0x00: // SPECIAL
-        return psx_cpu_exec_special(cpu);
-        
-    case 0x01: // REGIMM (branches)
-        return psx_cpu_exec_regimm(cpu);
-        
-    case 0x02: // J
-        psx_cpu_i_j(cpu);
-        return 2;
-        
-    case 0x03: // JAL
-        psx_cpu_i_jal(cpu);
-        return 2;
-        
-    case 0x04: // BEQ
-        psx_cpu_i_beq(cpu);
-        return 2;
-        
-    case 0x05: // BNE  
-        psx_cpu_i_bne(cpu);
-        return 2;
-        
-    case 0x06: // BLEZ
-        psx_cpu_i_blez(cpu);
-        return 2;
-        
-    case 0x07: // BGTZ
-        psx_cpu_i_bgtz(cpu);
-        return 2;
-        
-    case 0x08: // ADDI
-        psx_cpu_i_addi(cpu);
-        return 2;
-        
-    case 0x09: // ADDIU - very common
-        psx_cpu_i_addiu(cpu);
-        return 2;
-        
-    case 0x0a: // SLTI
-        psx_cpu_i_slti(cpu);
-        return 2;
-        
-    case 0x0b: // SLTIU
-        psx_cpu_i_sltiu(cpu);
-        return 2;
-        
-    case 0x0c: // ANDI
-        psx_cpu_i_andi(cpu);
-        return 2;
-        
-    case 0x0d: // ORI
-        psx_cpu_i_ori(cpu);
-        return 2;
-        
-    case 0x0e: // XORI
-        psx_cpu_i_xori(cpu);
-        return 2;
-        
-    case 0x0f: // LUI - very common
-        psx_cpu_i_lui(cpu);
-        return 2;
-        
-    case 0x10: // COP0
-        return psx_cpu_exec_cop0(cpu);
-        
-    case 0x12: // COP2 (GTE)
-        return psx_cpu_exec_cop2(cpu);
-        
-    case 0x20: // LB
-        psx_cpu_i_lb(cpu);
-        return 2;
-        
-    case 0x21: // LH
-        psx_cpu_i_lh(cpu);
-        return 2;
-        
-    case 0x22: // LWL
-        psx_cpu_i_lwl(cpu);
-        return 2;
-        
-    case 0x23: // LW - very common
-        psx_cpu_i_lw(cpu);
-        return 2;
-        
-    case 0x24: // LBU
-        psx_cpu_i_lbu(cpu);
-        return 2;
-        
-    case 0x25: // LHU
-        psx_cpu_i_lhu(cpu);
-        return 2;
-        
-    case 0x26: // LWR
-        psx_cpu_i_lwr(cpu);
-        return 2;
-        
-    case 0x28: // SB
-        psx_cpu_i_sb(cpu);
-        return 2;
-        
-    case 0x29: // SH
-        psx_cpu_i_sh(cpu);
-        return 2;
-        
-    case 0x2a: // SWL
-        psx_cpu_i_swl(cpu);
-        return 2;
-        
-    case 0x2b: // SW - very common
-        psx_cpu_i_sw(cpu);
-        return 2;
-        
-    case 0x2e: // SWR
-        psx_cpu_i_swr(cpu);
-        return 2;
-        
-    case 0x30: // LWC0
-        psx_cpu_i_lwc0(cpu);
-        return 2;
-        
-    case 0x31: // LWC1
-        psx_cpu_i_lwc1(cpu);
-        return 2;
-        
-    case 0x32: // LWC2
-        psx_cpu_i_lwc2(cpu);
-        return 2;
-        
-    case 0x33: // LWC3
-        psx_cpu_i_lwc3(cpu);
-        return 2;
-        
-    case 0x38: // SWC0
-        psx_cpu_i_swc0(cpu);
-        return 2;
-        
-    case 0x39: // SWC1
-        psx_cpu_i_swc1(cpu);
-        return 2;
-        
-    case 0x3a: // SWC2
-        psx_cpu_i_swc2(cpu);
-        return 2;
-        
-    case 0x3b: // SWC3
-        psx_cpu_i_swc3(cpu);
-        return 2;
-        
-    default:
-        return 0;
+    case 0x00: return psx_cpu_exec_special(cpu);
+    case 0x01: return psx_cpu_exec_regimm(cpu);
+    case 0x02: psx_cpu_i_j(cpu);     return 2;
+    case 0x03: psx_cpu_i_jal(cpu);   return 2;
+    case 0x04: psx_cpu_i_beq(cpu);   return 2;
+    case 0x05: psx_cpu_i_bne(cpu);   return 2;
+    case 0x06: psx_cpu_i_blez(cpu);  return 2;
+    case 0x07: psx_cpu_i_bgtz(cpu);  return 2;
+    case 0x08: psx_cpu_i_addi(cpu);  return 2;
+    case 0x09: psx_cpu_i_addiu(cpu); return 2;
+    case 0x0a: psx_cpu_i_slti(cpu);  return 2;
+    case 0x0b: psx_cpu_i_sltiu(cpu); return 2;
+    case 0x0c: psx_cpu_i_andi(cpu);  return 2;
+    case 0x0d: psx_cpu_i_ori(cpu);   return 2;
+    case 0x0e: psx_cpu_i_xori(cpu);  return 2;
+    case 0x0f: psx_cpu_i_lui(cpu);   return 2;
+    case 0x10: return psx_cpu_exec_cop0(cpu);
+    case 0x12: return psx_cpu_exec_cop2(cpu);
+    case 0x20: psx_cpu_i_lb(cpu);    return 2;
+    case 0x21: psx_cpu_i_lh(cpu);    return 2;
+    case 0x22: psx_cpu_i_lwl(cpu);   return 2;
+    case 0x23: psx_cpu_i_lw(cpu);    return 2;
+    case 0x24: psx_cpu_i_lbu(cpu);   return 2;
+    case 0x25: psx_cpu_i_lhu(cpu);   return 2;
+    case 0x26: psx_cpu_i_lwr(cpu);   return 2;
+    case 0x28: psx_cpu_i_sb(cpu);    return 2;
+    case 0x29: psx_cpu_i_sh(cpu);    return 2;
+    case 0x2a: psx_cpu_i_swl(cpu);   return 2;
+    case 0x2b: psx_cpu_i_sw(cpu);    return 2;
+    case 0x2e: psx_cpu_i_swr(cpu);   return 2;
+    case 0x30: psx_cpu_i_lwc0(cpu);  return 2;
+    case 0x31: psx_cpu_i_lwc1(cpu);  return 2;
+    case 0x32: psx_cpu_i_lwc2(cpu);  return 2;
+    case 0x33: psx_cpu_i_lwc3(cpu);  return 2;
+    case 0x38: psx_cpu_i_swc0(cpu);  return 2;
+    case 0x39: psx_cpu_i_swc1(cpu);  return 2;
+    case 0x3a: psx_cpu_i_swc2(cpu);  return 2;
+    case 0x3b: psx_cpu_i_swc3(cpu);  return 2;
+    default: return 0;
     }
-}
-
-// Simplified instruction cache for performance tracking
-void psx_cpu_clear_cache(psx_cpu_t *cpu)
-{
-    for (int32_t i = 0; i < 1024; i++)
-    {
-        cpu->instruction_cache[i].pc = 0xFFFFFFFF;
-        cpu->instruction_cache[i].opcode = 0;
-        cpu->instruction_cache[i].func = NULL;
-        cpu->instruction_cache[i].cycles = 0;
-    }
-    cpu->cache_hits = 0;
-    cpu->cache_misses = 0;
-}
-
-void __attribute__((section(".ramfunc.$SRAM_OC"))) psx_cpu_cache_instruction(psx_cpu_t *cpu, uint32_t pc, uint32_t opcode, void (*func)(psx_cpu_t *), int32_t cycles)
-{
-    // Kept for API compatibility but not used in optimized path
-    (void)cpu;
-    (void)pc;
-    (void)opcode;
-    (void)func;
-    (void)cycles;
-}
-
-// Optimized cached execution - now just calls the fast dispatch directly
-int32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_execute_cached(psx_cpu_t *cpu)
-{
-    // With our optimized dispatch, caching is no longer beneficial
-    // The new switch-based dispatch is fast enough
-    return psx_cpu_execute(cpu);
 }
 
 #undef R_R0

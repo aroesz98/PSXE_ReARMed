@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "bus.h"
+#include "prof.h"
 #include "bus_init.h"
 #include "log.h"
 
@@ -104,7 +105,7 @@ const uint32_t g_psx_bus_region_mask_table[] = {
     0x7fffffff, 0x1fffffff, 0xffffffff, 0xffffffff};
 
 // Static buffer for bus instance
-static psx_bus_t g_bus_instance;
+static psx_bus_t __attribute__((section(".bss.$SRAM_DTC"), aligned(4))) g_bus_instance;
 static int32_t g_bus_instance_used = 0;
 
 psx_bus_t *psx_bus_create(void)
@@ -294,6 +295,8 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_bus_read32(psx_bus_t
         log_fatal("Unaligned 32-bit read from %08x:%08x", (uint32_t)vaddr, (uint32_t)addr);
     }
 
+    PSX_IO_TRACE(addr, 0, 0, 32);
+
     uint32_t cached32;
     if (psx_bus_try_cached_read32(bus, addr, &cached32))
     {
@@ -336,6 +339,8 @@ uint16_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_bus_read16(psx_bus_t
     {
         log_fatal("Unaligned 16-bit read from %08x:%08x", (uint32_t)vaddr, (uint32_t)addr);
     }
+
+    PSX_IO_TRACE(addr, 0, 0, 16);
 
     uint16_t cached16;
     if (psx_bus_try_cached_read16(bus, addr, &cached16))
@@ -385,6 +390,8 @@ uint8_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_bus_read8(psx_bus_t *
 
     addr &= g_psx_bus_region_mask_table[addr >> 29];
 
+    PSX_IO_TRACE(addr, 0, 0, 8);
+
     uint8_t cached8;
     if (psx_bus_try_cached_read8(bus, addr, &cached8))
     {
@@ -417,6 +424,8 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_bus_write32(psx_bus_t *b
     {
         log_fatal("Unaligned 32-bit write to %08x:%08x (%08x)", (uint32_t)vaddr, (uint32_t)addr, (uint32_t)value);
     }
+
+    PSX_IO_TRACE(addr, value, 1, 32);
 
     if (psx_bus_try_cached_write32(bus, addr, value))
     {
@@ -455,6 +464,8 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_bus_write16(psx_bus_t *b
         log_fatal("Unaligned 16-bit write to %08x:%08x (%04x)", (uint32_t)vaddr, (uint32_t)addr, value);
     }
 
+    PSX_IO_TRACE(addr, value, 1, 16);
+
     if (psx_bus_try_cached_write16(bus, addr, value))
     {
         return;
@@ -481,6 +492,8 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_bus_write8(psx_bus_t *bu
     uint32_t vaddr = addr;
 
     addr &= g_psx_bus_region_mask_table[addr >> 29];
+
+    PSX_IO_TRACE(addr, value, 1, 8);
 
     if (psx_bus_try_cached_write8(bus, addr, value))
     {

@@ -168,9 +168,11 @@ void pad_handle_ctrl_write(psx_pad_t *pad, uint32_t value)
     }
 }
 
+static psx_pad_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) g_pad_instance;
+
 psx_pad_t *psx_pad_create(void)
 {
-    return (psx_pad_t *)malloc(sizeof(psx_pad_t));
+    return &g_pad_instance;
 }
 
 void psx_pad_init(psx_pad_t *pad, psx_ic_t *ic)
@@ -426,7 +428,7 @@ void psx_pad_detach_mcd(psx_pad_t *pad, int32_t slot)
     pad->mcd_slot[slot] = NULL;
 }
 
-void psx_pad_update(psx_pad_t *pad, int32_t cyc)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_pad_update(psx_pad_t *pad, int32_t cyc)
 {
     if (pad->cycles_until_irq)
     {

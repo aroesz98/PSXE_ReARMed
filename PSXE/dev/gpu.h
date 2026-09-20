@@ -107,6 +107,10 @@ struct psx_gpu_t
 
     uint16_t *vram;
     uint16_t *empty;
+
+    /* Set on every GPU register write, cleared when the frame is presented:
+       lets the frontend skip re-scaling a frame that did not change. */
+    int32_t vram_dirty;
     int display_enable;
 
     // State data
@@ -164,9 +168,15 @@ struct psx_gpu_t
     uint32_t disp_y1, disp_y2;
 
     // Timing and IRQs
-    float cycles;
+    /* GPU dot clock accumulator in 16.16 fixed point: integer compares in the
+       hblank check are far cheaper than the float ones this used to do on
+       every single device update. */
+    uint32_t cycles_fp;
+    /* Next dot clock value at which an hblank edge happens, so the periodic
+       update can bail out with a single compare. */
+    uint32_t next_edge_fp;
+    int in_hblank;
     int line;
-
     psx_ic_t *ic;
 
     psx_gpu_event_callback_t event_cb_table[8];

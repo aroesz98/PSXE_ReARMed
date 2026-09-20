@@ -71,6 +71,10 @@
 #define DEMO_CACHE_LINE_SIZE FSL_FEATURE_L1DCACHE_LINESIZE_BYTE
 #endif
 
+#ifndef FRAME_BUFFER_ALIGN
+#define FRAME_BUFFER_ALIGN 64
+#endif
+
 #if (DEMO_CACHE_LINE_SIZE > FRAME_BUFFER_ALIGN)
 #define DEMO_FB_ALIGN DEMO_CACHE_LINE_SIZE
 #else
@@ -120,7 +124,10 @@ static SemaphoreHandle_t s_frameSema;
 #endif
 
 // Simplified frame buffer declaration for testing
-__attribute__((aligned(32), section(".bss.$BOARD_SDRAM"))) static uint8_t s_frameBuffer[2][DEMO_FB_SIZE];
+/* Framebuffers live in the non-cacheable SDRAM region: they are written by
+   PXP and read by eLCDIF (both bus masters), so keeping them out of the
+   D-cache removes all cache maintenance from the display path. */
+__attribute__((aligned(64), section(".bss.$NCACHE_REGION"))) static uint8_t s_frameBuffer[2][DEMO_FB_SIZE];
 
 /*******************************************************************************
  * PXP Support - Hardware Acceleration
@@ -358,16 +365,17 @@ void DEMO_InitLcd(void)
     DEMO_InitLcdBackLight();
 }
 
-// Double buffer management to prevent tearing
+// Double buffer management to prevent tearing - optimized for minimal latency
 void DEMO_SwapBuffers(void)
 {
-    // Wait for any pending frame to complete
-    while (s_framePending)
+    // If previous frame is still pending, skip this frame (drop frame instead of waiting)
+    // This prevents blocking and maintains smooth performance
+    if (s_framePending)
     {
+        return; // Frame drop - continue rendering next frame
     }
     
-    // Clean the back buffer cache before displaying
-    DCACHE_CleanInvalidateByRange((uint32_t)s_frameBuffer[s_currentBackBuffer], DEMO_FB_SIZE);
+    /* Framebuffers are non-cacheable: no cache maintenance needed here */
     
     // Set the back buffer as the new display buffer
     ELCDIF_SetNextBufferAddr(LCDIF, (uint32_t)s_frameBuffer[s_currentBackBuffer]);
@@ -378,22 +386,8 @@ void DEMO_SwapBuffers(void)
     // Mark frame as pending
     s_framePending = true;
     
-#if defined(SDK_OS_FREE_RTOS)
-    // Wait for vsync (frame completion)
-    if (xSemaphoreTake(s_frameSema, portMAX_DELAY) == pdTRUE)
-    {
-        // Frame swap completed
-    }
-    else
-    {
-        PRINTF("Buffer swap failed\r\n");
-    }
-#else
-    // Wait for vsync (frame completion)
-    while (s_framePending)
-    {
-    }
-#endif
+    // Don't wait for completion - return immediately for async rendering
+    // The interrupt handler will complete the buffer swap
 }
 
 void DEMO_DisplayColorTest(uint16_t background_color)

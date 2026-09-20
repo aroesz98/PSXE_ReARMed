@@ -39,7 +39,7 @@ const flexspi_nor_config_t
                         (1u << kFlexSpiMiscOffset_SafeConfigFreqEnable) | (1u << kFlexSpiMiscOffset_DiffClkEnable),
                     .deviceType         = kFlexSpiDeviceType_SerialNOR,
                     .sflashPadType      = kSerialFlash_8Pads,
-                    .serialClkFreq      = kFlexSpiSerialClk_133MHz,
+                    .serialClkFreq      = kFlexSpiSerialClk_166MHz,
                     .lutCustomSeqEnable = 0x1,
                     .sflashA1Size       = 64u * 1024u * 1024u,
                     .dataValidTime      = {15u, 0u},

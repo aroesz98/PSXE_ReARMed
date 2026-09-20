@@ -25,12 +25,14 @@
 #include "clock_config.h"
 #include "board.h"
 #include "fsl_gpio.h"
+#include "MIMXRT1052.h"
 
 /* DWT cycle counter for performance monitoring */
 #include "core_cm7.h"
 
 /* PSX Emulator includes */
 #include "psx.h"
+#include "prof.h"
 #include "input/sda.h"
 #include "input/guncon.h"
 #include "dev/cdrom/cdrom.h"
@@ -60,6 +62,124 @@ typedef struct
 /*******************************************************************************
  * Prototypes
  ******************************************************************************/
+/* ---------------------------------------------------------------------------
+   Memory micro benchmark: tells us what the memory system actually delivers
+   for the access patterns the GPU rasterizer uses (VRAM lives in SDRAM).
+   --------------------------------------------------------------------------- */
+/* Set to 1 to print the memory benchmark at boot */
+#define PSX_MEM_BENCH 0
+
+/* The stock NXP DCD programs the SDRAM (and the SEMC) for burst length 1, so a
+   single 32 byte cache line refill turns into 16 separate SDRAM accesses.
+   VRAM and PSX RAM live in SDRAM, so this directly limits the rasterizer. */
+static void BOARD_SDRAM_SetBurstLen8(void)
+{
+    while (0U == (SEMC->STS0 & SEMC_STS0_IDLE_MASK))
+    {
+    }
+
+    /* SDRAM mode register: CAS latency 3, burst length 8 */
+    SEMC->IPTXDAT = 0x33U;
+    SEMC->IPCR0 = 0x80000000U;
+    SEMC->IPCR1 = 2U;
+    SEMC->IPCMD = 0xA55A000AU; /* MODESET */
+
+    while (0U == (SEMC->INTR & SEMC_INTR_IPCMDDONE_MASK))
+    {
+    }
+
+    SEMC->INTR = SEMC_INTR_IPCMDDONE_MASK;
+
+    /* And let the controller issue 8 beat bursts */
+    SEMC->SDRAMCR0 = (SEMC->SDRAMCR0 & ~SEMC_SDRAMCR0_BL_MASK) | SEMC_SDRAMCR0_BL(3);
+
+    __DSB();
+    __ISB();
+}
+
+__attribute__((unused)) static void psx_mem_benchmark(void *vram, const char *tag)
+{
+    volatile uint16_t *p16 = (volatile uint16_t *)vram;
+    volatile uint32_t *p32 = (volatile uint32_t *)vram;
+    uint32_t t0, cyc, i, acc = 0;
+
+    const uint32_t words = 64 * 1024; /* 256 KB */
+
+    /* cost of a DWT cycle counter read (the profiler uses two per round) */
+    t0 = DWT->CYCCNT;
+    for (i = 0; i < 1000; i++)
+        acc += DWT->CYCCNT;
+    cyc = DWT->CYCCNT - t0;
+    PRINTF("[%s] BENCH DWT read: %u cyc each\r\n", tag, cyc / 1000);
+
+    /* sequential 32-bit write */
+    t0 = DWT->CYCCNT;
+    for (i = 0; i < words; i++)
+        p32[i] = i;
+    cyc = DWT->CYCCNT - t0;
+    PRINTF("[%s] BENCH seq write 256KB: %u cycles (%u MB/s, %u cyc/word)\r\n", tag,
+           cyc, (unsigned)((uint64_t)256 * 600000000u / 1024u / cyc), cyc / words);
+
+    /* sequential 32-bit read */
+    t0 = DWT->CYCCNT;
+    for (i = 0; i < words; i++)
+        acc += p32[i];
+    cyc = DWT->CYCCNT - t0;
+    PRINTF("[%s] BENCH seq read  256KB: %u cycles (%u MB/s, %u cyc/word)\r\n", tag,
+           cyc, (unsigned)((uint64_t)256 * 600000000u / 1024u / cyc), cyc / words);
+
+    /* 16-bit reads with a 2048 byte stride: one VRAM line per access */
+    t0 = DWT->CYCCNT;
+    for (i = 0; i < 16384; i++)
+        acc += p16[(i * 1024) & 0x7ffff];
+    cyc = DWT->CYCCNT - t0;
+    PRINTF("[%s] BENCH strided read (VRAM lines): %u cyc/access\r\n", tag, cyc / 16384);
+
+    /* 16-bit writes with a 2048 byte stride */
+    t0 = DWT->CYCCNT;
+    for (i = 0; i < 16384; i++)
+        p16[(i * 1024) & 0x7ffff] = (uint16_t)i;
+    cyc = DWT->CYCCNT - t0;
+    PRINTF("[%s] BENCH strided write (VRAM lines): %u cyc/access\r\n", tag, cyc / 16384);
+
+    /* sequential 16-bit span write (rasterizer fill pattern) */
+    t0 = DWT->CYCCNT;
+    for (i = 0; i < 131072; i++)
+        p16[i] = (uint16_t)i;
+    cyc = DWT->CYCCNT - t0;
+    PRINTF("[%s] BENCH span write 16-bit: %u cyc/pixel\r\n", tag, cyc / 131072);
+
+    /* sequential 16-bit read with software prefetch one line ahead */
+    t0 = DWT->CYCCNT;
+    for (i = 0; i < 131072; i++)
+    {
+        if ((i & 15u) == 0u)
+            __builtin_prefetch((const void *)&p16[i + 16]);
+
+        acc += p16[i];
+    }
+    cyc = DWT->CYCCNT - t0;
+    PRINTF("[%s] BENCH span read 16-bit + PLD: %u cyc/texel\r\n", tag, cyc / 131072);
+
+    /* strided read with prefetch of the following line */
+    t0 = DWT->CYCCNT;
+    for (i = 0; i < 16384; i++)
+    {
+        __builtin_prefetch((const void *)&p16[((i + 1) * 1024) & 0x7ffff]);
+
+        acc += p16[(i * 1024) & 0x7ffff];
+    }
+    cyc = DWT->CYCCNT - t0;
+    PRINTF("[%s] BENCH strided read + PLD: %u cyc/access\r\n", tag, cyc / 16384);
+
+    /* sequential 16-bit read (texel fetch pattern along one texture row) */
+    t0 = DWT->CYCCNT;
+    for (i = 0; i < 131072; i++)
+        acc += p16[i];
+    cyc = DWT->CYCCNT - t0;
+    PRINTF("[%s] BENCH span read 16-bit: %u cyc/texel (acc=%u)\r\n", tag, cyc / 131072, (unsigned)acc);
+}
+
 static void psx_emulator_task(void *pvParameters);
 
 /* Empty audio callback for future use */
@@ -72,6 +192,11 @@ void audio_update(void *ud, uint8_t *buf, int size)
 /*******************************************************************************
  * Variables
  ******************************************************************************/
+
+/* FreeRTOS heap placed in DTCM: every task stack (including the emulator
+   task) then lives in tightly coupled memory instead of ITCM, which is
+   reserved for hot code. */
+uint8_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) ucHeap[configTOTAL_HEAP_SIZE];
 
 /* PSX Emulator global variables */
 static psx_t *g_psx = NULL;
@@ -99,7 +224,29 @@ int main(void)
     BOARD_BootClockRUN();
     BOARD_InitDebugConsole();
 
+    CLOCK_InitSysPfd(kCLOCK_Pfd2, 23);
+    /* Set semc clock to 176 MHz (528 * 18 / 27 / 2) */
+    CLOCK_SetMux(kCLOCK_SemcMux, 1);
+    CLOCK_SetDiv(kCLOCK_SemcDiv, 1);
+//    CLOCK_SetDiv(kCLOCK_Usdhc1Div, 2);
+//    CLOCK_SetDiv(kCLOCK_Usdhc2Div, 2);
+
     PRINTF("PSXE MCU Emulator Starting...\r\n");
+
+    /* DWT cycle counter, used by the benchmarks and the profiler */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    /* Burst length 8 makes SDRAM line fills (VRAM, PSX RAM) much cheaper */
+#if PSX_MEM_BENCH
+    psx_mem_benchmark((void *)0x81000000u, "BL1");
+#endif
+    BOARD_SDRAM_SetBurstLen8();
+#if PSX_MEM_BENCH
+    psx_mem_benchmark((void *)0x81000000u, "BL8");
+#endif
+    PRINTF("Initial Core Clock: %u Hz (%u MHz)\r\n", (unsigned int)SystemCoreClock, (unsigned int)(SystemCoreClock / 1000000));
 
 /* Display architecture information */
 #ifdef __arm__
@@ -306,7 +453,7 @@ static void psx_emulator_task(void *pvParameters)
         }
     }
 
-    run_all_tests();
+//    run_all_tests();
 
 //    /* Load executable if specified */
 //    if (g_psxConfig.exe_path)
@@ -321,6 +468,8 @@ static void psx_emulator_task(void *pvParameters)
 
     /* Main emulation loop */
     PRINTF("Starting PSX emulation loop...\r\n");
+
+    psx_prof_init();
 
     while (psxe_screen_is_open(g_screen))
     {

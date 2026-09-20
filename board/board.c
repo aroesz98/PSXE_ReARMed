@@ -356,13 +356,19 @@ void BOARD_ConfigMPU(void)
     MPU->RBAR = ARM_MPU_RBAR(6, 0x20000000U);
     MPU->RASR = ARM_MPU_RASR(0, ARM_MPU_AP_FULL, 0, 0, 1, 1, 0, ARM_MPU_REGION_SIZE_128KB);
 
-    /* Region 7 setting: Memory with Normal type, not shareable, outer/inner write back */
+    /* Region 7 setting: Memory with Normal type, not shareable, outer/inner write
+     * back, read/write allocate (TEX=1,C=1,B=1) */
     MPU->RBAR = ARM_MPU_RBAR(7, 0x20200000U);
-    MPU->RASR = ARM_MPU_RASR(0, ARM_MPU_AP_FULL, 0, 0, 1, 1, 0, ARM_MPU_REGION_SIZE_256KB);
+    MPU->RASR = ARM_MPU_RASR(0, ARM_MPU_AP_FULL, 1, 0, 1, 1, 0, ARM_MPU_REGION_SIZE_256KB);
 
-    /* Region 8 setting: Memory with Normal type, not shareable, outer/inner write back */
+    /* Region 8 setting (SDRAM): Normal type, not shareable, outer/inner write back
+     * with read AND write allocate (TEX=1,C=1,B=1).
+     * Write allocate is essential here: PSX RAM and the 1MB VRAM live in SDRAM and
+     * are written pixel by pixel / word by word. Without write allocate every store
+     * miss becomes a single narrow SDRAM write instead of being combined into a
+     * 32 byte cache line. */
     MPU->RBAR = ARM_MPU_RBAR(8, 0x80000000U);
-    MPU->RASR = ARM_MPU_RASR(0, ARM_MPU_AP_FULL, 0, 0, 1, 1, 0, ARM_MPU_REGION_SIZE_32MB);
+    MPU->RASR = ARM_MPU_RASR(0, ARM_MPU_AP_FULL, 1, 0, 1, 1, 0, ARM_MPU_REGION_SIZE_32MB);
 
     while ((size >> i) > 0x1U)
     {

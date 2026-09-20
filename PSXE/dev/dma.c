@@ -1,4 +1,7 @@
+#include "../prof.h"
 #include "dma.h"
+#include "../bus_init.h"
+#include "../bus_fast.h"
 #include "../log.h"
 
 #include <stdint.h>
@@ -9,7 +12,7 @@
 #include "fsl_debug_console.h"
 
 // Static buffer for DMA instance
-static psx_dma_t g_dma_instance;
+static psx_dma_t __attribute__((section(".bss.$SRAM_DTC"), aligned(4))) g_dma_instance;
 static int32_t g_dma_instance_used = 0;
 
 psx_dma_t *psx_dma_create(void)
@@ -139,6 +142,70 @@ uint8_t psx_dma_read8(psx_dma_t *dma, uint32_t offset)
     }
 }
 
+/* Latches the per channel completion flags. The hardware latches them at the
+   moment the transfer finishes and only if that channel's interrupt is enabled
+   right then, so this has to run as part of the transfer - not on some later
+   device update, or a channel that was disabled during the transfer could still
+   end up with a flag the program never acknowledges (which deadlocks it). */
+static void __attribute__((section(".ramfunc.$SRAM_ITC"))) dma_latch_irq_flags(psx_dma_t *dma)
+{
+    if (dma->cdrom_irq_delay)
+    {
+        dma->cdrom_irq_delay = 0;
+
+        if (dma->dicr & DICR_DMA3EN)
+            dma->dicr |= DICR_DMA3FL;
+    }
+
+    if (dma->spu_irq_delay)
+    {
+        dma->spu_irq_delay = 0;
+
+        if (dma->dicr & DICR_DMA4EN)
+            dma->dicr |= DICR_DMA4FL;
+    }
+
+    if (dma->gpu_irq_delay)
+    {
+        dma->gpu_irq_delay = 0;
+
+        if (dma->dicr & DICR_DMA2EN)
+            dma->dicr |= DICR_DMA2FL;
+    }
+
+    if (dma->otc_irq_delay)
+    {
+        dma->otc_irq_delay = 0;
+
+        if (dma->dicr & DICR_DMA6EN)
+            dma->dicr |= DICR_DMA6FL;
+    }
+}
+
+/* Re-evaluates the DMA interrupt line.
+
+   The DICR IRQ master flag (bit 31) holds the previous state of the line and an
+   interrupt is only delivered on a 0->1 edge, exactly like the hardware. That
+   means the line has to be re-evaluated as soon as anything can change it:
+   after a transfer sets a channel flag and after the program acknowledges the
+   flags. Evaluating it only from the periodic update would lose interrupts
+   whenever an acknowledge and the next transfer happen between two updates. */
+static void __attribute__((section(".ramfunc.$SRAM_ITC"))) dma_update_irq_signal(psx_dma_t *dma)
+{
+    int32_t prev_irq_signal = (dma->dicr & DICR_IRQSI) != 0;
+    int32_t irq_on_flags = (dma->dicr & DICR_IRQEN) != 0;
+    int32_t force_irq = (dma->dicr & DICR_FORCE) != 0;
+    int32_t irq = (dma->dicr & DICR_FLAGS) != 0;
+
+    int32_t irq_signal = force_irq || ((irq & irq_on_flags) != 0);
+
+    if (irq_signal && !prev_irq_signal)
+        psx_ic_irq(dma->ic, IC_DMA);
+
+    dma->dicr &= ~DICR_IRQSI;
+    dma->dicr |= irq_signal << 31;
+}
+
 void dma_write_dicr(psx_dma_t *dma, uint32_t value)
 {
     uint32_t ack = value & DICR_FLAGS;
@@ -150,9 +217,12 @@ void dma_write_dicr(psx_dma_t *dma, uint32_t value)
     dma->dicr &= 0x80000000;
     dma->dicr |= flags;
     dma->dicr |= value & 0xffffff;
+
+    /* The acknowledge may have released the interrupt line */
+    dma_update_irq_signal(dma);
 }
 
-void psx_dma_write32(psx_dma_t *dma, uint32_t offset, uint32_t value)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_write32(psx_dma_t *dma, uint32_t offset, uint32_t value)
 {
     if (offset < 0x70)
     {
@@ -164,7 +234,16 @@ void psx_dma_write32(psx_dma_t *dma, uint32_t offset, uint32_t value)
         log_debug("DMA channel %u register %u write (%08x) %08x", channel, reg, PSX_DMAR_BEGIN + offset, value);
 
         if (reg == 2)
+        {
+            PROF_T0(t_dma);
             g_psx_dma_do_table[channel](dma);
+            PROF_ADD(dmax, t_dma);
+
+            /* Latch the completion flag and deliver the interrupt right away
+               instead of waiting for the next device update round */
+            dma_latch_irq_flags(dma);
+            dma_update_irq_signal(dma);
+        }
     }
     else
     {
@@ -240,7 +319,7 @@ const char *g_psx_dma_sync_type_name_table[] = {
     "linked",
     "reserved"};
 
-void psx_dma_do_mdec_in(psx_dma_t *dma)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_mdec_in(psx_dma_t *dma)
 {
     if (!CHCR_BUSY(mdec_in))
         return;
@@ -258,9 +337,9 @@ void psx_dma_do_mdec_in(psx_dma_t *dma)
 
     for (int32_t i = 0; i < size; i++)
     {
-        uint32_t data = psx_bus_read32(dma->bus, dma->mdec_in.madr);
+        uint32_t data = psx_bus_fast_read32(dma->bus, dma->mdec_in.madr);
 
-        psx_bus_write32(dma->bus, 0x1f801820, data);
+        psx_mdec_write32(dma->bus->mdec, 0, data);
 
         dma->mdec_in.madr += step;
     }
@@ -271,7 +350,7 @@ void psx_dma_do_mdec_in(psx_dma_t *dma)
     dma->mdec_in.bcr = 0;
 }
 
-void psx_dma_do_mdec_out(psx_dma_t *dma)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_mdec_out(psx_dma_t *dma)
 {
     if (!CHCR_BUSY(mdec_out))
         return;
@@ -289,9 +368,9 @@ void psx_dma_do_mdec_out(psx_dma_t *dma)
 
     for (int32_t i = 0; i < size; i++)
     {
-        uint32_t data = psx_bus_read32(dma->bus, 0x1f801820);
+        uint32_t data = psx_mdec_read32(dma->bus->mdec, 0);
 
-        psx_bus_write32(dma->bus, dma->mdec_out.madr, data);
+        psx_bus_fast_write32(dma->bus, dma->mdec_out.madr, data);
 
         dma->mdec_out.madr += CHCR_STEP(mdec_out) ? -4 : 4;
     }
@@ -302,9 +381,9 @@ void psx_dma_do_mdec_out(psx_dma_t *dma)
     dma->mdec_out.bcr = 0;
 }
 
-void psx_dma_do_gpu_linked(psx_dma_t *dma)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_gpu_linked(psx_dma_t *dma)
 {
-    uint32_t hdr = psx_bus_read32(dma->bus, dma->gpu.madr);
+    uint32_t hdr = psx_bus_fast_read32(dma->bus, dma->gpu.madr);
     uint32_t size = hdr >> 24;
     uint32_t addr = dma->gpu.madr;
 
@@ -317,10 +396,10 @@ void psx_dma_do_gpu_linked(psx_dma_t *dma)
             addr = (addr + (CHCR_STEP(gpu) ? -4 : 4)) & 0x1ffffc;
 
             // Get command from linked list
-            uint32_t cmd = psx_bus_read32(dma->bus, addr);
+            uint32_t cmd = psx_bus_fast_read32(dma->bus, addr);
 
             // Write to GP0
-            psx_bus_write32(dma->bus, 0x1f801810, cmd);
+            psx_gpu_write32(dma->bus->gpu, 0, cmd);
 
             dma->gpu_irq_delay++;
         }
@@ -330,12 +409,12 @@ void psx_dma_do_gpu_linked(psx_dma_t *dma)
         if (addr == 0xffffff)
             break;
 
-        hdr = psx_bus_read32(dma->bus, addr);
+        hdr = psx_bus_fast_read32(dma->bus, addr);
         size = hdr >> 24;
     }
 }
 
-void psx_dma_do_gpu_request(psx_dma_t *dma)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_gpu_request(psx_dma_t *dma)
 {
     if (!CHCR_BUSY(gpu))
         return;
@@ -346,9 +425,9 @@ void psx_dma_do_gpu_request(psx_dma_t *dma)
     {
         for (int32_t i = 0; i < size; i++)
         {
-            uint32_t data = psx_bus_read32(dma->bus, dma->gpu.madr);
+            uint32_t data = psx_bus_fast_read32(dma->bus, dma->gpu.madr);
 
-            psx_bus_write32(dma->bus, 0x1f801810, data);
+            psx_gpu_write32(dma->bus->gpu, 0, data);
 
             dma->gpu.madr += CHCR_STEP(gpu) ? -4 : 4;
         }
@@ -357,9 +436,9 @@ void psx_dma_do_gpu_request(psx_dma_t *dma)
     {
         for (int32_t i = 0; i < size; i++)
         {
-            uint32_t data = psx_bus_read32(dma->bus, 0x1f801810);
+            uint32_t data = psx_gpu_read32(dma->bus->gpu, 0);
 
-            psx_bus_write32(dma->bus, dma->gpu.madr, data);
+            psx_bus_fast_write32(dma->bus, dma->gpu.madr, data);
 
             dma->gpu.madr += CHCR_STEP(gpu) ? -4 : 4;
         }
@@ -382,7 +461,7 @@ psx_dma_do_fn_t g_psx_dma_gpu_table[] = {
 
 #define TEST_SET_IRQ_FLAG()
 
-void psx_dma_do_gpu(psx_dma_t *dma)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_gpu(psx_dma_t *dma)
 {
     if (!CHCR_BUSY(gpu))
         return;
@@ -402,7 +481,7 @@ void psx_dma_do_gpu(psx_dma_t *dma)
     dma->gpu.bcr = 0;
 }
 
-void psx_dma_do_cdrom(psx_dma_t *dma)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_cdrom(psx_dma_t *dma)
 {
     if (!CHCR_BUSY(cdrom))
         return;
@@ -435,12 +514,12 @@ void psx_dma_do_cdrom(psx_dma_t *dma)
         {
             uint32_t data = 0;
 
-            data |= psx_bus_read8(dma->bus, 0x1f801802) << 0;
-            data |= psx_bus_read8(dma->bus, 0x1f801802) << 8;
-            data |= psx_bus_read8(dma->bus, 0x1f801802) << 16;
-            data |= psx_bus_read8(dma->bus, 0x1f801802) << 24;
+            data |= psx_cdrom_read8(dma->bus->cdrom, 2) << 0;
+            data |= psx_cdrom_read8(dma->bus->cdrom, 2) << 8;
+            data |= psx_cdrom_read8(dma->bus->cdrom, 2) << 16;
+            data |= psx_cdrom_read8(dma->bus->cdrom, 2) << 24;
 
-            psx_bus_write32(dma->bus, dma->cdrom.madr, data);
+            psx_bus_fast_write32(dma->bus, dma->cdrom.madr, data);
 
             dma->cdrom.madr += CHCR_STEP(cdrom) ? -4 : 4;
         }
@@ -455,7 +534,7 @@ void psx_dma_do_cdrom(psx_dma_t *dma)
     dma->cdrom.bcr = 0;
 }
 
-void psx_dma_do_spu(psx_dma_t *dma)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_spu(psx_dma_t *dma)
 {
     if (!CHCR_BUSY(spu))
         return;
@@ -495,10 +574,10 @@ void psx_dma_do_spu(psx_dma_t *dma)
         {
             for (int32_t i = 0; i < size; i++)
             {
-                uint32_t data = psx_bus_read32(dma->bus, dma->spu.madr);
+                uint32_t data = psx_bus_fast_read32(dma->bus, dma->spu.madr);
 
-                psx_bus_write16(dma->bus, 0x1f801da8, data & 0xffff);
-                psx_bus_write16(dma->bus, 0x1f801da8, data >> 16);
+                psx_spu_write16(dma->bus->spu, 0x1a8, data & 0xffff);
+                psx_spu_write16(dma->bus->spu, 0x1a8, data >> 16);
 
                 dma->spu.madr += CHCR_STEP(spu) ? -4 : 4;
             }
@@ -512,10 +591,10 @@ void psx_dma_do_spu(psx_dma_t *dma)
             {
                 uint32_t data;
 
-                data = psx_bus_read16(dma->bus, 0x1f801da8);
-                data |= psx_bus_read16(dma->bus, 0x1f801da8) << 16;
+                data = psx_spu_read16(dma->bus->spu, 0x1a8);
+                data |= psx_spu_read16(dma->bus->spu, 0x1a8) << 16;
 
-                psx_bus_write32(dma->bus, dma->spu.madr, data);
+                psx_bus_fast_write32(dma->bus, dma->spu.madr, data);
 
                 dma->spu.madr += CHCR_STEP(spu) ? -4 : 4;
             }
@@ -532,7 +611,7 @@ void psx_dma_do_pio(psx_dma_t *dma)
     log_fatal("PIO DMA channel unimplemented");
 }
 
-void psx_dma_do_otc(psx_dma_t *dma)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_otc(psx_dma_t *dma)
 {
     if ((!(dma->dpcr & DPCR_DMA6EN)) || (!CHCR_TRIG(otc)) || (!CHCR_BUSY(otc)))
         return;
@@ -554,7 +633,7 @@ void psx_dma_do_otc(psx_dma_t *dma)
     {
         uint32_t addr = (i != 1) ? (dma->otc.madr - 4) : 0xffffff;
 
-        psx_bus_write32(dma->bus, dma->otc.madr, addr & 0xffffff);
+        psx_bus_fast_write32(dma->bus, dma->otc.madr, addr & 0xffffff);
 
         dma->otc.madr -= 4;
     }
@@ -567,42 +646,16 @@ void psx_dma_do_otc(psx_dma_t *dma)
     dma->otc.bcr = 0;
 }
 
-void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_dma_update(psx_dma_t *dma, int32_t cyc)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_update(psx_dma_t *dma, int32_t cyc)
 {
-    if (dma->cdrom_irq_delay)
-    {
-        dma->cdrom_irq_delay = 0;
+    /* Early out for the overwhelmingly common case: no channel is waiting to
+       raise its completion flag and the interrupt line state cannot change. */
+    if (((dma->cdrom_irq_delay | dma->spu_irq_delay | dma->gpu_irq_delay |
+          dma->otc_irq_delay | dma->mdec_in_irq_delay | dma->mdec_out_irq_delay) == 0) &&
+        ((dma->dicr & (DICR_FLAGS | DICR_FORCE | DICR_IRQSI)) == 0))
+        return;
 
-        if ((dma->dicr & DICR_DMA3EN) && !dma->cdrom_irq_delay)
-            dma->dicr |= DICR_DMA3FL;
-    }
-
-    if (dma->spu_irq_delay)
-    {
-        dma->spu_irq_delay = 0;
-
-        if (dma->spu_irq_delay <= 0)
-            if (dma->dicr & DICR_DMA4EN)
-                dma->dicr |= DICR_DMA4FL;
-    }
-
-    if (dma->gpu_irq_delay)
-    {
-        dma->gpu_irq_delay = 0;
-
-        if (!dma->gpu_irq_delay)
-            if (dma->dicr & DICR_DMA2EN)
-                dma->dicr |= DICR_DMA2FL;
-    }
-
-    if (dma->otc_irq_delay)
-    {
-        dma->otc_irq_delay = 0;
-
-        if (!dma->otc_irq_delay)
-            if (dma->dicr & DICR_DMA6EN)
-                dma->dicr |= DICR_DMA6FL;
-    }
+    dma_latch_irq_flags(dma);
 
     if (dma->mdec_in_irq_delay)
     {
@@ -622,18 +675,7 @@ void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_dma_update(psx_dma_t *dm
                 dma->dicr |= DICR_DMA1FL;
     }
 
-    int32_t prev_irq_signal = (dma->dicr & DICR_IRQSI) != 0;
-    int32_t irq_on_flags = (dma->dicr & DICR_IRQEN) != 0;
-    int32_t force_irq = (dma->dicr & DICR_FORCE) != 0;
-    int32_t irq = (dma->dicr & DICR_FLAGS) != 0;
-
-    int32_t irq_signal = force_irq || ((irq & irq_on_flags) != 0);
-
-    if (irq_signal && !prev_irq_signal)
-        psx_ic_irq(dma->ic, IC_DMA);
-
-    dma->dicr &= ~DICR_IRQSI;
-    dma->dicr |= irq_signal << 31;
+    dma_update_irq_signal(dma);
 }
 
 void psx_dma_destroy(psx_dma_t *dma)

@@ -97,9 +97,21 @@ typedef struct
   int32_t hblank, prev_hblank;
   int32_t vblank, prev_vblank;
 
+  /* Cycles accumulated but not yet applied to the counters, plus the number of
+     cycles after which something can actually happen (target or wrap
+     crossing). Keeps the periodic update at one add and one compare while the
+     events still land on their exact cycle. */
+  int32_t pending_cycles;
+  int32_t deadline_cycles;
+
   struct
   {
-    float counter;
+    /* Integer counter plus a 16.16 fractional accumulator for the fractional
+       clock sources (dot clock, system clock / 8). Float counters cost ~10
+       cycles per compare on this core and this runs three times per device
+       update round. */
+    uint32_t counter;
+    uint32_t counter_frac;
     uint32_t target;
     int32_t sync_enable;
     int32_t sync_mode;
@@ -129,6 +141,7 @@ void psx_timer_write32(psx_timer_t *, uint32_t, uint32_t);
 void psx_timer_write16(psx_timer_t *, uint32_t, uint16_t);
 void psx_timer_write8(psx_timer_t *, uint32_t, uint8_t);
 void psx_timer_update(psx_timer_t *, int32_t);
+void psx_timer_flush(psx_timer_t *);
 void psx_timer_destroy(psx_timer_t *);
 
 // GPU event handlers

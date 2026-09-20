@@ -1,4 +1,5 @@
 #include "psx.h"
+#include "prof.h"
 #include <stdlib.h>
 #include <stdint.h>
 #include "fsl_debug_console.h"
@@ -51,32 +52,169 @@ uint32_t frame_count = 0;
 
 // #define PSX_DEBUG_PERFORMANCE
 
+#if PSX_PROFILE
+psx_prof_t g_prof;
+
+psx_io_trace_t __attribute__((section(".bss.$SRAM_DTC"))) g_io_trace[PSX_IO_TRACE_SIZE];
+volatile uint32_t g_io_trace_idx = 0;
+volatile int32_t g_io_trace_on = 0;
+
+void psx_prof_init(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    memset(&g_prof, 0, sizeof(g_prof));
+    g_prof.t_start = DWT->CYCCNT;
+}
+
+void psx_prof_tick(void)
+{
+    uint32_t now = DWT->CYCCNT;
+    uint32_t elapsed = now - g_prof.t_start;
+
+    if (elapsed < SystemCoreClock)
+        return;
+
+    uint32_t other = elapsed - g_prof.cpu - g_prof.dev;
+
+    PRINTF("PROF inst=%u ecyc=%u | cpu=%u gp0=%u dma=%u | dev=%u (cd=%u gpu=%u pad=%u tmr=%u dma=%u) blit=%u bwait=%u | other=%u | frames=%u gp0cmds=%u px=%u (f=%u s=%u t4=%u t8=%u t15=%u r=%u fast=%u tr=%u raw=%u) | elapsed=%u\r\n",
+           g_prof.instr, g_prof.ecycles,
+           g_prof.cpu, g_prof.gp0, g_prof.dmax,
+           g_prof.dev, g_prof.d_cdrom, g_prof.d_gpu, g_prof.d_pad, g_prof.d_timer, g_prof.d_dma,
+           g_prof.blit, g_prof.bwait,
+           other, g_prof.frames, g_prof.gp0cmds, g_prof.pixels,
+           g_prof.px_flat, g_prof.px_shade, g_prof.px_t4, g_prof.px_t8, g_prof.px_t15, g_prof.px_rect,
+           g_prof.px_fast, g_prof.px_transp, g_prof.px_raw,
+           elapsed);
+
+    /* State snapshot: makes it obvious when the emulated machine is stuck
+       spinning somewhere instead of making progress. */
+    {
+        psx_t *p = &g_psx_instance;
+
+        PRINTF("STATE pc=%08x sr=%08x cause=%08x | ic stat=%04x mask=%04x | gpustat=%08x line=%d dirty=%d | cdrom st=%d dly=%d ifr=%02x ier=%02x | dicr=%08x dpcr=%08x\r\n",
+               (unsigned)p->cpu->pc, (unsigned)p->cpu->cop0_r[COP0_SR], (unsigned)p->cpu->cop0_r[COP0_CAUSE],
+               (unsigned)p->ic->stat, (unsigned)p->ic->mask,
+               (unsigned)p->gpu->gpustat, (int)p->gpu->line, (int)p->gpu->vram_dirty,
+               (int)p->cdrom->state, (int)p->cdrom->delay, (unsigned)p->cdrom->ifr, (unsigned)p->cdrom->ier,
+               (unsigned)p->dma->dicr, (unsigned)p->dma->dpcr);
+
+        PRINTF("TIMERS t0=%d/%u clk=%d pause=%d sync=%d/%d | t1=%d/%u clk=%d pause=%d sync=%d/%d irq=%d/%d | t2=%d/%u clk=%d pause=%d | hbl=%d vbl=%d\r\n",
+               (int)p->timer->timer[0].counter, (unsigned)p->timer->timer[0].target,
+               (int)p->timer->timer[0].clk_source, (int)p->timer->timer[0].paused,
+               (int)p->timer->timer[0].sync_enable, (int)p->timer->timer[0].sync_mode,
+               (int)p->timer->timer[1].counter, (unsigned)p->timer->timer[1].target,
+               (int)p->timer->timer[1].clk_source, (int)p->timer->timer[1].paused,
+               (int)p->timer->timer[1].sync_enable, (int)p->timer->timer[1].sync_mode,
+               (int)p->timer->timer[1].irq_target, (int)p->timer->timer[1].irq_max,
+               (int)p->timer->timer[2].counter, (unsigned)p->timer->timer[2].target,
+               (int)p->timer->timer[2].clk_source, (int)p->timer->timer[2].paused,
+               (int)p->timer->hblank, (int)p->timer->vblank);
+    }
+
+    /* Stuck detection: arm an I/O trace after a few seconds without any
+       rendering, dump it on the next tick. */
+    {
+        static uint32_t idle_seconds = 0;
+
+        if ((g_prof.frames == 0) && (g_prof.gp0cmds == 0))
+            idle_seconds++;
+        else
+            idle_seconds = 0;
+
+        if (idle_seconds == 3)
+        {
+            g_io_trace_idx = 0;
+            g_io_trace_on = 1;
+        }
+        else if (idle_seconds == 4)
+        {
+            g_io_trace_on = 0;
+
+            PRINTF("IOTRACE %u entries:\r\n", (unsigned)g_io_trace_idx);
+
+            for (uint32_t i = 0; i < g_io_trace_idx; i++)
+            {
+                PRINTF("  %c%u %08x %08x\r\n",
+                       g_io_trace[i].write ? 'W' : 'R',
+                       (unsigned)g_io_trace[i].size,
+                       (unsigned)g_io_trace[i].addr,
+                       (unsigned)g_io_trace[i].value);
+            }
+
+            idle_seconds = 0;
+        }
+    }
+
+    memset(&g_prof, 0, sizeof(g_prof));
+    g_prof.t_start = DWT->CYCCNT;
+}
+#endif
+
+/* Emulated CPU cycles executed between two device update rounds.
+   The devices only need ~scanline resolution; updating them after every
+   single instruction cost more than the interpreter itself.
+   Must stay well below the GPU hblank window (~54 CPU cycles) so no
+   hblank/vblank edge can be stepped over. */
+#define PSX_DEV_SLICE_CYCLES 8
+#define PSX_DEV_SLICE_MAX_STEPS 8
+
 void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_update(psx_t *psx)
 {
-    // Remove debug overhead for better performance
-    psx_cpu_cycle(psx->cpu);
+    psx_cpu_t *const cpu = psx->cpu;
+    uint32_t acc = 0;
+    uint32_t steps = 0;
 
-    psx_cdrom_update(psx->cdrom, psx->cpu->last_cycles);
-    psx_gpu_update(psx->gpu, psx->cpu->last_cycles);
-    psx_pad_update(psx->pad, psx->cpu->last_cycles);
-    psx_timer_update(psx->timer, psx->cpu->last_cycles);
-    psx_dma_update(psx->dma, psx->cpu->last_cycles);
+    PROF_T0(t_cpu);
 
-#ifdef PSX_DEBUG_PERFORMANCE
-    // Only include debug code when specifically needed
-    uint32_t sm = DWT->CYCCNT;
-    g_cycles_wm += sm;
-    loop_cnt++;
-
-    if (xTaskGetTickCount() - last_update_time > 1000)
+    do
     {
-        last_update_time = xTaskGetTickCount();
-        PRINTF("Cycles per update: %d\r\n", g_cycles_wm);
-        PRINTF("Loop cnt: %d\r\n", loop_cnt);
-        g_cycles_wm = 0;
-        loop_cnt = 0;
+        psx_cpu_cycle(cpu);
+
+        acc += cpu->last_cycles;
+        steps++;
     }
+    while ((acc < PSX_DEV_SLICE_CYCLES) && (steps < PSX_DEV_SLICE_MAX_STEPS));
+
+    PROF_ADD(cpu, t_cpu);
+
+#if PSX_PROFILE
+    g_prof.instr += steps;
+    g_prof.ecycles += acc;
 #endif
+
+    PROF_T0(t_dev);
+
+    /* Guards for the devices that are idle most of the time: skipping the call
+       (and its prologue) is much cheaper than entering it just to return. */
+    PROF_T0(t_d1);
+    if ((psx->cdrom->delay > 0) || (psx->cdrom->state != CD_STATE_IDLE))
+        psx_cdrom_update(psx->cdrom, acc);
+    PROF_ADD(d_cdrom, t_d1);
+
+    PROF_T0(t_d2);
+    psx_gpu_update(psx->gpu, acc);
+    PROF_ADD(d_gpu, t_d2);
+
+    PROF_T0(t_d3);
+    if (psx->pad->cycles_until_irq)
+        psx_pad_update(psx->pad, acc);
+    PROF_ADD(d_pad, t_d3);
+
+    PROF_T0(t_d4);
+    psx_timer_update(psx->timer, acc);
+    PROF_ADD(d_timer, t_d4);
+
+    PROF_T0(t_d5);
+    /* DMA delays are counted in update rounds, not in cycles */
+    psx_dma_update(psx->dma, steps);
+    PROF_ADD(d_dma, t_d5);
+
+    PROF_ADD(dev, t_dev);
+
+    psx_prof_tick();
 }
 
 void *psx_get_display_buffer(psx_t *psx)

@@ -10,7 +10,9 @@
 
 // Static buffer for EXP1 instance
 static psx_exp1_t g_exp1_instance;
-static uint8_t __attribute__((section(".ramfunc.$BOARD_SDRAM"))) g_exp1_rom_buffer[PSX_EXP1_SIZE];
+/* Zero initialised: keeping this in .bss instead of .data saves 512 KB of
+   flash image and the startup copy that came with it. */
+static uint8_t __attribute__((section(".bss.$BOARD_SDRAM"))) g_exp1_rom_buffer[PSX_EXP1_SIZE];
 static int32_t g_exp1_instance_used = 0;
 
 psx_exp1_t *psx_exp1_create(void)

@@ -64,7 +64,7 @@ typedef void (*psx_cpu_kcall_hook_t)(psx_cpu_t *);
   -          hi,lo    Multiply/divide results, may be changed by subroutines
 */
 
-typedef struct __attribute__((__packed__))
+typedef struct
 {
     union
     {
@@ -75,7 +75,7 @@ typedef struct __attribute__((__packed__))
     int16_t z;
 } gte_vertex_t;
 
-typedef struct __attribute__((__packed__))
+typedef struct
 {
     union
     {
@@ -84,12 +84,12 @@ typedef struct __attribute__((__packed__))
     };
 } gte_vec2_t;
 
-typedef struct __attribute__((__packed__))
+typedef struct
 {
     int32_t x, y, z;
 } gte_vec3_t;
 
-typedef struct __attribute__((__packed__))
+typedef struct
 {
     union
     {
@@ -98,7 +98,7 @@ typedef struct __attribute__((__packed__))
     };
 } gte_color_t;
 
-typedef struct __attribute__((__packed__))
+typedef struct
 {
     union
     {
@@ -109,7 +109,7 @@ typedef struct __attribute__((__packed__))
     int16_t m33;
 } gte_matrix_t;
 
-struct __attribute__((__packed__)) psx_cpu_t
+struct psx_cpu_t
 {
     uint32_t r[32];
     uint32_t opcode;
@@ -166,17 +166,6 @@ struct __attribute__((__packed__)) psx_cpu_t
     psx_cpu_kcall_hook_t a_function_hook;
     psx_cpu_kcall_hook_t b_function_hook;
 
-    // Instruction cache for performance optimization
-    struct
-    {
-        uint32_t pc;
-        uint32_t opcode;
-        void (*func)(psx_cpu_t *);
-        int32_t cycles;
-    } instruction_cache[1024]; // Cache for 1024 instructions
-
-    int32_t cache_hits;
-    int32_t cache_misses;
 };
 
 /*
@@ -253,12 +242,7 @@ void psx_cpu_destroy(psx_cpu_t *);
 void psx_cpu_force_reset_singleton(void); // For testing only
 void psx_cpu_cycle(psx_cpu_t *);
 void psx_cpu_set_irq_pending(psx_cpu_t *);
-void psx_cpu_print_profiling(void);
 
-// Instruction cache functions
-void psx_cpu_cache_instruction(psx_cpu_t *cpu, uint32_t pc, uint32_t opcode, void (*func)(psx_cpu_t *), int32_t cycles);
-int32_t psx_cpu_execute_cached(psx_cpu_t *cpu);
-void psx_cpu_clear_cache(psx_cpu_t *cpu);
 void psx_cpu_load_state(psx_cpu_t *, FIL *);
 void psx_cpu_save_state(psx_cpu_t *, FIL *);
 void psx_cpu_fetch(psx_cpu_t *);

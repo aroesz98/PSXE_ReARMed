@@ -6,7 +6,7 @@
 #include "../log.h"
 
 // Static buffer for MC2 instance
-static psx_mc2_t g_mc2_instance;
+static psx_mc2_t __attribute__((section(".bss.$SRAM_DTC"), aligned(4))) g_mc2_instance;
 static int32_t g_mc2_instance_used = 0;
 
 psx_mc2_t *psx_mc2_create(void)

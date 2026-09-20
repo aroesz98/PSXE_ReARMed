@@ -81,9 +81,11 @@ static const int16_t g_spu_gauss_table[] = {
     0x593A, 0x5949, 0x5958, 0x5965, 0x5971, 0x597C, 0x5986, 0x598F,
     0x5997, 0x599E, 0x59A4, 0x59A9, 0x59AD, 0x59B0, 0x59B2, 0x59B3};
 
+static psx_spu_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) g_spu_instance;
+
 psx_spu_t *psx_spu_create(void)
 {
-    return (psx_spu_t *)malloc(sizeof(psx_spu_t));
+    return &g_spu_instance;
 }
 
 void psx_spu_init(psx_spu_t *spu, psx_ic_t *ic)

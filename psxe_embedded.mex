@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding= "UTF-8" ?>
-<configuration name="MIMXRT1052xxxxB" xsi:schemaLocation="http://mcuxpresso.nxp.com/XSD/mex_configuration_17 http://mcuxpresso.nxp.com/XSD/mex_configuration_17.xsd" uuid="dfdccc4e-4c50-42dd-b87e-04b5d3b4afa8" version="17" xmlns="http://mcuxpresso.nxp.com/XSD/mex_configuration_17" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<configuration name="MIMXRT1052xxxxB" xsi:schemaLocation="http://mcuxpresso.nxp.com/XSD/mex_configuration_18 http://mcuxpresso.nxp.com/XSD/mex_configuration_18.xsd" uuid="dfdccc4e-4c50-42dd-b87e-04b5d3b4afa8" version="18" xmlns="http://mcuxpresso.nxp.com/XSD/mex_configuration_18" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
    <common>
       <processor>MIMXRT1052xxxxB</processor>
       <package>MIMXRT1052DVL6B</package>
@@ -14,12 +14,13 @@
       <validate_boot_init_only>true</validate_boot_init_only>
       <generate_code_modified_registers_only>false</generate_code_modified_registers_only>
       <update_include_paths>true</update_include_paths>
+      <enable_parallel_routing>true</enable_parallel_routing>
       <generate_registers_defines>false</generate_registers_defines>
    </preferences>
    <tools>
       <pins name="Pins" version="17.0" enabled="true" update_project_code="true">
          <pins_profile>
-            <processor_version>24.12.10</processor_version>
+            <processor_version>25.06.10</processor_version>
             <pin_labels>
                <pin_label pin_num="M11" pin_signal="GPIO_AD_B0_02" label="USB_OTG1_PWR/J24[2]/LCD_RST" identifier="LCD_RST"/>
             </pin_labels>
@@ -494,9 +495,9 @@
             </function>
          </functions_list>
       </pins>
-      <clocks name="Clocks" version="15.0" enabled="true" update_project_code="true">
+      <clocks name="Clocks" version="17.0" enabled="true" update_project_code="true">
          <clocks_profile>
-            <processor_version>24.12.10</processor_version>
+            <processor_version>25.06.10</processor_version>
          </clocks_profile>
          <clock_configurations>
             <clock_configuration name="BOARD_BootClockRUN" id_prefix="" prefix_user_defined="false">
@@ -768,7 +769,7 @@
       </clocks>
       <dcdx name="DCDx" version="4.0" enabled="true" update_project_code="true">
          <dcdx_profile>
-            <processor_version>24.12.10</processor_version>
+            <processor_version>25.06.10</processor_version>
             <output_format>c_array</output_format>
          </dcdx_profile>
          <dcdx_configurations>

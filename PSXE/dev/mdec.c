@@ -13,7 +13,7 @@
 #define MDEC_MAX_INPUT_SIZE (64 * 1024)         // 64KB max input buffer (should be enough)
 
 static uint8_t __attribute__((section(".bss.$BOARD_SDRAM"))) g_mdec_output_buffer[MDEC_MAX_OUTPUT_SIZE];
-static uint32_t __attribute__((section(".bss.$SRAM_DTC"))) g_mdec_input_buffer[MDEC_MAX_INPUT_SIZE / sizeof(uint32_t)];
+static uint32_t __attribute__((section(".bss.$SRAM_OC"))) g_mdec_input_buffer[MDEC_MAX_INPUT_SIZE / sizeof(uint32_t)];
 static psx_mdec_t g_mdec_instance;
 static int32_t g_mdec_instance_in_use = 0;
 

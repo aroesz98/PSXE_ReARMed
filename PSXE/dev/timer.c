@@ -52,6 +52,9 @@
 #define T2_BLANK_ONCE timer->timer[2].blank_once
 #define T2_DIV_COUNTER timer->timer[2].div_counter
 
+/* 16.16 fixed point increments of the fractional clock sources */
+#define TIMER_FRAC_ONE 65536u
+
 uint16_t timer_get_mode(psx_timer_t *timer, int32_t index)
 {
     uint16_t value = (timer->timer[index].sync_enable << 0) |
@@ -89,6 +92,7 @@ void timer_set_mode(psx_timer_t *timer, int32_t index, uint16_t value)
     timer->timer[index].irq = 1;
     timer->timer[index].irq_fired = 0;
     timer->timer[index].counter = 0;
+    timer->timer[index].counter_frac = 0;
     timer->timer[index].div_counter = 0;
     timer->timer[index].blank_once = 0;
     timer->timer[index].paused = 0;
@@ -130,7 +134,7 @@ const char *g_psx_timer_reg_names[] = {
     "target", 0, 0, 0};
 
 // Static buffer for timer instance
-static psx_timer_t g_timer_instance;
+static psx_timer_t __attribute__((section(".bss.$SRAM_DTC"), aligned(4))) g_timer_instance;
 static int32_t g_timer_instance_used = 0;
 
 psx_timer_t *psx_timer_create(void)
@@ -156,6 +160,8 @@ void psx_timer_init(psx_timer_t *timer, psx_ic_t *ic, psx_gpu_t *gpu)
 
 uint32_t psx_timer_read32(psx_timer_t *timer, uint32_t offset)
 {
+    psx_timer_flush(timer);
+
     int32_t index = offset >> 4;
     int32_t reg = offset & 0xf;
 
@@ -176,6 +182,8 @@ uint32_t psx_timer_read32(psx_timer_t *timer, uint32_t offset)
 
 uint16_t psx_timer_read16(psx_timer_t *timer, uint32_t offset)
 {
+    psx_timer_flush(timer);
+
     int32_t index = offset >> 4;
     int32_t reg = offset & 0xf;
 
@@ -201,10 +209,12 @@ uint8_t psx_timer_read8(psx_timer_t *timer, uint32_t offset)
     return 0x0;
 }
 
-void timer_handle_irq(psx_timer_t *timer, int32_t i);
+static inline void timer_handle_irq_inl(psx_timer_t *timer, int32_t i);
 
 void psx_timer_write32(psx_timer_t *timer, uint32_t offset, uint32_t value)
 {
+    psx_timer_flush(timer);
+
     int32_t index = offset >> 4;
     int32_t reg = offset & 0xf;
 
@@ -221,11 +231,13 @@ void psx_timer_write32(psx_timer_t *timer, uint32_t offset, uint32_t value)
         break;
     }
 
-    timer_handle_irq(timer, index);
+    timer_handle_irq_inl(timer, index);
 }
 
 void psx_timer_write16(psx_timer_t *timer, uint32_t offset, uint16_t value)
 {
+    psx_timer_flush(timer);
+
     int32_t index = offset >> 4;
     int32_t reg = offset & 0xf;
 
@@ -242,7 +254,7 @@ void psx_timer_write16(psx_timer_t *timer, uint32_t offset, uint16_t value)
         break;
     }
 
-    timer_handle_irq(timer, index);
+    timer_handle_irq_inl(timer, index);
 }
 
 void psx_timer_write8(psx_timer_t *timer, uint32_t offset, uint8_t value)
@@ -250,12 +262,38 @@ void psx_timer_write8(psx_timer_t *timer, uint32_t offset, uint8_t value)
     PRINTF("Unhandled 8-bit TIMER write at offset %08lx (%02x)\r\n", offset, value);
 }
 
-void timer_handle_irq(psx_timer_t *timer, int32_t i)
+static inline void timer_handle_irq_inl(psx_timer_t *timer, int32_t i)
 {
     int32_t irq = 0;
 
     int32_t target_reached = timer->timer[i].counter > timer->timer[i].target;
-    int32_t max_reached = timer->timer[i].counter > 65535.0f;
+    int32_t max_reached = timer->timer[i].counter > 65535u;
+
+    /* Nothing reached yet: this is by far the most common case and it must be
+       cheap, this runs for three timers on every device update round. */
+    if (!target_reached && !max_reached)
+        return;
+
+    /* No interrupt configured: only the status flags (and the optional target
+       reset) can be affected, so skip the whole interrupt state machine. */
+    if (!timer->timer[i].irq_target && !timer->timer[i].irq_max)
+    {
+        if (target_reached)
+        {
+            timer->timer[i].target_reached = 1;
+
+            if (timer->timer[i].reset_target)
+                timer->timer[i].counter = 0;
+        }
+
+        if (max_reached)
+        {
+            timer->timer[i].counter = 0;
+            timer->timer[i].max_reached = 1;
+        }
+
+        return;
+    }
 
     if (target_reached)
     {
@@ -314,7 +352,7 @@ void timer_handle_irq(psx_timer_t *timer, int32_t i)
     }
 }
 
-float timer_get_dotclock_div(psx_timer_t *timer)
+static inline float timer_get_dotclock_div(psx_timer_t *timer)
 {
     static const float dmode_dotclk_div_table[] = {
         10.0f, 8.0f, 5.0f, 4.0f};
@@ -329,25 +367,29 @@ float timer_get_dotclock_div(psx_timer_t *timer)
     }
 }
 
-void timer_update_timer0(psx_timer_t *timer, int32_t cyc)
+static inline void timer_update_timer0(psx_timer_t *timer, int32_t cyc)
 {
     if (T0_PAUSED)
         return;
 
     if (T0_CLKSRC & 1)
     {
-        // Dotclock test
-        T0_COUNTER += (float)cyc * timer_get_dotclock_div(timer);
+        /* Dot clock: accumulate the fractional part in 16.16 */
+        uint32_t frac = timer->timer[0].counter_frac +
+                        (uint32_t)((float)cyc * timer_get_dotclock_div(timer) * (float)TIMER_FRAC_ONE);
+
+        T0_COUNTER += frac >> 16;
+        timer->timer[0].counter_frac = frac & 0xffffu;
     }
     else
     {
-        T0_COUNTER += (float)cyc;
+        T0_COUNTER += (uint32_t)cyc;
     }
 
-    timer_handle_irq(timer, 0);
+    timer_handle_irq_inl(timer, 0);
 }
 
-void timer_update_timer1(psx_timer_t *timer, int32_t cyc)
+static inline void timer_update_timer1(psx_timer_t *timer, int32_t cyc)
 {
     if (T1_PAUSED)
         return;
@@ -358,37 +400,96 @@ void timer_update_timer1(psx_timer_t *timer, int32_t cyc)
     }
     else
     {
-        T1_COUNTER += (float)cyc;
+        T1_COUNTER += (uint32_t)cyc;
     }
 
-    timer_handle_irq(timer, 1);
+    timer_handle_irq_inl(timer, 1);
 }
 
-void timer_update_timer2(psx_timer_t *timer, int32_t cyc)
+static inline void timer_update_timer2(psx_timer_t *timer, int32_t cyc)
 {
     if (T2_PAUSED)
         return;
 
     if (T2_CLKSRC <= 1)
     {
-        T2_COUNTER += (float)cyc;
+        T2_COUNTER += (uint32_t)cyc;
     }
     else
     {
-        T2_COUNTER += ((float)cyc) / 8.0f;
+        /* System clock / 8 with the remainder kept in 16.16 */
+        uint32_t frac = timer->timer[2].counter_frac + ((uint32_t)cyc << 13);
+
+        T2_COUNTER += frac >> 16;
+        timer->timer[2].counter_frac = frac & 0xffffu;
     }
 
-    timer_handle_irq(timer, 2);
+    timer_handle_irq_inl(timer, 2);
 }
 
-void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_timer_update(psx_timer_t *timer, int32_t cyc)
+/* Lower bound (in CPU cycles) on when the next counter event can happen. Every
+   clock source ticks at most once per CPU cycle, so counting in counter units
+   is always conservative. */
+static void timer_recompute_deadline(psx_timer_t *timer)
 {
-    timer->prev_hblank = timer->hblank;
-    timer->prev_vblank = timer->vblank;
+    int32_t best = 0x40000000;
 
-    timer_update_timer0(timer, 2);
-    timer_update_timer1(timer, 2);
-    timer_update_timer2(timer, 2);
+    for (int32_t i = 0; i < 3; i++)
+    {
+        if (timer->timer[i].paused)
+            continue;
+
+        /* Timer 1 driven by hblank does not advance with CPU cycles */
+        if ((i == 1) && (timer->timer[i].clk_source & 1))
+            continue;
+
+        uint32_t limit = 65536u;
+
+        if (timer->timer[i].irq_target || timer->timer[i].reset_target ||
+            !timer->timer[i].target_reached)
+        {
+            uint32_t target = timer->timer[i].target;
+
+            if ((target + 1u) < limit)
+                limit = target + 1u;
+        }
+
+        int32_t remaining = (timer->timer[i].counter < limit)
+                                ? (int32_t)(limit - timer->timer[i].counter)
+                                : 1;
+
+        if (remaining < best)
+            best = remaining;
+    }
+
+    timer->deadline_cycles = best;
+}
+
+/* Applies the cycles accumulated since the last flush */
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_timer_flush(psx_timer_t *timer)
+{
+    int32_t cyc = timer->pending_cycles;
+
+    if (cyc <= 0)
+        return;
+
+    timer->pending_cycles = 0;
+
+    timer_update_timer0(timer, cyc);
+    timer_update_timer1(timer, cyc);
+    timer_update_timer2(timer, cyc);
+
+    timer_recompute_deadline(timer);
+}
+
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_timer_update(psx_timer_t *timer, int32_t cyc)
+{
+    timer->pending_cycles += cyc;
+
+    if (timer->pending_cycles < timer->deadline_cycles)
+        return;
+
+    psx_timer_flush(timer);
 }
 
 void psxe_gpu_hblank_event_cb(psx_gpu_t *gpu)
@@ -401,7 +502,7 @@ void psxe_gpu_hblank_event_cb(psx_gpu_t *gpu)
     {
         ++T1_COUNTER;
 
-        timer_handle_irq(timer, 1);
+        timer_handle_irq_inl(timer, 1);
     }
 
     if (!T0_SYNC_EN)

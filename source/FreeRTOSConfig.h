@@ -40,7 +40,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #define configUSE_PREEMPTION 1
 #define configUSE_TICKLESS_IDLE 0
-#define configCPU_CLOCK_HZ (SystemCoreClock)
+#define configCPU_CLOCK_HZ (SystemCoreClock) /* Fetched from board/clock_config.h */
 #define configTICK_RATE_HZ ((TickType_t)1000)
 #define configMAX_PRIORITIES 6
 #define configMINIMAL_STACK_SIZE ((unsigned short)180)
@@ -70,7 +70,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define configSUPPORT_STATIC_ALLOCATION 1
 #define configSUPPORT_DYNAMIC_ALLOCATION 1
 #define configTOTAL_HEAP_SIZE ((size_t)(68 * 1024))
-#define configAPPLICATION_ALLOCATED_HEAP 0
+#define configAPPLICATION_ALLOCATED_HEAP 1 /* ucHeap lives in DTCM, see main.c */
 
 /* Hook function related definitions. */
 #define configUSE_IDLE_HOOK 0

@@ -6,7 +6,7 @@
 #include <stdlib.h>
 
 // Static buffer for RAM instance (maximum 2MB PSX RAM)
-static psx_ram_t g_ram_instance;
+static psx_ram_t __attribute__((section(".bss.$SRAM_DTC"), aligned(4))) g_ram_instance;
 static uint8_t __attribute__((section(".bss.$BOARD_SDRAM"))) g_ram_buffer[RAM_SIZE_2MB];
 static int32_t g_ram_instance_used = 0;
 

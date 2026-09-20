@@ -122,10 +122,15 @@ void cdrom_write_vol2(psx_cdrom_t *cdrom, uint8_t data);
 void cdrom_write_vol3(psx_cdrom_t *cdrom, uint8_t data);
 void cdrom_write_vapp(psx_cdrom_t *cdrom, uint8_t data);
 
+/* Polled by every device update round. The struct carries ~115 KB of XA audio
+   resample buffers so it cannot live in DTCM, but OCRAM still has a much lower
+   miss penalty than SDRAM. */
+static psx_cdrom_t __attribute__((section(".bss.$SRAM_OC"), aligned(8))) g_cdrom_instance;
+
 psx_cdrom_t *psx_cdrom_create(void)
 {
     PRINTF("[CDROM] Creating CDROM instance...\r\n");
-    psx_cdrom_t *cdrom = malloc(sizeof(psx_cdrom_t));
+    psx_cdrom_t *cdrom = &g_cdrom_instance;
     if (cdrom)
     {
         PRINTF("[CDROM] CDROM instance created successfully\r\n");
@@ -596,7 +601,7 @@ void cdrom_handle_read(psx_cdrom_t *cdrom)
               cdrom->delay);
 }
 
-void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_cdrom_update(psx_cdrom_t *cdrom, int32_t cycles)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cdrom_update(psx_cdrom_t *cdrom, int32_t cycles)
 {
     if (cdrom->delay > 0)
     {
