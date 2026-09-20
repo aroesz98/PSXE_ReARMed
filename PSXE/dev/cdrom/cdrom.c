@@ -122,10 +122,34 @@ void cdrom_write_vol2(psx_cdrom_t *cdrom, uint8_t data);
 void cdrom_write_vol3(psx_cdrom_t *cdrom, uint8_t data);
 void cdrom_write_vapp(psx_cdrom_t *cdrom, uint8_t data);
 
-/* Polled by every device update round. The struct carries ~115 KB of XA audio
-   resample buffers so it cannot live in DTCM, but OCRAM still has a much lower
-   miss penalty than SDRAM. */
-static psx_cdrom_t __attribute__((section(".bss.$SRAM_OC"), aligned(8))) g_cdrom_instance;
+/* Polled by every device update round: keep the state in DTCM. The audio work
+   buffers it used to embed now live in SDRAM (see below). */
+static psx_cdrom_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) g_cdrom_instance;
+
+#define PSX_SDRAM_BSS __attribute__((section(".bss.$BOARD_SDRAM"), aligned(4)))
+
+static int16_t PSX_SDRAM_BSS s_cdda_buf[CD_SECTOR_SIZE >> 1];
+static uint8_t PSX_SDRAM_BSS s_xa_buf[CD_SECTOR_SIZE];
+static int16_t PSX_SDRAM_BSS s_xa_left_buf[XA_STEREO_SAMPLES];
+static int16_t PSX_SDRAM_BSS s_xa_right_buf[XA_STEREO_SAMPLES];
+static int16_t PSX_SDRAM_BSS s_xa_mono_buf[XA_MONO_SAMPLES];
+static int16_t PSX_SDRAM_BSS s_xa_upsample_buf[XA_UPSAMPLE_SIZE];
+static int16_t PSX_SDRAM_BSS s_xa_left_resample_buf[XA_STEREO_RESAMPLE_MAX_SIZE];
+static int16_t PSX_SDRAM_BSS s_xa_right_resample_buf[XA_STEREO_RESAMPLE_MAX_SIZE];
+static int16_t PSX_SDRAM_BSS s_xa_mono_resample_buf[XA_MONO_RESAMPLE_MAX_SIZE];
+
+static void cdrom_bind_audio_buffers(psx_cdrom_t *cdrom)
+{
+    cdrom->cdda_buf = s_cdda_buf;
+    cdrom->xa_buf = s_xa_buf;
+    cdrom->xa_left_buf = s_xa_left_buf;
+    cdrom->xa_right_buf = s_xa_right_buf;
+    cdrom->xa_mono_buf = s_xa_mono_buf;
+    cdrom->xa_upsample_buf = s_xa_upsample_buf;
+    cdrom->xa_left_resample_buf = s_xa_left_resample_buf;
+    cdrom->xa_right_resample_buf = s_xa_right_resample_buf;
+    cdrom->xa_mono_resample_buf = s_xa_mono_resample_buf;
+}
 
 psx_cdrom_t *psx_cdrom_create(void)
 {
@@ -146,6 +170,9 @@ void psx_cdrom_init(psx_cdrom_t *cdrom, psx_ic_t *ic)
 {
     PRINTF("[CDROM] Initializing CDROM...\r\n");
     memset(cdrom, 0, sizeof(psx_cdrom_t));
+
+    /* the audio work buffers live outside the struct */
+    cdrom_bind_audio_buffers(cdrom);
 
     cdrom->io_base = PSX_CDROM_BEGIN;
     cdrom->io_size = PSX_CDROM_SIZE;

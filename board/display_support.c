@@ -115,10 +115,22 @@ void DEMO_Draw3DCube_AndSwap(int center_x, int center_y, int size, float rotatio
 /*******************************************************************************
  * Variables
  ******************************************************************************/
+/*
+    Triple buffered display.
+
+    With two buffers the drawing side had nowhere to go after handing a frame to
+    the LCDIF: the indices only change when the flip actually happens, at the
+    next panel vblank, so the next frame was drawn into the buffer about to be
+    scanned out. That showed as frames missing their bottom and right part.
+
+    With three, one buffer is on screen, one is waiting for the flip and one is
+    free to draw into, so nothing has to wait and nothing is drawn into a buffer
+    the panel is reading.
+*/
 static volatile bool s_framePending;
-static volatile int s_currentFrontBuffer = 1;  // Currently displayed buffer (0 or 1)
-static volatile int s_currentBackBuffer = 0;   // Currently drawing buffer (0 or 1)
-static volatile bool s_bufferSwapRequested = false;  // Buffer swap pending flag
+static volatile int s_currentFrontBuffer = 1; /* on screen */
+static volatile int s_currentBackBuffer = 0;  /* free for drawing */
+static volatile int s_queuedBuffer = -1;      /* handed over, flips at vblank */
 #if defined(SDK_OS_FREE_RTOS)
 static SemaphoreHandle_t s_frameSema;
 #endif
@@ -127,7 +139,7 @@ static SemaphoreHandle_t s_frameSema;
 /* Framebuffers live in the non-cacheable SDRAM region: they are written by
    PXP and read by eLCDIF (both bus masters), so keeping them out of the
    D-cache removes all cache maintenance from the display path. */
-__attribute__((aligned(64), section(".bss.$NCACHE_REGION"))) static uint8_t s_frameBuffer[2][DEMO_FB_SIZE];
+__attribute__((aligned(64), section(".bss.$NCACHE_REGION"))) static uint8_t s_frameBuffer[3][DEMO_FB_SIZE];
 
 /*******************************************************************************
  * PXP Support - Hardware Acceleration
@@ -248,15 +260,12 @@ void LCDIF_IRQHandler(void)
         if (intStatus & kELCDIF_CurFrameDone)
         {
             s_framePending = false;
-            
-            // Handle buffer swap if requested
-            if (s_bufferSwapRequested)
+
+            /* the queued buffer is the one the panel now scans out */
+            if (s_queuedBuffer >= 0)
             {
-                // Swap buffers
-                int temp = s_currentFrontBuffer;
-                s_currentFrontBuffer = s_currentBackBuffer;
-                s_currentBackBuffer = temp;
-                s_bufferSwapRequested = false;
+                s_currentFrontBuffer = s_queuedBuffer;
+                s_queuedBuffer = -1;
             }
 
 #if defined(SDK_OS_FREE_RTOS)
@@ -368,26 +377,23 @@ void DEMO_InitLcd(void)
 // Double buffer management to prevent tearing - optimized for minimal latency
 void DEMO_SwapBuffers(void)
 {
-    // If previous frame is still pending, skip this frame (drop frame instead of waiting)
-    // This prevents blocking and maintains smooth performance
-    if (s_framePending)
-    {
-        return; // Frame drop - continue rendering next frame
-    }
-    
-    /* Framebuffers are non-cacheable: no cache maintenance needed here */
-    
-    // Set the back buffer as the new display buffer
-    ELCDIF_SetNextBufferAddr(LCDIF, (uint32_t)s_frameBuffer[s_currentBackBuffer]);
-    
-    // Request buffer swap (will happen in interrupt handler when frame is done)
-    s_bufferSwapRequested = true;
-    
-    // Mark frame as pending
+    /* Frame buffers are non-cacheable, so there is no cache maintenance here */
+
+    const int drawn = s_currentBackBuffer;
+    const int stale = s_queuedBuffer;
+
+    ELCDIF_SetNextBufferAddr(LCDIF, (uint32_t)s_frameBuffer[drawn]);
+
+    s_queuedBuffer = drawn;
     s_framePending = true;
-    
-    // Don't wait for completion - return immediately for async rendering
-    // The interrupt handler will complete the buffer swap
+
+    /*
+        Drawing continues in a buffer the panel is not using: a frame that was
+        queued but never shown (this call replaced it) is free again, otherwise
+        the one that is neither on screen nor queued. The three indices are 0, 1
+        and 2, so the spare one is what is left of their sum.
+    */
+    s_currentBackBuffer = (stale >= 0) ? stale : (3 - s_currentFrontBuffer - drawn);
 }
 
 void DEMO_DisplayColorTest(uint16_t background_color)
@@ -1003,6 +1009,17 @@ void DEMO_DrawNumber(int x, int y, int number, uint16_t color) {
 uint8_t* DEMO_GetCurrentFrameBuffer(void)
 {
     return s_frameBuffer[s_currentBackBuffer];
+}
+
+/*
+    True while a swap requested by DEMO_SwapBuffers has not reached the panel
+    yet. The swap is asynchronous and drops frames handed to it while one is
+    still pending, so a caller that renders faster than the panel refreshes has
+    to wait for this - otherwise it draws into the buffer being scanned out.
+*/
+bool DEMO_IsFramePending(void)
+{
+    return s_framePending;
 }
 
 // Get current back buffer index

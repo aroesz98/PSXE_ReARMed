@@ -21,6 +21,19 @@
 
 #define PSX_BUS_FAST static inline __attribute__((always_inline))
 
+/* Recompiler hooks (declared here to avoid pulling the JIT headers into every
+   translation unit that does guest memory accesses). */
+extern uint8_t g_psx_jit_code_pages[];
+void psx_jit_invalidate(uint32_t addr, uint32_t size);
+
+/* Guest RAM write: only pages a block was compiled from need invalidating,
+   which is a single byte test in the common case. */
+PSX_BUS_FAST void psx_bus_fast_note_write(uint32_t phys, uint32_t size)
+{
+    if (g_psx_jit_code_pages[(phys & 0x1fffffu) >> 10])
+        psx_jit_invalidate(phys, size);
+}
+
 #define PSX_RAM_FAST_SIZE 0x200000u
 #define PSX_SPAD_FAST_BASE 0x1f800000u
 #define PSX_SPAD_FAST_SIZE 0x400u
@@ -143,6 +156,8 @@ PSX_BUS_FAST void psx_bus_fast_write32(psx_bus_t *bus, uint32_t addr, uint32_t v
 
         *(uint32_t *)(bus->ram->buf + a) = value;
 
+        psx_bus_fast_note_write(a, 4);
+
         return;
     }
 
@@ -168,6 +183,8 @@ PSX_BUS_FAST void psx_bus_fast_write16(psx_bus_t *bus, uint32_t addr, uint32_t v
 
         *(uint16_t *)(bus->ram->buf + a) = (uint16_t)value;
 
+        psx_bus_fast_note_write(a, 2);
+
         return;
     }
 
@@ -192,6 +209,8 @@ PSX_BUS_FAST void psx_bus_fast_write8(psx_bus_t *bus, uint32_t addr, uint32_t va
         bus->access_cycles = bus->ram->bus_delay;
 
         bus->ram->buf[a] = (uint8_t)value;
+
+        psx_bus_fast_note_write(a, 1);
 
         return;
     }

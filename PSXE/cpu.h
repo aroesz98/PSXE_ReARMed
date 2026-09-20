@@ -241,6 +241,10 @@ void psx_cpu_init(psx_cpu_t *, psx_bus_t *);
 void psx_cpu_destroy(psx_cpu_t *);
 void psx_cpu_force_reset_singleton(void); // For testing only
 void psx_cpu_cycle(psx_cpu_t *);
+
+/* Runs one GTE (COP2) command and returns its cycle count. Used by the
+   recompiler, which cannot call the static inline GTE helpers itself. */
+int32_t psx_cpu_gte_command(psx_cpu_t *cpu, uint32_t opcode);
 void psx_cpu_set_irq_pending(psx_cpu_t *);
 
 void psx_cpu_load_state(psx_cpu_t *, FIL *);

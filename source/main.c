@@ -34,6 +34,8 @@
 #include "psx.h"
 #include "prof.h"
 #include "input/sda.h"
+#include "gamepad.h"
+#include "menu.h"
 #include "input/guncon.h"
 #include "dev/cdrom/cdrom.h"
 #include "dev/timer.h"
@@ -293,6 +295,23 @@ static void psx_emulator_task(void *pvParameters)
     }
     PRINTF("SD card mounted successfully\r\n");
 
+    /* The controller link comes up before anything else: the picker below is
+       driven by it, and the emulated pad is attached to it later. */
+    psxe_gamepad_init();
+
+    /* The panel has to be alive for the picker to draw on it; psxe_screen_init
+       calls this again later, which is harmless. */
+    DEMO_InitLcd();
+
+    {
+        static char chosen_path[192];
+
+        if (psxe_menu_pick(chosen_path, sizeof(chosen_path)))
+            g_psxConfig.cd_path = chosen_path;
+        else
+            PRINTF("menu: no disc images found, keeping %s\r\n", g_psxConfig.cd_path);
+    }
+
     /* Set PSX emulator log level to reduce verbosity */
     log_set_level(g_psxConfig.log_level);
     PRINTF("PSX log level set to: %d (ERROR and FATAL only)\r\n", g_psxConfig.log_level);
@@ -412,6 +431,10 @@ static void psx_emulator_task(void *pvParameters)
         }
 
         psx_pad_attach_joy(g_psx->pad, 0, input);
+
+        /* the link is already up, point it at the emulated controller */
+        psxe_gamepad_bind(g_psx->pad, 0);
+
         PRINTF("Input system initialized\r\n");
     }
 
@@ -471,9 +494,17 @@ static void psx_emulator_task(void *pvParameters)
 
     psx_prof_init();
 
+    uint32_t pad_tick = 0;
+
     while (psxe_screen_is_open(g_screen))
     {
         psx_update(g_psx);
+
+        /* A game reads the pad once per frame and the bridge sends at most a
+           few hundred frames a second, so looking every few hundred device
+           slices is plenty - and costs nothing when nothing has arrived. */
+        if ((++pad_tick & 0x1ffu) == 0u)
+            psxe_gamepad_poll();
     }
 
     /* Cleanup on exit */

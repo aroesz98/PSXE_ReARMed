@@ -1,5 +1,6 @@
 #include "mdec.h"
 #include "log.h"
+#include "../prof.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -13,7 +14,7 @@
 #define MDEC_MAX_INPUT_SIZE (64 * 1024)         // 64KB max input buffer (should be enough)
 
 static uint8_t __attribute__((section(".bss.$BOARD_SDRAM"))) g_mdec_output_buffer[MDEC_MAX_OUTPUT_SIZE];
-static uint32_t __attribute__((section(".bss.$SRAM_OC"))) g_mdec_input_buffer[MDEC_MAX_INPUT_SIZE / sizeof(uint32_t)];
+static uint32_t __attribute__((section(".bss.$BOARD_SDRAM"))) g_mdec_input_buffer[MDEC_MAX_INPUT_SIZE / sizeof(uint32_t)];
 static psx_mdec_t g_mdec_instance;
 static int32_t g_mdec_instance_in_use = 0;
 
@@ -187,6 +188,9 @@ void real_idct(int16_t *blk, int16_t *scale)
 
 uint16_t *rl_decode_block(int16_t *blk, uint16_t *src, uint8_t *quant, int16_t *scale)
 {
+    PROF_T0(t_idct);
+    PROF_INC(mdec_blk);
+
     int32_t k = 0;
 
     for (int32_t i = 0; i < 64; i++)
@@ -235,6 +239,8 @@ uint16_t *rl_decode_block(int16_t *blk, uint16_t *src, uint8_t *quant, int16_t *
 
     IDCT_FUNC(blk, scale);
 
+    PROF_ADD(mdec_idct, t_idct);
+
     return src;
 }
 
@@ -253,6 +259,8 @@ uint16_t *rl_decode_block(int16_t *blk, uint16_t *src, uint8_t *quant, int16_t *
 
 void yuv_to_rgb(psx_mdec_t *mdec, uint8_t *buf, int32_t xx, int32_t yy)
 {
+    PROF_T0(t_yuv);
+
     for (int32_t y = 0; y < 8; y++)
     {
         for (int32_t x = 0; x < 8; x++)
@@ -299,6 +307,8 @@ void yuv_to_rgb(psx_mdec_t *mdec, uint8_t *buf, int32_t xx, int32_t yy)
             }
         }
     }
+
+    PROF_ADD(mdec_yuv, t_yuv);
 }
 
 void mdec_nop(psx_mdec_t *mdec) { /* Do nothing */ }

@@ -147,6 +147,26 @@ uint8_t psx_dma_read8(psx_dma_t *dma, uint32_t offset)
    right then, so this has to run as part of the transfer - not on some later
    device update, or a channel that was disabled during the transfer could still
    end up with a flag the program never acknowledges (which deadlocks it). */
+/* Our DMA transfers finish in zero emulated time, while on the real machine they
+   take tens of microseconds. That collapses the window in which the program
+   acknowledges the previous completion, so a new completion flag can be latched
+   while the interrupt line (DICR bit 31) is still asserted from the previous one.
+   The hardware would have seen the line drop in between, so the edge - and with
+   it the interrupt - would not be lost. Release the line here so the following
+   evaluation produces that edge.
+
+   Without this the game deadlocks: the CD DMA completion interrupt it is waiting
+   for never gets delivered because a stale GPU DMA flag keeps the line high. */
+static inline void dma_release_stale_irq_line(psx_dma_t *dma, uint32_t channel)
+{
+    if (dma->dicr & DICR_IRQSI)
+    {
+        PSX_IO_TRACE(0xF3000000u + channel, dma->dicr, 1, 32);
+
+        dma->dicr &= ~DICR_IRQSI;
+    }
+}
+
 static void __attribute__((section(".ramfunc.$SRAM_ITC"))) dma_latch_irq_flags(psx_dma_t *dma)
 {
     if (dma->cdrom_irq_delay)
@@ -154,7 +174,11 @@ static void __attribute__((section(".ramfunc.$SRAM_ITC"))) dma_latch_irq_flags(p
         dma->cdrom_irq_delay = 0;
 
         if (dma->dicr & DICR_DMA3EN)
+        {
+            dma_release_stale_irq_line(dma, 3);
+
             dma->dicr |= DICR_DMA3FL;
+        }
     }
 
     if (dma->spu_irq_delay)
@@ -162,7 +186,11 @@ static void __attribute__((section(".ramfunc.$SRAM_ITC"))) dma_latch_irq_flags(p
         dma->spu_irq_delay = 0;
 
         if (dma->dicr & DICR_DMA4EN)
+        {
+            dma_release_stale_irq_line(dma, 4);
+
             dma->dicr |= DICR_DMA4FL;
+        }
     }
 
     if (dma->gpu_irq_delay)
@@ -170,7 +198,11 @@ static void __attribute__((section(".ramfunc.$SRAM_ITC"))) dma_latch_irq_flags(p
         dma->gpu_irq_delay = 0;
 
         if (dma->dicr & DICR_DMA2EN)
+        {
+            dma_release_stale_irq_line(dma, 2);
+
             dma->dicr |= DICR_DMA2FL;
+        }
     }
 
     if (dma->otc_irq_delay)
@@ -178,7 +210,11 @@ static void __attribute__((section(".ramfunc.$SRAM_ITC"))) dma_latch_irq_flags(p
         dma->otc_irq_delay = 0;
 
         if (dma->dicr & DICR_DMA6EN)
+        {
+            dma_release_stale_irq_line(dma, 6);
+
             dma->dicr |= DICR_DMA6FL;
+        }
     }
 }
 
@@ -192,12 +228,19 @@ static void __attribute__((section(".ramfunc.$SRAM_ITC"))) dma_latch_irq_flags(p
    whenever an acknowledge and the next transfer happen between two updates. */
 static void __attribute__((section(".ramfunc.$SRAM_ITC"))) dma_update_irq_signal(psx_dma_t *dma)
 {
-    int32_t prev_irq_signal = (dma->dicr & DICR_IRQSI) != 0;
-    int32_t irq_on_flags = (dma->dicr & DICR_IRQEN) != 0;
-    int32_t force_irq = (dma->dicr & DICR_FORCE) != 0;
-    int32_t irq = (dma->dicr & DICR_FLAGS) != 0;
+    const int32_t prev_irq_signal = (dma->dicr & DICR_IRQSI) != 0;
+    const int32_t master_enable = (dma->dicr & DICR_IRQEN) != 0;
+    const int32_t force_irq = (dma->dicr & DICR_FORCE) != 0;
 
-    int32_t irq_signal = force_irq || ((irq & irq_on_flags) != 0);
+    /* The hardware ORs only the flags whose channel is enabled, so clearing a
+       channel enable releases the line even while its flag is still set. */
+    const uint32_t flags = (dma->dicr & DICR_FLAGS) >> 24;
+    const uint32_t enables = (dma->dicr & DICR_FLGEN) >> 16;
+
+    const int32_t irq_signal = force_irq || (master_enable && ((flags & enables) != 0));
+
+    if (irq_signal != prev_irq_signal)
+        PSX_IO_TRACE(0xF1000000u, dma->dicr | (uint32_t)irq_signal, 1, 32);
 
     if (irq_signal && !prev_irq_signal)
         psx_ic_irq(dma->ic, IC_DMA);
@@ -208,6 +251,9 @@ static void __attribute__((section(".ramfunc.$SRAM_ITC"))) dma_update_irq_signal
 
 void dma_write_dicr(psx_dma_t *dma, uint32_t value)
 {
+    PSX_IO_TRACE(0xF1000004u, value, 1, 32);
+    PSX_IO_TRACE(0xF1000008u, dma->dicr, 0, 32);
+
     uint32_t ack = value & DICR_FLAGS;
     uint32_t flags = dma->dicr & DICR_FLAGS;
 
@@ -235,6 +281,9 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_write32(psx_dma_t *d
 
         if (reg == 2)
         {
+            PSX_IO_TRACE(0xF1000010u + (uint32_t)channel, dma->dicr, 1, 32);
+            PSX_IO_TRACE(0xF1000020u + (uint32_t)channel, dma->dpcr, 1, 32);
+
             PROF_T0(t_dma);
             g_psx_dma_do_table[channel](dma);
             PROF_ADD(dmax, t_dma);
@@ -663,7 +712,11 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_update(psx_dma_t *dm
 
         if (!dma->mdec_in_irq_delay)
             if (dma->dicr & DICR_DMA0EN)
+            {
+                dma_release_stale_irq_line(dma, 0);
+
                 dma->dicr |= DICR_DMA0FL;
+            }
     }
 
     if (dma->mdec_out_irq_delay)
@@ -672,7 +725,11 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_update(psx_dma_t *dm
 
         if (!dma->mdec_out_irq_delay)
             if (dma->dicr & DICR_DMA1EN)
+            {
+                dma_release_stale_irq_line(dma, 1);
+
                 dma->dicr |= DICR_DMA1FL;
+            }
     }
 
     dma_update_irq_signal(dma);

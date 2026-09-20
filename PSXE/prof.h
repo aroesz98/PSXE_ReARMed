@@ -5,7 +5,7 @@
    Set PSX_PROFILE to 0 to compile out completely. */
 
 #ifndef PSX_PROFILE
-#define PSX_PROFILE 0
+#define PSX_PROFILE 1
 #endif
 
 #include <stdint.h>
@@ -28,6 +28,9 @@ typedef struct
     uint32_t gp0;      /* core cycles in GP0 command execution (rasterizer) */
     uint32_t blit;     /* core cycles in screen update (scale + LCD) */
     uint32_t dmax;     /* core cycles in DMA block transfers */
+    uint32_t mdec_idct;/* core cycles in MDEC block decode + IDCT */
+    uint32_t mdec_yuv; /* core cycles in MDEC colour conversion */
+    uint32_t mdec_blk; /* MDEC blocks decoded */
     uint32_t bwait;    /* core cycles spent waiting for PXP */
     uint32_t frames;   /* screen updates */
     uint32_t gp0cmds;  /* GP0 commands executed */
@@ -46,33 +49,35 @@ typedef struct
 
 extern psx_prof_t g_prof;
 
-/* Small I/O access trace, armed automatically when the emulated machine stops
-   producing frames, so we can see what it is polling while it is stuck. */
-#define PSX_IO_TRACE_SIZE 192
+/* Continuously recorded ring buffer of I/O accesses, dumped when the emulated
+   machine stops producing frames. Consecutive accesses to the same register are
+   collapsed into a repeat count so a polling loop cannot flush out the history
+   that led to the lockup. */
+#define PSX_IO_TRACE_SIZE 384
 
 typedef struct
 {
     uint32_t addr;
     uint32_t value;
+    uint32_t repeats;
     uint8_t write;
     uint8_t size;
 } psx_io_trace_t;
 
 extern psx_io_trace_t g_io_trace[PSX_IO_TRACE_SIZE];
-extern volatile uint32_t g_io_trace_idx;
+extern volatile uint32_t g_io_trace_idx; /* next slot to write */
+extern volatile uint32_t g_io_trace_len; /* number of valid entries */
 extern volatile int32_t g_io_trace_on;
+
+void psx_io_trace_record(uint32_t addr, uint32_t value, uint32_t write, uint32_t size);
+void psx_io_trace_request_dump(void);
+void psx_io_trace_dump(const char *tag);
 
 #define PSX_IO_TRACE(a, v, w, sz)                                    \
     do                                                               \
     {                                                                \
-        if (g_io_trace_on && (g_io_trace_idx < PSX_IO_TRACE_SIZE))    \
-        {                                                            \
-            psx_io_trace_t *e = &g_io_trace[g_io_trace_idx++];        \
-            e->addr = (a);                                           \
-            e->value = (v);                                          \
-            e->write = (w);                                          \
-            e->size = (sz);                                          \
-        }                                                            \
+        if (g_io_trace_on)                                           \
+            psx_io_trace_record((a), (v), (w), (sz));                 \
     } while (0)
 
 void psx_prof_init(void);
@@ -90,6 +95,7 @@ void psx_prof_tick(void); /* prints a report once per second */
 #define psx_prof_init() do {} while (0)
 #define psx_prof_tick() do {} while (0)
 #define PSX_IO_TRACE(a, v, w, sz) do {} while (0)
+#define psx_io_trace_request_dump() do {} while (0)
 
 #endif
 

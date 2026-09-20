@@ -1,3 +1,4 @@
+#include "../prof.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,8 @@ void psx_ic_init(psx_ic_t *ic, psx_cpu_t *cpu)
 
 uint32_t psx_ic_read32(psx_ic_t *ic, uint32_t offset)
 {
+    PSX_IO_TRACE(0xF0000020u + offset, (offset == 0) ? ic->stat : ic->mask, 0, 32);
+
     switch (offset)
     {
     case 0x00:
@@ -102,6 +105,8 @@ uint8_t psx_ic_read8(psx_ic_t *ic, uint32_t offset)
 
 void psx_ic_write32(psx_ic_t *ic, uint32_t offset, uint32_t value)
 {
+    PSX_IO_TRACE(0xF0000000u + offset, value, 1, 32);
+
     switch (offset)
     {
     case 0x00:
@@ -205,6 +210,8 @@ void psx_ic_write8(psx_ic_t *ic, uint32_t offset, uint8_t value)
 
 void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_ic_irq(psx_ic_t *ic, int32_t id)
 {
+    PSX_IO_TRACE(0xF0000010u, (uint32_t)id | (ic->mask << 16), 1, 32);
+
     ic->stat |= id;
 
     if (ic->mask & ic->stat)

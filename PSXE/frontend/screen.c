@@ -26,6 +26,8 @@
 #include "fsl_cache.h"
 #include "fsl_debug_console.h"
 #include "../prof.h"
+#include "../jit/jit.h"
+#include "gamepad.h"
 
 // Memory tracking - if available
 #ifdef ENABLE_MEM_TRACKING
@@ -90,6 +92,114 @@ int32_t screen_get_base_width(psxe_screen_t *screen)
 }
 
 // Initialize PXP hardware scaling engine
+/*
+    24 bpp display mode.
+
+    In that mode the PSX display area holds packed 24 bit pixels - three bytes
+    each, so a 320 pixel line takes 480 halfwords of VRAM. The PXP cannot read
+    that: its "RGB888" process surface format is an unpacked 32 bit one. FF7 uses
+    24 bpp for its full motion video, which came out as a green mush when the
+    packed bytes were handed to the scaler as RGB565.
+
+    So the display area is repacked into RGB565 first, into a staging buffer the
+    scaler then reads. The buffer lives in SDRAM and is written through the
+    D-cache; the clean before every PXP job covers it.
+*/
+#define SCREEN_STAGE_MAX_PIXELS (640 * 480)
+
+static uint16_t __attribute__((section(".bss.$BOARD_SDRAM"), aligned(32)))
+    g_rgb24_stage[SCREEN_STAGE_MAX_PIXELS];
+
+/* Native PSX pixel (mask, blue, green, red) to the RGB565 the panel wants. */
+static void screen_repack_bgr555(const uint16_t *src, int32_t width, int32_t height, uint16_t *dst)
+{
+    for (int32_t y = 0; y < height; y++)
+    {
+        const uint16_t *s = src + (uint32_t)y * (PSX_GPU_FB_STRIDE / 2u);
+        uint16_t *d = dst + (uint32_t)y * (uint32_t)width;
+
+        for (int32_t x = 0; x < width; x++)
+        {
+            const uint32_t p = s[x];
+
+            d[x] = (uint16_t)(((p & 0x1fu) << 11) | (((p >> 5) & 0x1fu) << 6) | ((p >> 10) & 0x1fu));
+        }
+    }
+}
+
+/*
+    Geometry test pattern, drawn instead of the emulated frame.
+
+    Set PSXE_SCREEN_TEST_PATTERN to 1 to answer "does the panel show the whole
+    source rectangle, and does it show it undistorted": a one pixel white frame
+    around the edge, a differently coloured square in each corner, cross hairs
+    through the middle and diagonals. A missing edge means the source rectangle
+    is wrong, bent diagonals mean the row pitch is wrong, and a cut off frame
+    means the output rectangle is off the panel.
+*/
+#ifndef PSXE_SCREEN_TEST_PATTERN
+#define PSXE_SCREEN_TEST_PATTERN 0
+#endif
+
+#if PSXE_SCREEN_TEST_PATTERN
+static void screen_test_pattern(int32_t width, int32_t height, uint16_t *dst)
+{
+    const uint16_t white = 0xffffu;
+    const uint16_t red = 0xf800u;
+    const uint16_t green = 0x07e0u;
+    const uint16_t blue = 0x001fu;
+    const uint16_t yellow = 0xffe0u;
+    const uint16_t dim = 0x2104u;
+
+    for (int32_t y = 0; y < height; y++)
+    {
+        uint16_t *d = dst + (uint32_t)y * (uint32_t)width;
+
+        for (int32_t x = 0; x < width; x++)
+        {
+            uint16_t c = 0;
+
+            /* diagonals, so any shear shows up as a kink */
+            if ((((x + y) & 31) == 0) || (((x - y) & 31) == 0))
+                c = dim;
+
+            /* cross hairs */
+            if ((x == (width / 2)) || (y == (height / 2)))
+                c = white;
+
+            /* one pixel frame */
+            if ((x == 0) || (y == 0) || (x == (width - 1)) || (y == (height - 1)))
+                c = white;
+
+            /* corner markers, 12 pixels on a side */
+            if ((x < 12) && (y < 12))
+                c = red;
+            else if ((x >= (width - 12)) && (y < 12))
+                c = green;
+            else if ((x < 12) && (y >= (height - 12)))
+                c = blue;
+            else if ((x >= (width - 12)) && (y >= (height - 12)))
+                c = yellow;
+
+            d[x] = c;
+        }
+    }
+}
+#endif
+
+static void screen_repack_rgb24(const uint8_t *src, int32_t width, int32_t height, uint16_t *dst)
+{
+    for (int32_t y = 0; y < height; y++)
+    {
+        const uint8_t *s = src + (uint32_t)y * PSX_GPU_FB_STRIDE;
+        uint16_t *d = dst + (uint32_t)y * (uint32_t)width;
+
+        for (int32_t x = 0; x < width; x++, s += 3)
+            d[x] = (uint16_t)(((uint32_t)(s[0] & 0xf8u) << 8) | ((uint32_t)(s[1] & 0xfcu) << 3) |
+                              ((uint32_t)s[2] >> 3));
+    }
+}
+
 static void psxe_screen_init_pxp(void)
 {
     if (g_pxp_initialized) {
@@ -262,8 +372,82 @@ void psxe_screen_update(psxe_screen_t *screen)
             uint32_t cycles = screen->psx->cpu->total_cycles;
             uint32_t kcyc = (cycles - last_cycles) / 1000u;
 
-            PRINTF("emu: %u kcyc/s (%u%% of PS1) | vblanks/s: %u | frames/s: %u\r\n",
-                   kcyc, (unsigned)((kcyc * 100u) / 33869u), vblanks, g_presented_frames);
+            const psx_jit_stats_t *jit = psx_jit_get_stats();
+
+#if PSX_JIT_HIST
+            {
+                /* the five opcode classes the fallback spends most time on */
+                const uint32_t *hist = psx_jit_get_hist();
+
+                uint32_t top[5] = {0, 0, 0, 0, 0};
+
+                for (uint32_t i = 0; i < PSX_JIT_HIST_SIZE; i++)
+                {
+                    for (uint32_t k = 0; k < 5; k++)
+                    {
+                        if (hist[i] > hist[top[k]])
+                        {
+                            for (uint32_t m = 4; m > k; m--)
+                                top[m] = top[m - 1];
+
+                            top[k] = i;
+                            break;
+                        }
+                    }
+                }
+
+                PRINTF("jit fallback: ");
+
+                for (uint32_t k = 0; k < 5; k++)
+                {
+                    if (!hist[top[k]])
+                        continue;
+
+                    if (top[k] < 64u)
+                        PRINTF("op%02x=%u ", (unsigned)top[k], (unsigned)hist[top[k]]);
+                    else
+                        PRINTF("sp%02x=%u ", (unsigned)(top[k] - 64u), (unsigned)hist[top[k]]);
+                }
+
+                PRINTF("\r\n");
+
+                psx_jit_clear_hist();
+            }
+#endif
+
+            PRINTF("emu: %u kcyc/s (%u%% of PS1) | vbl/s: %u | fps: %u | jit blk=%u cmp=%u flush=%u inv=%u code=%uB nat=%u int=%u\r\n",
+                   kcyc, (unsigned)((kcyc * 100u) / 33869u), vblanks, g_presented_frames,
+                   (unsigned)jit->blocks, (unsigned)jit->compiles, (unsigned)jit->flushes,
+                   (unsigned)jit->invalidations, (unsigned)jit->code_used,
+                   (unsigned)jit->native, (unsigned)jit->interp_steps);
+
+            {
+                /* Frames from the ESP32 pad bridge, so a wiring or baud rate
+                   problem is visible without a debugger: frames climbing means
+                   the link is alive, errors climbing means the line is noisy. */
+                uint32_t pad_frames = 0;
+                uint32_t pad_errors = 0;
+
+                psxe_gamepad_get_stats(&pad_frames, &pad_errors);
+
+    #if PSX_PROFILE
+            PRINTF("mdec: idct=%u yuv=%u blocks=%u\r\n",
+                   (unsigned)g_prof.mdec_idct, (unsigned)g_prof.mdec_yuv, (unsigned)g_prof.mdec_blk);
+#endif
+
+            PRINTF("disp: %dx%d %s mode=%03x yrange=%u..%u start=(%u,%u) | pad: %u/%u\r\n",
+                       (int)psx_get_display_width(screen->psx),
+                       (int)psx_get_display_height(screen->psx),
+                       psx_get_display_format(screen->psx) ? "24bpp" : "15bpp",
+                       (unsigned)screen->psx->gpu->display_mode,
+                       (unsigned)screen->psx->gpu->disp_y1, (unsigned)screen->psx->gpu->disp_y2,
+                       (unsigned)screen->psx->gpu->disp_x, (unsigned)screen->psx->gpu->disp_y,
+                       (unsigned)pad_frames, (unsigned)pad_errors);
+            }
+
+#if PSX_JIT_HIST
+            PRINTF("jit dispatch-interp=%u\r\n", (unsigned)jit->dispatch_steps);
+#endif
 
             last_tick = now;
             last_cycles = cycles;
@@ -319,9 +503,6 @@ static void psxe_screen_update_impl(psxe_screen_t *screen)
 
     void *display_buf = screen->debug_mode ? psx_get_vram(screen->psx) : psx_get_display_buffer(screen->psx);
 
-    if ((screen->psx->gpu->disp_y + screen->texture_height) > 512)
-        display_buf = psx_get_vram(screen->psx);
-
     uint16_t *src = (uint16_t *)display_buf;
 
     if (!src)
@@ -351,20 +532,50 @@ static void psxe_screen_update_impl(psxe_screen_t *screen)
 
         if (src_width == 640 && src_height > 480)
             src_height = 480;
+
+        /* The window has to stay inside VRAM. This used to fall back to the top
+           of VRAM instead, which showed the wrong buffer on every frame the game
+           displayed its second one (disp_y = 240 with FF7's double buffering)
+           and turned into stripes whenever the two buffers differed. */
+        if ((int32_t)screen->psx->gpu->disp_y + src_height > PSX_GPU_FB_HEIGHT)
+            src_height = PSX_GPU_FB_HEIGHT - (int32_t)screen->psx->gpu->disp_y;
+
+        if (src_height <= 0)
+            src_height = 1;
     }
 
     const int32_t dst_width = LCD_WIDTH;   /* 480 */
     const int32_t dst_height = LCD_HEIGHT; /* 272 */
 
-    /* Fit into the panel keeping the aspect ratio (integer math only) */
+    /*
+        Fit a 4:3 rectangle into the panel, not the source pixel count.
+
+        Every standard PSX video mode covers the same screen area: 256, 320, 368,
+        512 and 640 pixel wide modes all span the full width, and 240 or 480
+        lines both span the full height, so the pixels are not square. Scaling by
+        the pixel counts squashed the 640x240 modes (FF7's menus) into 480x180
+        with black bars above and below.
+
+        Set PSXE_SCREEN_FILL_PANEL to 1 to stretch to the whole 480x272 panel
+        instead: no bars, but a 4:3 picture comes out a third too wide.
+    */
+#ifndef PSXE_SCREEN_FILL_PANEL
+#define PSXE_SCREEN_FILL_PANEL 0
+#endif
+
+#if PSXE_SCREEN_FILL_PANEL
+    int32_t scaled_width = dst_width;
     int32_t scaled_height = dst_height;
-    int32_t scaled_width = (src_width * dst_height) / src_height;
+#else
+    int32_t scaled_height = dst_height;
+    int32_t scaled_width = (dst_height * 4) / 3;
 
     if (scaled_width > dst_width)
     {
         scaled_width = dst_width;
-        scaled_height = (src_height * dst_width) / src_width;
+        scaled_height = (dst_width * 3) / 4;
     }
+#endif
 
     const int32_t x_offset = (dst_width - scaled_width) / 2;
     const int32_t y_offset = (dst_height - scaled_height) / 2;
@@ -379,8 +590,10 @@ static void psxe_screen_update_impl(psxe_screen_t *screen)
         /* Both buffers have to lose the old letterbox bars */
         clear_pending = 2;
 
-        PRINTF("PXP scaling: %dx%d -> %dx%d, offset=(%d,%d)\r\n",
-               src_width, src_height, scaled_width, scaled_height, x_offset, y_offset);
+        PRINTF("PXP scaling: %dx%d -> %dx%d, offset=(%d,%d), vram start=(%u,%u), mode=%03x\r\n",
+               src_width, src_height, scaled_width, scaled_height, x_offset, y_offset,
+               (unsigned)screen->psx->gpu->disp_x, (unsigned)screen->psx->gpu->disp_y,
+               (unsigned)screen->psx->gpu->display_mode);
     }
 
     if (clear_pending > 0)
@@ -390,13 +603,45 @@ static void psxe_screen_update_impl(psxe_screen_t *screen)
         memset(dst, 0, dst_width * dst_height * sizeof(uint16_t));
     }
 
+    /*
+        VRAM is in the native PSX pixel format, which the scaler cannot read, so
+        the visible area is repacked into RGB565 first - from 15 bpp pixels
+        normally, from packed 24 bpp ones during full motion video.
+    */
+    const uint16_t *ps_buffer = src;
+    uint32_t ps_pitch = PSX_GPU_FB_STRIDE;
+
+/* Set to 0 to feed 15 bpp frames to the scaler straight out of VRAM, as before
+   the native format change. 24 bpp always needs the repack. */
+#ifndef PSXE_SCREEN_USE_STAGING
+#define PSXE_SCREEN_USE_STAGING 1
+#endif
+
+    const int32_t is_24bpp = psx_get_display_format(screen->psx) && !screen->debug_mode;
+
+    if (((src_width * src_height) <= SCREEN_STAGE_MAX_PIXELS) &&
+        (is_24bpp || PSXE_SCREEN_USE_STAGING))
+    {
+#if PSXE_SCREEN_TEST_PATTERN
+        screen_test_pattern(src_width, src_height, g_rgb24_stage);
+#else
+        if (is_24bpp)
+            screen_repack_rgb24((const uint8_t *)src, src_width, src_height, g_rgb24_stage);
+        else
+            screen_repack_bgr555(src, src_width, src_height, g_rgb24_stage);
+#endif
+
+        ps_buffer = g_rgb24_stage;
+        ps_pitch = (uint32_t)src_width * 2u;
+    }
+
     /* The rasterizer writes VRAM through the D-cache, PXP reads it as a bus
        master - a full clean is cheaper than cleaning the display window. */
     SCB_CleanDCache();
 
     /* Process surface = PSX display area inside VRAM */
-    g_pxp_ps_config.bufferAddr = (uint32_t)src;
-    g_pxp_ps_config.pitchBytes = PSX_GPU_FB_STRIDE;
+    g_pxp_ps_config.bufferAddr = (uint32_t)ps_buffer;
+    g_pxp_ps_config.pitchBytes = ps_pitch;
     PXP_SetProcessSurfaceBufferConfig(APP_PXP, &g_pxp_ps_config);
 
     /* Hardware scaler handles both down- and upscaling */

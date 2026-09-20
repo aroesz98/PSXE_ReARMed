@@ -1,5 +1,6 @@
 #include "psx.h"
 #include "prof.h"
+#include "jit/jit.h"
 #include <stdlib.h>
 #include <stdint.h>
 #include "fsl_debug_console.h"
@@ -57,7 +58,59 @@ psx_prof_t g_prof;
 
 psx_io_trace_t __attribute__((section(".bss.$SRAM_DTC"))) g_io_trace[PSX_IO_TRACE_SIZE];
 volatile uint32_t g_io_trace_idx = 0;
-volatile int32_t g_io_trace_on = 0;
+volatile uint32_t g_io_trace_len = 0;
+volatile int32_t g_io_trace_on = 1; /* record from the start */
+
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_io_trace_record(uint32_t addr, uint32_t value,
+                                                                       uint32_t write, uint32_t size)
+{
+    /* Only the registers that matter for interrupt / DMA / CD sequencing.
+       SPU FIFO and GP0 data would otherwise flood the ring buffer. */
+    const uint32_t off = addr - 0x1f801000u;
+
+    /* 0xF00000xx / 0xF10000xx are internal markers (interrupt controller and
+       DMA engine events), they always pass. */
+    if ((off >= 0x1000u) && (addr < 0xF0000000u))
+        return;
+
+    const int interesting = (addr >= 0xF0000000u) ||
+        ((off >= 0x070u) && (off < 0x078u)) ||  /* I_STAT / I_MASK          */
+        ((off >= 0x080u) && (off < 0x100u)) ||  /* DMA channels + DPCR/DICR */
+        ((off >= 0x100u) && (off < 0x130u)) ||  /* timers                   */
+        ((off >= 0x800u) && (off < 0x804u)) ||  /* CDROM                    */
+        ((off >= 0x810u) && (off < 0x818u));    /* GPU (GP0/GP1/GPUSTAT)    */
+
+    if (!interesting)
+        return;
+
+    uint32_t idx = g_io_trace_idx;
+
+    /* collapse a polling loop into one entry (value of the last access wins) */
+    if (g_io_trace_len)
+    {
+        psx_io_trace_t *last = &g_io_trace[(idx + PSX_IO_TRACE_SIZE - 1) % PSX_IO_TRACE_SIZE];
+
+        if ((last->addr == addr) && (last->write == write))
+        {
+            last->repeats++;
+            last->value = value;
+            return;
+        }
+    }
+
+    psx_io_trace_t *e = &g_io_trace[idx];
+
+    e->addr = addr;
+    e->value = value;
+    e->repeats = 0;
+    e->write = (uint8_t)write;
+    e->size = (uint8_t)size;
+
+    g_io_trace_idx = (idx + 1u) % PSX_IO_TRACE_SIZE;
+
+    if (g_io_trace_len < PSX_IO_TRACE_SIZE)
+        g_io_trace_len++;
+}
 
 void psx_prof_init(void)
 {
@@ -69,8 +122,54 @@ void psx_prof_init(void)
     g_prof.t_start = DWT->CYCCNT;
 }
 
+static volatile int32_t g_io_trace_dump_req = 0;
+static volatile int32_t g_io_trace_dumped_once = 0;
+
+void psx_io_trace_request_dump(void)
+{
+    if (!g_io_trace_dumped_once)
+    {
+        g_io_trace_dumped_once = 1;
+        g_io_trace_dump_req = 1;
+    }
+}
+
+void psx_io_trace_dump(const char *tag)
+{
+    g_io_trace_on = 0;
+
+    uint32_t len = g_io_trace_len;
+    uint32_t start = (g_io_trace_idx + PSX_IO_TRACE_SIZE - len) % PSX_IO_TRACE_SIZE;
+
+    PRINTF("IOTRACE-RING [%s] %u entries (oldest first):\r\n", tag, (unsigned)len);
+
+    for (uint32_t i = 0; i < len; i++)
+    {
+        const psx_io_trace_t *e = &g_io_trace[(start + i) % PSX_IO_TRACE_SIZE];
+
+        PRINTF("  %c%u %08x = %08x x%u\r\n",
+               e->write ? 'W' : 'R',
+               (unsigned)e->size,
+               (unsigned)e->addr,
+               (unsigned)e->value,
+               (unsigned)(e->repeats + 1u));
+    }
+
+    PRINTF("IOTRACE-END\r\n");
+
+    g_io_trace_len = 0;
+    g_io_trace_idx = 0;
+    g_io_trace_on = 1;
+}
+
 void psx_prof_tick(void)
 {
+    if (g_io_trace_dump_req)
+    {
+        g_io_trace_dump_req = 0;
+        psx_io_trace_dump("LOST DMA IRQ");
+    }
+
     uint32_t now = DWT->CYCCNT;
     uint32_t elapsed = now - g_prof.t_start;
 
@@ -124,26 +223,33 @@ void psx_prof_tick(void)
         else
             idle_seconds = 0;
 
-        if (idle_seconds == 3)
+        if (idle_seconds == 4)
         {
-            g_io_trace_idx = 0;
-            g_io_trace_on = 1;
-        }
-        else if (idle_seconds == 4)
-        {
+            /* Freeze and dump the history that led here, oldest first */
             g_io_trace_on = 0;
 
-            PRINTF("IOTRACE %u entries:\r\n", (unsigned)g_io_trace_idx);
+            uint32_t len = g_io_trace_len;
+            uint32_t start = (g_io_trace_idx + PSX_IO_TRACE_SIZE - len) % PSX_IO_TRACE_SIZE;
 
-            for (uint32_t i = 0; i < g_io_trace_idx; i++)
+            PRINTF("IOTRACE-RING %u entries (oldest first):\r\n", (unsigned)len);
+
+            for (uint32_t i = 0; i < len; i++)
             {
-                PRINTF("  %c%u %08x %08x\r\n",
-                       g_io_trace[i].write ? 'W' : 'R',
-                       (unsigned)g_io_trace[i].size,
-                       (unsigned)g_io_trace[i].addr,
-                       (unsigned)g_io_trace[i].value);
+                const psx_io_trace_t *e = &g_io_trace[(start + i) % PSX_IO_TRACE_SIZE];
+
+                PRINTF("  %c%u %08x = %08x x%u\r\n",
+                       e->write ? 'W' : 'R',
+                       (unsigned)e->size,
+                       (unsigned)e->addr,
+                       (unsigned)e->value,
+                       (unsigned)(e->repeats + 1u));
             }
 
+            PRINTF("IOTRACE-END\r\n");
+
+            g_io_trace_len = 0;
+            g_io_trace_idx = 0;
+            g_io_trace_on = 1;
             idle_seconds = 0;
         }
     }
@@ -158,8 +264,8 @@ void psx_prof_tick(void)
    single instruction cost more than the interpreter itself.
    Must stay well below the GPU hblank window (~54 CPU cycles) so no
    hblank/vblank edge can be stepped over. */
-#define PSX_DEV_SLICE_CYCLES 8
-#define PSX_DEV_SLICE_MAX_STEPS 8
+#define PSX_DEV_SLICE_CYCLES 21
+#define PSX_DEV_SLICE_MAX_STEPS 32
 
 void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_update(psx_t *psx)
 {
@@ -171,9 +277,15 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_update(psx_t *psx)
 
     do
     {
+#if PSX_JIT_ENABLE
+        /* One recompiled block; instructions the translator cannot emit
+           natively call back into the interpreter from inside the block. */
+        acc += psx_jit_step(cpu);
+#else
         psx_cpu_cycle(cpu);
 
         acc += cpu->last_cycles;
+#endif
         steps++;
     }
     while ((acc < PSX_DEV_SLICE_CYCLES) && (steps < PSX_DEV_SLICE_MAX_STEPS));
@@ -264,7 +376,11 @@ uint32_t psx_get_dmode_width(psx_t *psx)
 
 uint32_t psx_get_dmode_height(psx_t *psx)
 {
-    if (psx->gpu->display_mode & 0x4)
+    /* The vertical resolution bit only means 480 lines together with vertical
+       interlace; on its own the hardware still shows 240, and the real height
+       then comes from the vertical display range (that is where 224 line modes
+       come from). */
+    if ((psx->gpu->display_mode & 0x4) && (psx->gpu->display_mode & 0x20))
         return 480;
 
     int32_t disp = psx->gpu->disp_y2 - psx->gpu->disp_y1;
@@ -364,6 +480,8 @@ int32_t psx_init(psx_t *psx, const char *bios_path, const char *exp_path)
     psx_mdec_init(psx->mdec);
     psx_cpu_init(psx->cpu, psx->bus);
 
+    psx_jit_init();
+
     return 0;
 }
 
@@ -381,6 +499,8 @@ void psx_hard_reset(psx_t *psx)
 
 void psx_soft_reset(psx_t *psx)
 {
+    psx_jit_reset();
+
     psx_cpu_init(psx->cpu, psx->bus);
 }
 

@@ -63,6 +63,9 @@ void DEMO_DrawNumber(int x, int y, int number, uint16_t color);
 // Buffer management
 void DEMO_SwapBuffers(void);
 
+/* True until the last requested swap has been taken up by the panel. */
+bool DEMO_IsFramePending(void);
+
 // Frame buffer accessor functions for PXP acceleration
 uint8_t* DEMO_GetCurrentFrameBuffer(void);
 int DEMO_GetCurrentBackBufferIndex(void);

@@ -16,6 +16,11 @@
 /* Hot interpreter code is executed from ITCM, not XIP flash */
 #define PSX_CPU_HOT __attribute__((section(".ramfunc.$SRAM_ITC")))
 
+/* The GTE helpers are called (never inlined into the dispatcher) and they are
+   large, so they run from OCRAM through the instruction cache instead of
+   eating the ITCM the JIT code cache needs. */
+#define PSX_GTE_HOT __attribute__((section(".ramfunc.$SRAM_OC")))
+
 // DWT (Data Watchpoint and Trace) registers for cycle counting
 #define DWT_CONTROL             (*((volatile uint32_t*)0xE0001000))
 #define DWT_CYCCNT              (*((volatile uint32_t*)0xE0001004))
@@ -76,28 +81,28 @@ static const uint8_t g_psx_gte_unr_table[] = {
     0x03, 0x03, 0x02, 0x02, 0x01, 0x01, 0x00, 0x00,
     0x00};
 
-static inline PSX_CPU_HOT void psx_gte_i_rtps(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_nclip(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_op(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_dpcs(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_intpl(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_mvmva(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_ncds(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_cdp(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_ncdt(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_nccs(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_cc(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_ncs(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_nct(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_sqr(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_dcpl(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_dpct(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_avsz3(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_avsz4(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_rtpt(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_gpf(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_gpl(psx_cpu_t *);
-static inline PSX_CPU_HOT void psx_gte_i_ncct(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_rtps(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_nclip(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_op(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_dpcs(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_intpl(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_mvmva(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_ncds(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_cdp(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_ncdt(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_nccs(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_cc(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_ncs(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_nct(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_sqr(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_dcpl(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_dpct(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_avsz3(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_avsz4(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_rtpt(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_gpf(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_gpl(psx_cpu_t *);
+static inline PSX_GTE_HOT void psx_gte_i_ncct(psx_cpu_t *);
 
 // CPU instruction function declarations for caching
 static inline void psx_cpu_i_sll(psx_cpu_t *);
@@ -387,7 +392,10 @@ static inline PSX_CPU_HOT void psx_cpu_exception(psx_cpu_t *cpu, uint32_t cause)
     cpu->next_pc = cpu->pc + 4;
 }
 
-void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_cycle(psx_cpu_t *cpu)
+/* In OCRAM, not ITCM: with the recompiler running the straight line code the
+   interpreter is down to a fraction of a percent of all instructions, so the
+   fast memory is worth far more to the code cache. */
+void __attribute__((section(".ramfunc.$SRAM_OC"))) psx_cpu_cycle(psx_cpu_t *cpu)
 {
     cpu->last_cycles = 0;
 
@@ -2159,7 +2167,7 @@ static inline uint32_t gte_divide(psx_cpu_t *cpu, uint16_t n, uint16_t d)
     return MIN(0x1ffff, res);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_invalid(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_invalid(psx_cpu_t *cpu)
 {
     log_fatal("invalid: Unimplemented GTE instruction %02x, %02x", cpu->opcode & 0x3f, cpu->opcode >> 25);
 }
@@ -2580,13 +2588,13 @@ static inline void __attribute__((always_inline)) gte_rtp(psx_cpu_t *cpu, uint32
         R_BC2 = gte_clamp_rgb(cpu, 3, R_MAC3 >> 4);                                                                                                                                           \
     }
 
-static inline PSX_CPU_HOT void psx_gte_i_rtps(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_rtps(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     GTE_RTP_DQ(0);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_nclip(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_nclip(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2597,7 +2605,7 @@ static inline PSX_CPU_HOT void psx_gte_i_nclip(psx_cpu_t *cpu)
     R_MAC0 = (int)gte_clamp_mac0(cpu, value);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_op(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_op(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2610,7 +2618,7 @@ static inline PSX_CPU_HOT void psx_gte_i_op(psx_cpu_t *cpu)
     R_IR3 = gte_clamp_ir(cpu, 3, R_MAC3, cpu->gte_lm);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_dpcs(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_dpcs(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2639,7 +2647,7 @@ static inline PSX_CPU_HOT void psx_gte_i_dpcs(psx_cpu_t *cpu)
     R_BC2 = gte_clamp_rgb(cpu, 3, R_MAC3 >> 4);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_intpl(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_intpl(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2685,7 +2693,7 @@ static inline PSX_CPU_HOT void psx_gte_i_intpl(psx_cpu_t *cpu)
 #define R_CV2 cv.y
 #define R_CV3 cv.z
 
-static inline PSX_CPU_HOT void psx_gte_i_mvmva(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_mvmva(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2801,14 +2809,14 @@ static inline PSX_CPU_HOT void psx_gte_i_mvmva(psx_cpu_t *cpu)
 #undef R_CV3
 
 // To-do: Fix flags
-static inline PSX_CPU_HOT void psx_gte_i_ncds(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_ncds(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
     NCDS(0);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_cdp(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_cdp(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     R_MAC1 = gte_clamp_mac(cpu, 1, gte_check_mac(cpu, 1, gte_check_mac(cpu, 1, (I64(R_RBK) << 12) + (I64(R_LR1) * I64(R_IR1))) + (I64(R_LR2) * I64(R_IR2))) + (I64(R_LR3) * I64(R_IR3)));
@@ -2834,7 +2842,7 @@ static inline PSX_CPU_HOT void psx_gte_i_cdp(psx_cpu_t *cpu)
     R_CD2 = R_CODE;
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_ncdt(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_ncdt(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     NCDS(0);
@@ -2842,13 +2850,13 @@ static inline PSX_CPU_HOT void psx_gte_i_ncdt(psx_cpu_t *cpu)
     NCDS(2);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_nccs(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_nccs(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     NCCS(0);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_cc(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_cc(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     R_MAC1 = gte_clamp_mac(cpu, 1, gte_check_mac(cpu, 1, gte_check_mac(cpu, 1, (I64(R_RBK) << 12) + (I64(R_LR1) * I64(R_IR1))) + (I64(R_LR2) * I64(R_IR2))) + (I64(R_LR3) * I64(R_IR3)));
@@ -2871,13 +2879,13 @@ static inline PSX_CPU_HOT void psx_gte_i_cc(psx_cpu_t *cpu)
     R_IR3 = gte_clamp_ir(cpu, 3, R_MAC3, cpu->gte_lm);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_ncs(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_ncs(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     NCS(0);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_nct(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_nct(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     NCS(0);
@@ -2885,7 +2893,7 @@ static inline PSX_CPU_HOT void psx_gte_i_nct(psx_cpu_t *cpu)
     NCS(2);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_sqr(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_sqr(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2898,7 +2906,7 @@ static inline PSX_CPU_HOT void psx_gte_i_sqr(psx_cpu_t *cpu)
     R_IR3 = gte_clamp_ir(cpu, 3, R_MAC3, cpu->gte_lm);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_dcpl(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_dcpl(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2922,7 +2930,7 @@ static inline PSX_CPU_HOT void psx_gte_i_dcpl(psx_cpu_t *cpu)
     R_BC2 = gte_clamp_rgb(cpu, 3, R_MAC3 >> 4);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_dpct(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_dpct(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     DPCT1;
@@ -2930,7 +2938,7 @@ static inline PSX_CPU_HOT void psx_gte_i_dpct(psx_cpu_t *cpu)
     DPCT1;
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_avsz3(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_avsz3(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2940,7 +2948,7 @@ static inline PSX_CPU_HOT void psx_gte_i_avsz3(psx_cpu_t *cpu)
     R_OTZ = gte_clamp_sz3(cpu, avg >> 12);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_avsz4(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_avsz4(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2950,7 +2958,7 @@ static inline PSX_CPU_HOT void psx_gte_i_avsz4(psx_cpu_t *cpu)
     R_OTZ = gte_clamp_sz3(cpu, avg >> 12);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_rtpt(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_rtpt(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     gte_rtp(cpu, 0);
@@ -2958,7 +2966,7 @@ static inline PSX_CPU_HOT void psx_gte_i_rtpt(psx_cpu_t *cpu)
     GTE_RTP_DQ(2);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_gpf(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_gpf(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2976,7 +2984,7 @@ static inline PSX_CPU_HOT void psx_gte_i_gpf(psx_cpu_t *cpu)
     R_BC2 = gte_clamp_rgb(cpu, 3, R_MAC3 >> 4);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_gpl(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_gpl(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
 
@@ -2994,7 +3002,7 @@ static inline PSX_CPU_HOT void psx_gte_i_gpl(psx_cpu_t *cpu)
     R_BC2 = gte_clamp_rgb(cpu, 3, R_MAC3 >> 4);
 }
 
-static inline PSX_CPU_HOT void psx_gte_i_ncct(psx_cpu_t *cpu)
+static inline PSX_GTE_HOT void psx_gte_i_ncct(psx_cpu_t *cpu)
 {
     R_FLAG = 0;
     NCCS(0);
@@ -3136,7 +3144,20 @@ static inline int32_t __attribute__((always_inline)) psx_cpu_exec_cop2(psx_cpu_t
     }
 }
 
-int32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cpu_execute(psx_cpu_t *cpu)
+/*
+    One entry point for the recompiler's GTE commands. The GTE helpers are static
+    inline, so generated code cannot reach them directly; this wrapper runs the
+    same dispatch the interpreter uses and returns the cycle count, which keeps
+    the per opcode timing table in exactly one place.
+*/
+int32_t PSX_GTE_HOT psx_cpu_gte_command(psx_cpu_t *cpu, uint32_t opcode)
+{
+    cpu->opcode = opcode;
+
+    return psx_cpu_exec_cop2(cpu);
+}
+
+int32_t __attribute__((section(".ramfunc.$SRAM_OC"))) psx_cpu_execute(psx_cpu_t *cpu)
 {
     /* Straight switch dispatch: every handler is a static inline, so the
        whole interpreter ends up as one branch-table driven function in

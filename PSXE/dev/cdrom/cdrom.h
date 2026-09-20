@@ -246,21 +246,24 @@ typedef struct
     int32_t delay;
     uint32_t pending_lba;
     uint32_t lba;
-    int16_t cdda_buf[CD_SECTOR_SIZE >> 1];
+    /* CD audio / XA work buffers. These are ~115 KB in total and only used for
+       audio, so they live in SDRAM and the struct only carries pointers - that
+       keeps psx_cdrom_t small enough for tightly coupled memory. */
+    int16_t *cdda_buf;
     int32_t cdda_remaining_samples;
     uint32_t cdda_sample_index;
     uint32_t cdda_sectors_played;
     int32_t cdda_playing;
     int32_t cdda_prev_track;
     int32_t read_ongoing;
-    uint8_t xa_buf[CD_SECTOR_SIZE];
-    int16_t xa_left_buf[XA_STEREO_SAMPLES];
-    int16_t xa_right_buf[XA_STEREO_SAMPLES];
-    int16_t xa_mono_buf[XA_MONO_SAMPLES];
-    int16_t xa_upsample_buf[XA_UPSAMPLE_SIZE];
-    int16_t xa_left_resample_buf[XA_STEREO_RESAMPLE_MAX_SIZE];
-    int16_t xa_right_resample_buf[XA_STEREO_RESAMPLE_MAX_SIZE];
-    int16_t xa_mono_resample_buf[XA_MONO_RESAMPLE_MAX_SIZE];
+    uint8_t *xa_buf;
+    int16_t *xa_left_buf;
+    int16_t *xa_right_buf;
+    int16_t *xa_mono_buf;
+    int16_t *xa_upsample_buf;
+    int16_t *xa_left_resample_buf;
+    int16_t *xa_right_resample_buf;
+    int16_t *xa_mono_resample_buf;
 } psx_cdrom_t;
 
 enum
