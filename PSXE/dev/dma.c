@@ -3,6 +3,10 @@
 #include "../bus_init.h"
 #include "../bus_fast.h"
 #include "../log.h"
+#include "mdec.h"
+#include "cdrom/cdrom.h"
+#include "cdrom/queue.h"
+#include "ram.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -415,6 +419,39 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_mdec_out(psx_dma_
 
     uint32_t size = BCR_SIZE(mdec_out) * BCR_BCNT(mdec_out);
 
+    /*
+        Decoded video leaves the MDEC a word at a time through its data port,
+        which is just an indexed read of the output buffer - so a forward
+        transfer into guest RAM is a single copy. What does not fit the pattern
+        (or is left over) goes through the port as before.
+    */
+    if (!CHCR_STEP(mdec_out))
+    {
+        psx_mdec_t *mdec = dma->bus->mdec;
+
+        const uint32_t addr = dma->mdec_out.madr & 0x1ffffcu;
+
+        uint32_t n = mdec->output_words_remaining;
+
+        if (n > size)
+            n = size;
+
+        if (n && ((addr + n * 4u) <= 0x200000u) && ((dma->mdec_out.madr & 0x1fffffffu) < 0x200000u))
+        {
+            memcpy(dma->bus->ram->buf + addr, &((uint32_t *)mdec->output)[mdec->output_index], n * 4u);
+
+            mdec->output_index += n;
+            mdec->output_words_remaining -= n;
+
+            psx_jit_invalidate(addr, n * 4u);
+
+            dma->mdec_out.madr += n * 4u;
+            size -= n;
+        }
+    }
+
+    const uint32_t total = BCR_SIZE(mdec_out) * BCR_BCNT(mdec_out);
+
     for (int32_t i = 0; i < size; i++)
     {
         uint32_t data = psx_mdec_read32(dma->bus->mdec, 0);
@@ -424,7 +461,7 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_mdec_out(psx_dma_
         dma->mdec_out.madr += CHCR_STEP(mdec_out) ? -4 : 4;
     }
 
-    dma->mdec_out_irq_delay = size;
+    dma->mdec_out_irq_delay = total;
 
     dma->mdec_out.chcr = 0;
     dma->mdec_out.bcr = 0;
@@ -472,13 +509,43 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_gpu_request(psx_d
 
     if (CHCR_TDIR(gpu))
     {
-        for (int32_t i = 0; i < size; i++)
+        uint32_t left = size;
+
+        while (left)
         {
+            /*
+                Whole rows of pixel data go straight into VRAM. Only plain
+                forward transfers out of guest RAM qualify; everything else -
+                and every leftover word - takes the per word path below.
+            */
+            if (!CHCR_STEP(gpu))
+            {
+                const uint32_t addr = dma->gpu.madr & 0x1ffffcu;
+
+                if (addr < 0x200000u)
+                {
+                    const uint32_t room = (0x200000u - addr) >> 2;
+                    const uint32_t *src = (const uint32_t *)(dma->bus->ram->buf + addr);
+
+                    const uint32_t done = psx_gpu_write_bulk(dma->bus->gpu, src,
+                                                             (left < room) ? left : room);
+
+                    if (done)
+                    {
+                        dma->gpu.madr += done * 4u;
+                        left -= done;
+
+                        continue;
+                    }
+                }
+            }
+
             uint32_t data = psx_bus_fast_read32(dma->bus, dma->gpu.madr);
 
             psx_gpu_write32(dma->bus->gpu, 0, data);
 
             dma->gpu.madr += CHCR_STEP(gpu) ? -4 : 4;
+            left--;
         }
     }
     else
@@ -559,6 +626,41 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_cdrom(psx_dma_t *
 
     if (!CHCR_TDIR(cdrom))
     {
+        /*
+            A sector is popped out of the drive's data queue byte by byte, and
+            every one of those pops used to format a debug log line. A forward
+            transfer into guest RAM takes the bytes straight out of the queue
+            instead; the per byte path stays for whatever is left.
+        */
+        psx_cdrom_t *cd = dma->bus->cdrom;
+
+        if (!CHCR_STEP(cdrom) && cd->data_req && cd->data)
+        {
+            const uint32_t addr = dma->cdrom.madr & 0x1ffffcu;
+            const uint32_t have = (cd->data->write_index - cd->data->read_index) >> 2;
+
+            uint32_t n = (have < size) ? have : size;
+
+            if (n && ((addr + n * 4u) <= 0x200000u) && ((dma->cdrom.madr & 0x1fffffffu) < 0x200000u))
+            {
+                memcpy(dma->bus->ram->buf + addr, &cd->data->buf[cd->data->read_index], n * 4u);
+
+                cd->data->read_index += n * 4u;
+
+                /* same as queue_pop: an emptied queue starts over */
+                if (cd->data->read_index == cd->data->write_index)
+                {
+                    cd->data->read_index = 0;
+                    cd->data->write_index = 0;
+                }
+
+                psx_jit_invalidate(addr, n * 4u);
+
+                dma->cdrom.madr += n * 4u;
+                size -= n;
+            }
+        }
+
         for (int32_t i = 0; i < size; i++)
         {
             uint32_t data = 0;
@@ -706,9 +808,14 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_update(psx_dma_t *dm
 
     dma_latch_irq_flags(dma);
 
+    /* These two delays are lengths in device rounds of the original 21 cycle
+       slice; `cyc` is how many of those this round stands for, so a longer slice
+       does not stretch them in emulated time. */
+    const uint32_t rounds = (cyc > 0) ? (uint32_t)cyc : 1u;
+
     if (dma->mdec_in_irq_delay)
     {
-        --dma->mdec_in_irq_delay;
+        dma->mdec_in_irq_delay = (dma->mdec_in_irq_delay > rounds) ? (dma->mdec_in_irq_delay - rounds) : 0;
 
         if (!dma->mdec_in_irq_delay)
             if (dma->dicr & DICR_DMA0EN)
@@ -721,7 +828,7 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_update(psx_dma_t *dm
 
     if (dma->mdec_out_irq_delay)
     {
-        --dma->mdec_out_irq_delay;
+        dma->mdec_out_irq_delay = (dma->mdec_out_irq_delay > rounds) ? (dma->mdec_out_irq_delay - rounds) : 0;
 
         if (!dma->mdec_out_irq_delay)
             if (dma->dicr & DICR_DMA1EN)

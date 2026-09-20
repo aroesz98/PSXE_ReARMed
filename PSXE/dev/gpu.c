@@ -2646,6 +2646,71 @@ PSX_GPU_HOT void gpu_cmd_a0(psx_gpu_t *gpu)
     }
 }
 
+/*
+    Bulk CPU -> VRAM upload.
+
+    A DMA driven upload (command A0h) hands the GPU one word per call, and each
+    of those runs the whole command state machine to write two pixels. Video is
+    exactly that, word after word, and it dominated the DMA time: FF7's full
+    motion video pushes over a megabyte a second this way.
+
+    The data is already in the native VRAM pixel format, so whole rows can be
+    copied instead. This takes the common shape of such a transfer - starting at
+    a row boundary, an even number of pixels per row, an even destination, no
+    wrap in x - and copies row by row, leaving anything else to the per word
+    path, which stays the reference for correctness.
+
+    Returns the number of 32 bit words consumed, which may be zero.
+*/
+uint32_t PSX_GPU_HOT psx_gpu_write_bulk(psx_gpu_t *gpu, const uint32_t *src, uint32_t words)
+{
+    if (gpu->state != GPU_STATE_RECV_DATA)
+        return 0;
+
+    uint32_t used = 0;
+
+    while (words)
+    {
+        const uint32_t row = gpu->xsiz;
+
+        if (gpu->xcnt || (row & 1u) || (gpu->xpos & 1u))
+            break;
+
+        const uint32_t row_words = row >> 1;
+
+        if (!row_words || (words < row_words) || (gpu->tsiz < row))
+            break;
+
+        if ((gpu->xpos + row) > 1024u)
+            break;
+
+        const uint32_t ypos = (gpu->ypos + gpu->ycnt) & 0x1ffu;
+
+        memcpy(&gpu->vram[(ypos * 1024u) + gpu->xpos], src, row_words * 4u);
+
+        src += row_words;
+        used += row_words;
+        words -= row_words;
+
+        gpu->tsiz -= row;
+        gpu->ycnt++;
+
+        if (!gpu->tsiz)
+        {
+            gpu->xcnt = 0;
+            gpu->ycnt = 0;
+            gpu->state = GPU_STATE_RECV_CMD;
+
+            break;
+        }
+    }
+
+    if (used)
+        gpu->vram_dirty = 1;
+
+    return used;
+}
+
 // Monochrome Opaque Quadrilateral
 PSX_GPU_HOT void gpu_cmd_28(psx_gpu_t *gpu)
 {

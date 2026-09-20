@@ -196,4 +196,9 @@ void psx_gpu_set_event_callback(psx_gpu_t *, int, psx_gpu_event_callback_t);
 void *psx_gpu_get_display_buffer(psx_gpu_t *);
 void psx_gpu_update(psx_gpu_t *, int);
 
+/* Copies whole rows of a CPU -> VRAM transfer straight into VRAM, bypassing the
+   per word command path. Returns the 32 bit words consumed (possibly zero, in
+   which case the caller has to fall back to psx_gpu_write32). */
+uint32_t psx_gpu_write_bulk(psx_gpu_t *, const uint32_t *, uint32_t);
+
 #endif

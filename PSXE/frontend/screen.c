@@ -118,7 +118,23 @@ static void screen_repack_bgr555(const uint16_t *src, int32_t width, int32_t hei
         const uint16_t *s = src + (uint32_t)y * (PSX_GPU_FB_STRIDE / 2u);
         uint16_t *d = dst + (uint32_t)y * (uint32_t)width;
 
-        for (int32_t x = 0; x < width; x++)
+        int32_t x = 0;
+
+        /* two pixels per 32 bit operation; the loads may be unaligned (the
+           display window can start on an odd halfword), which the M7 handles */
+        for (; (x + 1) < width; x += 2)
+        {
+            uint32_t p;
+
+            __builtin_memcpy(&p, &s[x], 4);
+
+            const uint32_t o = ((p & 0x001f001fu) << 11) | ((p & 0x03e003e0u) << 1) |
+                               ((p >> 10) & 0x001f001fu);
+
+            __builtin_memcpy(&d[x], &o, 4);
+        }
+
+        for (; x < width; x++)
         {
             const uint32_t p = s[x];
 
@@ -194,7 +210,20 @@ static void screen_repack_rgb24(const uint8_t *src, int32_t width, int32_t heigh
         const uint8_t *s = src + (uint32_t)y * PSX_GPU_FB_STRIDE;
         uint16_t *d = dst + (uint32_t)y * (uint32_t)width;
 
-        for (int32_t x = 0; x < width; x++, s += 3)
+        int32_t x = 0;
+
+        /* one unaligned 32 bit load per pixel instead of three byte loads; the
+           last pixel of a row is done bytewise so nothing is read past it */
+        for (; x < (width - 1); x++, s += 3)
+        {
+            uint32_t p;
+
+            __builtin_memcpy(&p, s, 4);
+
+            d[x] = (uint16_t)(((p & 0xf8u) << 8) | ((p & 0xfc00u) >> 5) | ((p & 0xf80000u) >> 19));
+        }
+
+        for (; x < width; x++, s += 3)
             d[x] = (uint16_t)(((uint32_t)(s[0] & 0xf8u) << 8) | ((uint32_t)(s[1] & 0xfcu) << 3) |
                               ((uint32_t)s[2] >> 3));
     }
@@ -430,12 +459,7 @@ void psxe_screen_update(psxe_screen_t *screen)
 
                 psxe_gamepad_get_stats(&pad_frames, &pad_errors);
 
-    #if PSX_PROFILE
-            PRINTF("mdec: idct=%u yuv=%u blocks=%u\r\n",
-                   (unsigned)g_prof.mdec_idct, (unsigned)g_prof.mdec_yuv, (unsigned)g_prof.mdec_blk);
-#endif
-
-            PRINTF("disp: %dx%d %s mode=%03x yrange=%u..%u start=(%u,%u) | pad: %u/%u\r\n",
+                PRINTF("disp: %dx%d %s mode=%03x yrange=%u..%u start=(%u,%u) | pad: %u/%u\r\n",
                        (int)psx_get_display_width(screen->psx),
                        (int)psx_get_display_height(screen->psx),
                        psx_get_display_format(screen->psx) ? "24bpp" : "15bpp",

@@ -184,7 +184,99 @@ void real_idct(int16_t *blk, int16_t *scale)
     }
 }
 
-#define IDCT_FUNC(blk, scale) real_idct(blk, scale)
+/*
+    The same transform as real_idct, bit for bit, at a fraction of the cost.
+
+    real_idct is a plain 8x8 matrix product done twice: 1024 multiplies per block,
+    each with a division of the scale entry by eight. But an MDEC block is sparse
+    - a handful of coefficients out of 64, often just the DC term - so instead of
+    gathering every output from eight inputs, each input that is not zero is
+    scattered into the eight outputs it contributes to:
+
+      pass 1  out1[y][x] = sum over z of in[z][y] * S[z][x]
+              only the coefficients that are there do any work, and only the
+              rows y they touch can come out non zero
+      pass 2  the same product over out1, where whole rows are known to be zero
+
+    The sums are the same integers added in a different order, the rounding
+    division is the same expression, and the intermediate is truncated to 16 bits
+    like the original, so the result is identical. S is scale[] / 8, prepared
+    once per decode call by mdec_prepare_scale.
+*/
+static int16_t g_mdec_scale8[64];
+
+static void mdec_prepare_scale(const int16_t *scale)
+{
+    for (int32_t i = 0; i < 64; i++)
+        g_mdec_scale8[i] = (int16_t)((int32_t)scale[i] / 8);
+}
+
+static void mdec_idct_sparse(int16_t *blk)
+{
+    int32_t acc[64];
+    int16_t mid[64];
+    uint32_t rows = 0; /* rows of the intermediate that can be non zero */
+
+    for (int32_t i = 0; i < 64; i++)
+        acc[i] = 0;
+
+    for (int32_t i = 0; i < 64; i++)
+    {
+        const int32_t c = blk[i];
+
+        if (!c)
+            continue;
+
+        /* blk[y + z * 8] is in[z][y] */
+        const int32_t y = i & 7;
+        const int16_t *s = &g_mdec_scale8[i & ~7];
+        int32_t *a = &acc[y * 8];
+
+        rows |= 1u << y;
+
+        for (int32_t x = 0; x < 8; x++)
+            a[x] += c * (int32_t)s[x];
+    }
+
+    for (int32_t y = 0; y < 8; y++)
+    {
+        if (rows & (1u << y))
+        {
+            for (int32_t x = 0; x < 8; x++)
+                mid[x + y * 8] = (int16_t)((acc[x + y * 8] + 0xfff) / 0x2000);
+        }
+    }
+
+    for (int32_t i = 0; i < 64; i++)
+        acc[i] = 0;
+
+    /* mid[y + z * 8] is in[z][y] of the second pass: row z is one of `rows` */
+    for (int32_t z = 0; z < 8; z++)
+    {
+        if (!(rows & (1u << z)))
+            continue;
+
+        const int16_t *s = &g_mdec_scale8[z * 8];
+
+        for (int32_t y = 0; y < 8; y++)
+        {
+            const int32_t c = mid[y + z * 8];
+
+            if (!c)
+                continue;
+
+            int32_t *a = &acc[y * 8];
+
+            for (int32_t x = 0; x < 8; x++)
+                a[x] += c * (int32_t)s[x];
+        }
+    }
+
+    for (int32_t i = 0; i < 64; i++)
+        blk[i] = (int16_t)((acc[i] + 0xfff) / 0x2000);
+}
+
+#define IDCT_FUNC(blk, scale) mdec_idct_sparse(blk)
 
 uint16_t *rl_decode_block(int16_t *blk, uint16_t *src, uint8_t *quant, int16_t *scale)
 {
@@ -257,7 +349,77 @@ uint16_t *rl_decode_block(int16_t *blk, uint16_t *src, uint8_t *quant, int16_t *
 //     next x
 //   next y
 
+/*
+    One chroma sample covers a 2x2 cell of luma, so its contribution to red, green
+    and blue is worked out once per cell instead of once per pixel, and the output
+    format is decided per block rather than per pixel. The arithmetic is the
+    original's, expression for expression, so the pixels are identical.
+*/
 void yuv_to_rgb(psx_mdec_t *mdec, uint8_t *buf, int32_t xx, int32_t yy)
+{
+    PROF_T0(t_yuv);
+
+    const int32_t flip = mdec->output_signed ? 0 : 0x80;
+    const int32_t depth15 = (mdec->output_depth == 3);
+    const uint16_t bit15 = mdec->output_bit15 ? 0x8000u : 0u;
+
+    for (int32_t cy = 0; cy < 4; cy++)
+    {
+        for (int32_t cx = 0; cx < 4; cx++)
+        {
+            const int32_t ci = ((xx >> 1) + cx) + ((yy >> 1) + cy) * 8;
+
+            int16_t cr = mdec->crblk[ci];
+            int16_t cb = mdec->cbblk[ci];
+            const int16_t cg = (-0.3437 * (float)cb) + (-0.7143 * (float)cr);
+
+            cr = (1.402 * (float)cr);
+            cb = (1.772 * (float)cb);
+
+            for (int32_t py = 0; py < 2; py++)
+            {
+                for (int32_t px = 0; px < 2; px++)
+                {
+                    const int32_t x = cx * 2 + px;
+                    const int32_t y = cy * 2 + py;
+
+                    const int16_t l = mdec->yblk[x + y * 8];
+
+                    int16_t r = CLAMP(l + cr, -128, 127);
+                    int16_t g = CLAMP(l + cg, -128, 127);
+                    int16_t b = CLAMP(l + cb, -128, 127);
+
+                    r ^= flip;
+                    g ^= flip;
+                    b ^= flip;
+
+                    const int32_t o = (x + xx) + (y + yy) * 16;
+
+                    if (depth15)
+                    {
+                        const uint16_t rgb = (uint16_t)(((((uint8_t)b) >> 3) << 10) |
+                                                        ((((uint8_t)g) >> 3) << 5) |
+                                                        (((uint8_t)r) >> 3) | bit15);
+
+                        buf[0 + o * 2] = rgb & 0xff;
+                        buf[1 + o * 2] = rgb >> 8;
+                    }
+                    else
+                    {
+                        buf[0 + o * 3] = r & 0xff;
+                        buf[1 + o * 3] = g & 0xff;
+                        buf[2 + o * 3] = b & 0xff;
+                    }
+                }
+            }
+        }
+    }
+
+    PROF_ADD(mdec_yuv, t_yuv);
+}
+
+/* the original, kept as the reference the fast version is checked against */
+void yuv_to_rgb_reference(psx_mdec_t *mdec, uint8_t *buf, int32_t xx, int32_t yy)
 {
     PROF_T0(t_yuv);
 
@@ -315,6 +477,8 @@ void mdec_nop(psx_mdec_t *mdec) { /* Do nothing */ }
 
 void mdec_decode_macroblock(psx_mdec_t *mdec)
 {
+    mdec_prepare_scale(mdec->scale_table);
+
     if (mdec->output_depth < 2)
     {
         // Use static buffer instead of dynamic allocation

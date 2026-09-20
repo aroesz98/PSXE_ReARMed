@@ -178,6 +178,9 @@ void psx_prof_tick(void)
 
     uint32_t other = elapsed - g_prof.cpu - g_prof.dev;
 
+    PRINTF("PROF-MDEC idct=%u yuv=%u blocks=%u\r\n",
+           (unsigned)g_prof.mdec_idct, (unsigned)g_prof.mdec_yuv, (unsigned)g_prof.mdec_blk);
+
     PRINTF("PROF inst=%u ecyc=%u | cpu=%u gp0=%u dma=%u | dev=%u (cd=%u gpu=%u pad=%u tmr=%u dma=%u) blit=%u bwait=%u | other=%u | frames=%u gp0cmds=%u px=%u (f=%u s=%u t4=%u t8=%u t15=%u r=%u fast=%u tr=%u raw=%u) | elapsed=%u\r\n",
            g_prof.instr, g_prof.ecycles,
            g_prof.cpu, g_prof.gp0, g_prof.dmax,
@@ -262,9 +265,12 @@ void psx_prof_tick(void)
 /* Emulated CPU cycles executed between two device update rounds.
    The devices only need ~scanline resolution; updating them after every
    single instruction cost more than the interpreter itself.
-   Must stay well below the GPU hblank window (~54 CPU cycles) so no
-   hblank/vblank edge can be stepped over. */
-#define PSX_DEV_SLICE_CYCLES 21
+   Must stay well below the GPU hblank window so no hblank/vblank edge can be
+   stepped over: that window is 853 GPU cycles, about 538 CPU cycles now that the
+   GPU:CPU clock ratio is right (it was a tenth of that, hence the old 21). A
+   block may overshoot the slice by one block's worth of cycles, which is why
+   this stays far away from the limit. */
+#define PSX_DEV_SLICE_CYCLES 64
 #define PSX_DEV_SLICE_MAX_STEPS 32
 
 void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_update(psx_t *psx)
@@ -320,8 +326,8 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_update(psx_t *psx)
     PROF_ADD(d_timer, t_d4);
 
     PROF_T0(t_d5);
-    /* DMA delays are counted in update rounds, not in cycles */
-    psx_dma_update(psx->dma, steps);
+    /* DMA delays are counted in rounds of the original 21 cycle slice */
+    psx_dma_update(psx->dma, (int32_t)((acc + 20u) / 21u));
     PROF_ADD(d_dma, t_d5);
 
     PROF_ADD(dev, t_dev);
