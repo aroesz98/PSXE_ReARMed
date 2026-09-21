@@ -22,6 +22,8 @@
 #include "touch.h"
 #include "gamepad.h"
 
+#include "dev/cdrom/disc.h"
+
 #define MENU_MAX_GAMES 64
 
 #define MENU_NAME_MAX 72
@@ -219,6 +221,162 @@ static void menu_scan_dir(const char *path)
     f_closedir(&dir);
 }
 
+/*
+    A multi track disc is a cue sheet and a file per track, and only the sheet is
+    the game: whatever a sheet on the card names as one of its FILEs comes off
+    the list. (Tekken 3 is three files; the data track alone is big enough to
+    pass for an image, and an audio track would be listed and never start.)
+*/
+static char __attribute__((section(".bss.$BOARD_SDRAM"))) g_sheet_text[8192];
+
+static uint32_t menu_dir_len(const char *path)
+{
+    uint32_t len = 0;
+
+    for (uint32_t i = 0; path[i]; i++)
+    {
+        if (path[i] == '/')
+            len = i + 1u;
+    }
+
+    return len;
+}
+
+/* `a`, which is a_len long, against the string b, ignoring case */
+static int menu_same_text(const char *a, uint32_t a_len, const char *b)
+{
+    for (uint32_t i = 0; i < a_len; i++)
+    {
+        char ca = a[i];
+        char cb = b[i];
+
+        if ((ca >= 'A') && (ca <= 'Z'))
+            ca = (char)(ca + 32);
+
+        if ((cb >= 'A') && (cb <= 'Z'))
+            cb = (char)(cb + 32);
+
+        if (!cb || (ca != cb))
+            return 0;
+    }
+
+    return b[a_len] == 0;
+}
+
+static void menu_drop_track(const char *sheet_path, const char *name, uint32_t name_len)
+{
+    const uint32_t dir_len = menu_dir_len(sheet_path);
+
+    for (int32_t j = 0; j < g_count; j++)
+    {
+        const menu_entry_t *e = &g_entries[j];
+
+        /* an image of any kind, in the directory of the sheet, by that name */
+        if (e->kind[0] == 'C')
+            continue;
+
+        if ((menu_dir_len(e->path) != dir_len) || strncmp(e->path, sheet_path, dir_len))
+            continue;
+
+        if (!menu_same_text(name, name_len, e->path + dir_len))
+            continue;
+
+        for (int32_t k = j; k < (g_count - 1); k++)
+            g_entries[k] = g_entries[k + 1];
+
+        g_count--;
+        j--;
+    }
+}
+
+static void menu_drop_cue_tracks(void)
+{
+    /* the sheets are looked up by path, because dropping entries moves them */
+    for (int32_t i = 0; i < g_count; i++)
+    {
+        if (g_entries[i].kind[0] != 'C')
+            continue;
+
+        char sheet_path[MENU_PATH_MAX];
+
+        snprintf(sheet_path, sizeof(sheet_path), "%s", g_entries[i].path);
+
+        FIL file;
+        UINT got = 0;
+
+        if (FR_OK != f_open(&file, sheet_path, FA_READ))
+            continue;
+
+        if (FR_OK != f_read(&file, g_sheet_text, sizeof(g_sheet_text) - 1u, &got))
+            got = 0;
+
+        f_close(&file);
+
+        g_sheet_text[got] = 0;
+
+        for (const char *p = g_sheet_text; *p;)
+        {
+            while ((*p == ' ') || (*p == '\t'))
+                p++;
+
+            const char *line_end = p;
+
+            while (*line_end && (*line_end != '\n') && (*line_end != '\r'))
+                line_end++;
+
+            if (menu_same_text(p, 4, "FILE") && ((p[4] == ' ') || (p[4] == '\t')))
+            {
+                const char *name = p + 5;
+                const char *name_end;
+
+                while ((name < line_end) && ((*name == ' ') || (*name == '\t')))
+                    name++;
+
+                if ((name < line_end) && (*name == '"'))
+                {
+                    name_end = ++name;
+
+                    while ((name_end < line_end) && (*name_end != '"'))
+                        name_end++;
+                }
+                else
+                {
+                    /* without quotes the last word is the type */
+                    name_end = line_end;
+
+                    while ((name_end > name) && (name_end[-1] != ' ') && (name_end[-1] != '\t'))
+                        name_end--;
+
+                    while ((name_end > name) && ((name_end[-1] == ' ') || (name_end[-1] == '\t')))
+                        name_end--;
+                }
+
+                /* a sheet may carry the path the image had where it was made */
+                for (const char *q = name; q < name_end; q++)
+                {
+                    if ((*q == '/') || (*q == '\\'))
+                        name = q + 1;
+                }
+
+                if (name_end > name)
+                    menu_drop_track(sheet_path, name, (uint32_t)(name_end - name));
+            }
+
+            p = line_end;
+
+            while ((*p == '\n') || (*p == '\r'))
+                p++;
+        }
+
+        /* this sheet may be somewhere else now */
+        for (int32_t k = 0; k < g_count; k++)
+        {
+            if (!strcmp(g_entries[k].path, sheet_path))
+                i = k;
+        }
+    }
+}
+
 static void menu_sort(void)
 {
     for (int32_t i = 1; i < g_count; i++)
@@ -275,6 +433,7 @@ static void menu_scan(void)
     menu_scan_dir("/psx");
     menu_scan_dir("/PSX");
 
+    menu_drop_cue_tracks();
     menu_sort();
 
     PRINTF("menu: %d disc image(s) on the card\r\n", (int)g_count);
@@ -415,6 +574,113 @@ static int32_t menu_index_at(int32_t y, int32_t scroll)
     return (index < g_count) ? index : -1;
 }
 
+/* A card with a few lines of text over the list, until a tap, a button or some
+   seconds have passed. */
+static void menu_message(const char *title, const char *text)
+{
+    char lines[4][80];
+    int32_t count = 0;
+
+    /* words into lines that fit the card */
+    {
+        const int32_t max_w = 380;
+        char line[80] = "";
+
+        for (const char *p = text; *p && (count < 4);)
+        {
+            char word[48];
+            uint32_t n = 0;
+
+            while (*p == ' ')
+                p++;
+
+            while (*p && (*p != ' ') && (n < (sizeof(word) - 1u)))
+                word[n++] = *p++;
+
+            word[n] = 0;
+
+            if (!n)
+                break;
+
+            char tried[130];
+
+            snprintf(tried, sizeof(tried), "%s%s%s", line, line[0] ? " " : "", word);
+
+            if ((ui_text_width(&ui_font_small, tried) > max_w) && line[0])
+            {
+                snprintf(lines[count++], sizeof(lines[0]), "%s", line);
+                snprintf(line, sizeof(line), "%s", word);
+            }
+            else
+            {
+                snprintf(line, sizeof(line), "%s", tried);
+            }
+        }
+
+        if (line[0] && (count < 4))
+            snprintf(lines[count++], sizeof(lines[0]), "%s", line);
+    }
+
+    const int32_t card_h = 64 + count * 20;
+    const int32_t card_y = (UI_HEIGHT - card_h) / 2;
+
+    uint32_t prev_buttons = psxe_gamepad_raw_buttons();
+    int32_t was_down = 1;
+
+    for (int32_t frame = 0; frame < 480; frame++)
+    {
+        ui_begin();
+
+        ui_vgradient(0, 0, UI_WIDTH, UI_HEIGHT, COL_BG_TOP, COL_BG_BOTTOM);
+        ui_round_rect(30, card_y, UI_WIDTH - 60, card_h, 14, COL_CARD_SEL);
+        ui_round_rect(30, card_y, 5, card_h, 2, COL_ACCENT);
+        ui_text(&ui_font_body, 52, card_y + 32, UI_WIDTH - 104, title, COL_TEXT);
+
+        for (int32_t i = 0; i < count; i++)
+            ui_text(&ui_font_small, 52, card_y + 58 + i * 20, UI_WIDTH - 104, lines[i], COL_TEXT_DIM);
+
+        ui_present();
+
+        int32_t tx = 0;
+        int32_t ty = 0;
+        const int32_t down = psxe_touch_read(&tx, &ty);
+
+        psxe_gamepad_poll();
+
+        const uint32_t buttons = psxe_gamepad_raw_buttons();
+
+        /* not within the first moments: the press that chose the game is still there */
+        if ((frame > 30) && ((down && !was_down) || (buttons & ~prev_buttons)))
+            break;
+
+        was_down = down;
+        prev_buttons = buttons;
+    }
+}
+
+/* The chosen image is looked at before the console is started with it, so that
+   one that cannot run says why instead of ending in the BIOS shell. */
+static int32_t menu_start(int32_t selected, int32_t scroll, char *path, uint32_t path_size)
+{
+    for (int32_t i = 0; i < 24; i++)
+        menu_draw(selected, scroll, -1, 1);
+
+    if (psx_disc_probe(g_entries[selected].path) == CDT_ERROR)
+    {
+        PRINTF("menu: %s cannot be started: %s\r\n", g_entries[selected].path, psx_disc_last_error());
+
+        menu_message("This one cannot be started", psx_disc_last_error());
+
+        return 0;
+    }
+
+    snprintf(path, path_size, "%s", g_entries[selected].path);
+
+    PRINTF("menu: starting %s\r\n", g_entries[selected].path);
+
+    return 1;
+}
+
 int32_t psxe_menu_pick(char *path, uint32_t path_size)
 {
     menu_scan();
@@ -472,18 +738,9 @@ int32_t psxe_menu_pick(char *path, uint32_t path_size)
     }
 #endif
 
-    if (g_count == 1)
-    {
-        /* nothing to choose from, but show what is loading for a moment */
-        for (int32_t i = 0; i < 30; i++)
-            menu_draw(0, 0, -1, 1);
-
-        snprintf(path, path_size, "%s", g_entries[0].path);
-
-        PRINTF("menu: only one image, starting %s\r\n", g_entries[0].path);
-
+    /* nothing to choose from: straight in, unless it turns out not to be a game */
+    if ((g_count == 1) && menu_start(0, 0, path, path_size))
         return 1;
-    }
 
     for (;;)
     {
@@ -537,14 +794,10 @@ int32_t psxe_menu_pick(char *path, uint32_t path_size)
             {
                 selected = press_index;
 
-                for (int32_t i = 0; i < 24; i++)
-                    menu_draw(selected, scroll, -1, 1);
+                if (menu_start(selected, scroll, path, path_size))
+                    return 1;
 
-                snprintf(path, path_size, "%s", g_entries[selected].path);
-
-                PRINTF("menu: starting %s\r\n", g_entries[selected].path);
-
-                return 1;
+                warmup = 20;
             }
 
             press_index = -1;
@@ -578,14 +831,10 @@ int32_t psxe_menu_pick(char *path, uint32_t path_size)
 
         if (pressed & ((1u << PSXE_DS_CROSS) | (1u << PSXE_DS_OPTIONS)))
         {
-            for (int32_t i = 0; i < 24; i++)
-                menu_draw(selected, scroll, -1, 1);
+            if (menu_start(selected, scroll, path, path_size))
+                return 1;
 
-            snprintf(path, path_size, "%s", g_entries[selected].path);
-
-            PRINTF("menu: starting %s\r\n", g_entries[selected].path);
-
-            return 1;
+            warmup = 20;
         }
 
         menu_draw(selected, scroll, press_index, 0);

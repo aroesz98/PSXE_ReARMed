@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -105,6 +106,29 @@ void psx_spu_init(psx_spu_t *spu, psx_ic_t *ic)
     spu->irq9addr = 0xffff;
 }
 
+/* The registers a game writes end at 1F801DFFh. From 1F801E00h on the SPU shows
+   its own state (the current volume of each voice); in psx_spu_t that is where
+   the transfer address and the FIFO are, and a write must not reach them. */
+#define SPU_REG_BYTES 0x200
+
+_Static_assert((offsetof(psx_spu_t, taddr) - offsetof(psx_spu_t, voice)) == SPU_REG_BYTES, "SPU register block");
+
+/*
+    The transfer address has 19 bits and goes round at the end of sound RAM. A
+    game can count on that without meaning to: DMA moves whole blocks, so a
+    sample bank that ends at the top of sound RAM is sent with whatever follows
+    it in the file, and that tail lands at address 0. (Tekken 3 does it before
+    a fight; here it landed in whatever the heap had after the 512 KB, which was
+    the sector buffer of the CD-ROM.) The address is always even.
+*/
+static inline void spu_transfer_write(psx_spu_t *spu, uint16_t value)
+{
+    spu->ram[spu->taddr] = value & 0xff;
+    spu->ram[spu->taddr + 1] = value >> 8;
+
+    spu->taddr = (spu->taddr + 2) & SPU_RAM_MASK;
+}
+
 uint32_t psx_spu_read32(psx_spu_t *spu, uint32_t offset)
 {
     const uint8_t *ptr = (uint8_t *)&spu->voice[0].volumel;
@@ -118,7 +142,7 @@ uint16_t psx_spu_read16(psx_spu_t *spu, uint32_t offset)
     {
         uint16_t data = *(uint16_t *)(&spu->ram[spu->taddr]);
 
-        spu->taddr += 2;
+        spu->taddr = (spu->taddr + 2) & SPU_RAM_MASK;
 
         return data;
     }
@@ -137,10 +161,23 @@ uint8_t psx_spu_read8(psx_spu_t *spu, uint32_t offset)
 
 void spu_read_block(psx_spu_t *spu, int32_t v)
 {
-    uint32_t addr = spu->data[v].current_addr;
-    uint8_t hdr = spu->ram[addr];
+    uint32_t addr = spu->data[v].current_addr & SPU_RAM_MASK;
 
-    spu->data[v].block_flags = spu->ram[addr + 1];
+    /* a block that starts within the last 16 bytes continues at address 0 */
+    uint8_t wrapped[16];
+    const uint8_t *block = &spu->ram[addr];
+
+    if (addr > (SPU_RAM_SIZE - 16))
+    {
+        for (uint32_t i = 0; i < 16; i++)
+            wrapped[i] = spu->ram[(addr + i) & SPU_RAM_MASK];
+
+        block = wrapped;
+    }
+
+    uint8_t hdr = block[0];
+
+    spu->data[v].block_flags = block[1];
 
     unsigned hdr_shift = hdr & 0x0f;
 
@@ -155,7 +192,7 @@ void spu_read_block(psx_spu_t *spu, int32_t v)
 
     for (int32_t j = 0; j < 28; j++)
     {
-        uint16_t n = (spu->ram[addr + 2 + (j >> 1)] >> ((j & 1) * 4)) & 0xf;
+        uint16_t n = (block[2 + (j >> 1)] >> ((j & 1) * 4)) & 0xf;
 
         // Sign extend t
         int16_t t = (int16_t)(n << 12) >> 12;
@@ -422,17 +459,18 @@ int32_t spu_handle_write(psx_spu_t *spu, uint32_t offset, uint32_t value)
     case SPUR_TFIFO:
     {
         spu->ramdtf = value;
-        spu->tfifo[spu->tfifo_index++] = value;
+
+        /* 32 words is all the FIFO holds: what is written to a full one that no
+           transfer empties is lost (and here it would run into tfifo_index) */
+        if (spu->tfifo_index < 32)
+            spu->tfifo[spu->tfifo_index++] = value;
 
         if (spu->tfifo_index == 32)
         {
             if (((spu->spucnt >> 4) & 3) == 2)
             {
                 for (int32_t i = 0; i < spu->tfifo_index; i++)
-                {
-                    spu->ram[spu->taddr++] = spu->tfifo[i] & 0xff;
-                    spu->ram[spu->taddr++] = spu->tfifo[i] >> 8;
-                }
+                    spu_transfer_write(spu, spu->tfifo[i]);
 
                 spu->tfifo_index = 0;
             }
@@ -449,10 +487,7 @@ int32_t spu_handle_write(psx_spu_t *spu, uint32_t offset, uint32_t value)
         if ((value >> 4) & 3)
         {
             for (int32_t i = 0; i < spu->tfifo_index; i++)
-            {
-                spu->ram[spu->taddr++] = spu->tfifo[i] & 0xff;
-                spu->ram[spu->taddr++] = spu->tfifo[i] >> 8;
-            }
+                spu_transfer_write(spu, spu->tfifo[i]);
 
             spu->tfifo_index = 0;
         }
@@ -476,6 +511,9 @@ void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_spu_write32(psx_spu_t *s
     if (spu_handle_write(spu, offset, value))
         return;
 
+    if (offset >= SPU_REG_BYTES)
+        return;
+
     const uint8_t *ptr = (uint8_t *)&spu->voice[0];
 
     *((uint32_t *)(ptr + offset)) = value;
@@ -485,6 +523,9 @@ void __attribute__((section(".ramfunc.$SRAM_DTC"))) psx_spu_write16(psx_spu_t *s
 {
     // Handle special cases first
     if (spu_handle_write(spu, offset, value))
+        return;
+
+    if (offset >= SPU_REG_BYTES)
         return;
 
     const uint8_t *ptr = (uint8_t *)&spu->voice[0].volumel;
@@ -660,7 +701,7 @@ uint32_t psx_spu_get_sample(psx_spu_t *spu)
                     psx_ic_irq(spu->ic, IC_SPU);
                 }
 
-                spu->data[v].current_addr += 0x10;
+                spu->data[v].current_addr = (spu->data[v].current_addr + 0x10) & SPU_RAM_MASK;
 
                 if (((spu->irq9addr << 3) == spu->data[v].current_addr) && (spu->spucnt & 0x40))
                 {

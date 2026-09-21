@@ -633,12 +633,10 @@ void *psx_get_vram(psx_t *psx)
 
 uint32_t psx_get_display_width(psx_t *psx)
 {
-    int32_t width = psx_get_dmode_width(psx);
-
-    if (width == 368)
-        width = 384;
-
-    return width;
+    /* The 368 pixel mode is 368 pixels. This used to say 384, and the sixteen
+       columns too many are whatever lies in VRAM right of the picture: Tekken 3,
+       which keeps its textures there, had a strip of them down the right edge. */
+    return psx_get_dmode_width(psx);
 }
 
 uint32_t psx_get_display_height(psx_t *psx)

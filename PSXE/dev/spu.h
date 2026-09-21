@@ -10,6 +10,7 @@
 #define PSX_SPU_END 0x1f801fff
 
 #define SPU_RAM_SIZE 0x80000
+#define SPU_RAM_MASK (SPU_RAM_SIZE - 1)
 
 /*
     1F801D88h - Voice 0..23 Key ON (Start Attack/Decay/Sustain) (KON) (W)

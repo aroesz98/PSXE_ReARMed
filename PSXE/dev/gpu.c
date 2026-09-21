@@ -144,7 +144,7 @@ static inline int gpu_rect_in_window(const psx_gpu_t *gpu, uint32_t x0, uint32_t
 
     const uint32_t mode = gpu->display_mode;
 
-    uint32_t w = (mode & 0x40u) ? 384u : hres[mode & 3u];
+    uint32_t w = (mode & 0x40u) ? 368u : hres[mode & 3u];
 
     if (mode & 0x10u)
         w = (w * 3u + 1u) / 2u; /* 24 bpp: three bytes per pixel in 16 bit cells */

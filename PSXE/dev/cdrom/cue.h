@@ -1,7 +1,6 @@
 #ifndef CUE_H
 #define CUE_H
 
-#include "list.h"
 #include "disc.h"
 
 #include <stdint.h>
@@ -13,58 +12,43 @@ enum
     CUE_OK = 0,
     CUE_FILE_NOT_FOUND,
     CUE_TRACK_FILE_NOT_FOUND,
-    CUE_TRACK_READ_ERROR
+    CUE_TRACK_READ_ERROR,
+    CUE_BAD_SHEET,   /* no FILE, no TRACK, or more of them than fit */
+    CUE_BAD_IMAGE,   /* a bare image that is neither raw nor ISO 9660 */
+    CUE_NINTENDO     /* a GameCube or Wii disc, which also come as .iso */
 };
 
+/* track modes, as they are spelled in a cue sheet */
 enum
 {
-    CUE_4CH = 0,
-    CUE_AIFF,
-    CUE_AUDIO,
-    CUE_BINARY,
-    CUE_CATALOG,
+    CUE_AUDIO = 0,
     CUE_CDG,
     CUE_CDI_2336,
     CUE_CDI_2352,
-    CUE_CDTEXTFILE,
-    CUE_DCP,
-    CUE_FILE,
-    CUE_FLAGS,
-    CUE_INDEX,
-    CUE_ISRC,
     CUE_MODE1_2048,
     CUE_MODE1_2352,
     CUE_MODE2_2336,
     CUE_MODE2_2352,
-    CUE_MOTOROLA,
-    CUE_MP3,
-    CUE_PERFORMER,
-    CUE_POSTGAP,
-    CUE_PRE,
-    CUE_PREGAP,
-    CUE_REM,
-    CUE_SCMS,
-    CUE_SONGWRITER,
-    CUE_TITLE,
-    CUE_TRACK,
-    CUE_WAVE,
     CUE_NONE = 255
 };
 
 enum
 {
-    LD_BUFFERED,
+    LD_BUFFERED, /* (not supported on this target: an image does not fit in RAM) */
     LD_FILE
 };
 
+#define CUE_MAX_TRACKS 99
+#define CUE_MAX_FILES 99
+
 typedef struct
 {
-    char *name;
-    int32_t buf_mode;
-    void *buf;
-    uint32_t size;
-    uint32_t start;
-    list_t *tracks;
+    char *name;           /* path on the card                          */
+    uint32_t size;        /* bytes                                     */
+    uint32_t data_offset; /* where the sectors begin: a WAVE header    */
+    uint32_t start;       /* LBA of its first sector on the disc       */
+    uint32_t frames;      /* sectors of the disc it accounts for       */
+    uint8_t wave;
 } cue_file_t;
 
 typedef struct
@@ -72,29 +56,43 @@ typedef struct
     int32_t number;
     int32_t mode;
 
-    int32_t index[2];
-    uint32_t pregap;
-    uint32_t start;
-    uint32_t end;
-
-    cue_file_t *file;
+    int32_t index[2];      /* frames into the file, -1: not given             */
+    uint32_t pregap;       /* PREGAP: sectors of silence that are in no file  */
+    uint32_t sector_bytes; /* 2352, 2336 or 2048                              */
+    uint32_t file;         /* which of the files                              */
+    uint32_t file_byte;    /* where its first sector is in that file          */
+    uint32_t first;        /* LBA of that sector                              */
+    uint32_t pre_start;    /* first LBA that counts as this track (its pregap)*/
+    uint32_t start;        /* LBA of INDEX 01: what the table of contents says*/
+    uint32_t end;          /* one past its last sector                        */
 } cue_track_t;
 
 typedef struct
 {
-    list_t *files;
-    list_t *tracks;
+    cue_file_t files[CUE_MAX_FILES];
+    cue_track_t tracks[CUE_MAX_TRACKS];
+    uint32_t file_count;
+    uint32_t track_count;
 
-    char c;
-    FIL file;
-    char *file_buffer;
-    uint32_t buffer_pos;
-    uint32_t buffer_size;
+    /* one file is open at a time: a disc can have dozens of audio tracks, each
+       in a file of its own, and an open file costs more than half a kilobyte */
+    FIL fil;
+    int32_t open_file; /* -1: none */
+
+    uint32_t last_track; /* where the last sector was found */
 } cue_t;
 
 cue_t *cue_create(void);
 void cue_init(cue_t *cue);
+
+/* a cue sheet ... */
 int32_t cue_parse(cue_t *cue, const char *path);
+
+/* ... or an image on its own - .bin, .img, .iso - as one data track: raw 2352
+   byte sectors or the 2048 byte sectors of a plain ISO 9660 image */
+int32_t cue_open_image(cue_t *cue, const char *path);
+
+/* sizes the files and lays the tracks out on the disc */
 int32_t cue_load(cue_t *cue, int32_t mode);
 
 // Disc interface

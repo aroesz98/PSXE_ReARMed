@@ -74,4 +74,12 @@ int32_t psx_disc_get_track_lba(psx_disc_t *disc, int32_t track);
 void psx_disc_close(psx_disc_t *disc);
 void psx_disc_destroy(psx_disc_t *disc);
 
+/* Opens an image just to see what it is, and closes it again: the CDT_ type.
+   For the game picker, which wants to say why an image cannot be played before
+   the console is started with it. */
+int32_t psx_disc_probe(const char *path);
+
+/* Why the last open or probe came back with CDT_ERROR, as a sentence ("" when it did not) */
+const char *psx_disc_last_error(void);
+
 #endif
