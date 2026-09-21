@@ -58,7 +58,8 @@ extern "C" {
 #define PSX_JIT_H_MEM 32u       /* uint32_t f(cpu, pc, addr, d) access that is not RAM    */
 #define PSX_JIT_H_EXIT_LINK 36u /* not called: jumped to, with a link in r3, to leave      */
 #define PSX_JIT_H_PC_DELTA 40u  /* not a function: from a link to its guest address        */
-#define PSX_JIT_H_COUNT 11u
+#define PSX_JIT_H_SPAD 44u      /* not a function: the scratchpad buffer, for H_MEM's stub */
+#define PSX_JIT_H_COUNT 12u
 
 /*
     What PSX_JIT_H_MEM is told about the access, so it does not have to fetch and

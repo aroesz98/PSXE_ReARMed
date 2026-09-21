@@ -337,68 +337,15 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_load_at(p
 }
 
 /*
-    Escape of a natively translated load or store whose address is not plain RAM.
-
-    Nearly all of those are the scratchpad - FF7 keeps its 3D working set there -
-    and that is memory like any other, so it is served here, from what the block
-    passes along about the access, at a fraction of an interpreter step (whose
-    fetch alone is a data cache miss). Anything else, and anything misaligned,
-    still goes to the interpreter, which does the device access or raises the
-    address error.
+    Escape of a natively translated load or store whose address is not plain RAM:
+    what psx_jit_mem_fast below does not serve itself. A store into a page that
+    holds translated code is done here, everything else goes to the interpreter,
+    which does the device access or raises the address error.
 */
-uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_mem_escape(psx_cpu_t *cpu, uint32_t pc,
-                                                                           uint32_t addr, uint32_t desc)
+uint32_t __attribute__((used, section(".ramfunc.$SRAM_ITC"))) psx_jit_mem_escape(psx_cpu_t *cpu, uint32_t pc,
+                                                                                 uint32_t addr, uint32_t desc)
 {
-    const uint32_t off = (addr & 0x1fffffffu) - PSX_SPAD_FAST_BASE;
     const uint32_t size = PSX_JIT_MD_SIZE(desc);
-
-    if ((off < PSX_SPAD_FAST_SIZE) && !(addr & (size - 1u)))
-    {
-        uint8_t *const p = cpu->bus->scratchpad->buf + off;
-        const uint32_t rt = PSX_JIT_MD_RT(desc);
-
-        if (desc & PSX_JIT_MD_STORE)
-        {
-            const uint32_t v = cpu->r[rt];
-
-            if (size == 4u)
-                *(uint32_t *)p = v;
-            else if (size == 2u)
-                *(uint16_t *)p = (uint16_t)v;
-            else
-                *p = (uint8_t)v;
-        }
-        else
-        {
-            uint32_t v;
-
-            if (size == 4u)
-                v = *(const uint32_t *)p;
-            else if (size == 2u)
-                v = (desc & PSX_JIT_MD_SIGNED) ? (uint32_t)(int32_t)*(const int16_t *)p : *(const uint16_t *)p;
-            else
-                v = (desc & PSX_JIT_MD_SIGNED) ? (uint32_t)(int32_t)*(const int8_t *)p : *p;
-
-            if (desc & PSX_JIT_MD_PENDING)
-            {
-                /* as the interpreter leaves it: the next instruction, which
-                   the block has interpreted, applies it */
-                cpu->load_d = rt;
-                cpu->load_v = v;
-            }
-            else if (rt)
-            {
-                cpu->r[rt] = v;
-            }
-        }
-
-        const uint32_t cycles = 2u + cpu->bus->scratchpad->bus_delay;
-
-        g_jit_cycles += cycles;
-        cpu->total_cycles += cycles;
-
-        return 0u;
-    }
 
     /* A store into RAM only gets here because its page holds translated code.
        Most of those hit the data that lives next to the code: written right
@@ -420,9 +367,8 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_mem_escape(psx_c
         if (g_jit_page_cells[phys >> PSX_JIT_PAGE_SHIFT] & jit_cell_mask(phys, size))
             psx_jit_invalidate(phys, size);
 
-        g_jit_cycles += 2u;
-        cpu->total_cycles += 2u;
-
+        /* no cycles to add: the block counts two for the instruction whichever
+           way the store went, and RAM has no bus delay on top of that */
         return 0u;
     }
 
@@ -430,6 +376,101 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_mem_escape(psx_c
         return psx_jit_interp_op_at(cpu, pc);
 
     return psx_jit_interp_load_at(cpu, pc);
+}
+
+/*
+    What a block calls for an access that is not plain RAM (PSX_JIT_H_MEM): r0 cpu,
+    r1 guest pc, r2 guest address, r3 the PSX_JIT_MD_* description of the access.
+
+    Nearly all of those are the scratchpad - FF7 keeps its 3D working set there,
+    some 165 000 accesses a second in a battle - and that is memory like any
+    other. It used to be served by the C function above, at about 90 cycles a
+    time with the call, the decoding of the description and the way back; this
+    does an aligned scratchpad access in about twenty instructions and no stack,
+    and hands everything else on as it came. (Putting the test into the blocks
+    themselves would cost thirty bytes per load and store, and with them the
+    room the hot blocks have in the ITCM.)
+
+    The access costs the two cycles the block counts for any instruction, which
+    is what the interpreter charges: the scratchpad has no bus delay. The pending
+    load of a delay slot hazard goes into load_d / load_v, as the interpreter
+    leaves it.
+*/
+uint32_t psx_jit_mem_fast(psx_cpu_t *cpu, uint32_t pc, uint32_t addr, uint32_t desc);
+
+_Static_assert((offsetof(psx_cpu_t, load_d) == 152u) && (offsetof(psx_cpu_t, load_v) == 156u),
+               "psx_jit_mem_fast stores load_d / load_v at fixed offsets");
+_Static_assert(offsetof(psx_cpu_t, r) == 0u, "psx_jit_mem_fast indexes the guest registers from the cpu");
+_Static_assert(PSX_JIT_H_SPAD == 44u, "psx_jit_mem_fast reads the scratchpad address from [r9, #44]");
+_Static_assert((PSX_JIT_MD_STORE == 0x100u) && (PSX_JIT_MD_PENDING == 0x200u) && (PSX_JIT_MD_SIGNED == 0x80u),
+               "psx_jit_mem_fast tests these bits of the description");
+
+__attribute__((naked, noinline, used, section(".ramfunc.$SRAM_ITC")))
+uint32_t psx_jit_mem_fast(psx_cpu_t *cpu, uint32_t pc, uint32_t addr, uint32_t desc)
+{
+    __asm__(
+        "bic r12, r2, #0xe0000000\n"
+        "sub r12, r12, #0x1f800000\n"
+        "cmp r12, #0x400\n"
+        "bhs 9f\n"
+        "tst r3, #0x60\n"
+        "beq 1f\n"
+        "tst r3, #0x40\n"
+        "ite ne\n"
+        "tstne r2, #3\n"
+        "tsteq r2, #1\n"
+        "bne 9f\n"
+        "1:\n"
+        "ldr r0, [r9, #44]\n"
+        "add r0, r0, r12\n"
+        "and r12, r3, #0x1f\n"
+        "tst r3, #0x100\n"
+        "bne 5f\n"
+        "tst r3, #0x40\n"
+        "beq 2f\n"
+        "ldr r1, [r0]\n"
+        "b 4f\n"
+        "2:\n"
+        "tst r3, #0x20\n"
+        "beq 3f\n"
+        "tst r3, #0x80\n"
+        "ite ne\n"
+        "ldrshne r1, [r0]\n"
+        "ldrheq r1, [r0]\n"
+        "b 4f\n"
+        "3:\n"
+        "tst r3, #0x80\n"
+        "ite ne\n"
+        "ldrsbne r1, [r0]\n"
+        "ldrbeq r1, [r0]\n"
+        "4:\n"
+        "tst r3, #0x200\n"
+        "bne 6f\n"
+        "cmp r12, #0\n"
+        "it ne\n"
+        "strne r1, [r4, r12, lsl #2]\n"
+        "b 8f\n"
+        "6:\n"
+        "strd r12, r1, [r4, #152]\n"
+        "b 8f\n"
+        "5:\n"
+        "ldr r1, [r4, r12, lsl #2]\n"
+        "tst r3, #0x40\n"
+        "beq 7f\n"
+        "str r1, [r0]\n"
+        "b 8f\n"
+        "7:\n"
+        "tst r3, #0x20\n"
+        "ite ne\n"
+        "strhne r1, [r0]\n"
+        "strbeq r1, [r0]\n"
+        "8:\n"
+        "movs r0, #0\n"
+        "bx lr\n"
+        "9:\n"
+        "mov r0, r4\n"
+        "b psx_jit_mem_escape\n"
+    );
 }
 
 /* LWC2 / SWC2 */
@@ -523,12 +564,16 @@ static uint32_t jit_get_block(uint32_t pc)
     return i;
 }
 
+static inline void jit_data_words_forget(void);
+
 void psx_jit_reset(void)
 {
     memset(g_jit_hash, 0, sizeof(g_jit_hash));
     memset(g_jit_page_head, 0, sizeof(g_jit_page_head));
     memset(g_jit_page_cells, 0, sizeof(g_jit_page_cells));
     memset(g_psx_jit_code_pages, 0, sizeof(g_psx_jit_code_pages));
+
+    jit_data_words_forget();
 
     g_jit_block_count = 0;
     g_jit_master_used = 0;
@@ -561,7 +606,7 @@ void psx_jit_init(void)
     g_jit_regs.helpers[PSX_JIT_H_GTE_READ / 4u] = (uint32_t)(uintptr_t)&psx_cpu_gte_read;
     g_jit_regs.helpers[PSX_JIT_H_GTE_WRITE / 4u] = (uint32_t)(uintptr_t)&psx_cpu_gte_write;
     g_jit_regs.helpers[PSX_JIT_H_GTE_MEM / 4u] = (uint32_t)(uintptr_t)&psx_jit_gte_transfer;
-    g_jit_regs.helpers[PSX_JIT_H_MEM / 4u] = (uint32_t)(uintptr_t)&psx_jit_mem_escape;
+    g_jit_regs.helpers[PSX_JIT_H_MEM / 4u] = (uint32_t)(uintptr_t)&psx_jit_mem_fast;
     g_jit_regs.helpers[PSX_JIT_H_EXIT_LINK / 4u] = (uint32_t)(uintptr_t)&psx_jit_exit_link | 1u;
     g_jit_regs.helpers[PSX_JIT_H_PC_DELTA / 4u] = (uint32_t)(uintptr_t)g_jit_pc - (uint32_t)(uintptr_t)g_jit_link;
 
@@ -591,6 +636,27 @@ static void jit_kill_block(uint32_t i)
     g_jit_cold[i - 1u].page_next = 0;
 }
 
+/*
+    Words that are known to hold no code although their 32 byte cell does.
+
+    The cell map cannot tell a variable from the function it sits right behind,
+    and for a store into such a cell every block of the page has to be looked at
+    - some forty of them, each with its record in SDRAM. In an FF7 battle that
+    was 1.4 million blocks looked at in thirty seconds, to find the 42 that had
+    really been overwritten: one per cent of the machine. So a store that turned
+    out to touch no block leaves its word here, and the next store to it is
+    waved through. Whatever is translated next may well be at one of these
+    words, so translating anything forgets them all.
+*/
+#define PSX_JIT_DATA_WORDS 64u
+
+static uint32_t __attribute__((section(".bss.$SRAM_DTC"))) g_jit_data_word[PSX_JIT_DATA_WORDS]; /* address | 1 */
+
+static inline void jit_data_words_forget(void)
+{
+    memset(g_jit_data_word, 0, sizeof(g_jit_data_word));
+}
+
 void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_invalidate(uint32_t addr, uint32_t size)
 {
     if ((addr & 0x1fffffffu) >= 0x200000u)
@@ -598,6 +664,16 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_invalidate(uint32_t 
 
     const uint32_t lo = addr & 0x1fffffu;
     const uint32_t hi = lo + (size ? size : 1u); /* exclusive */
+
+    /* a store that stays inside one word: the only kind worth remembering */
+    const uint32_t word = lo & ~3u;
+    const uint32_t slot = (word >> 2) & (PSX_JIT_DATA_WORDS - 1u);
+    const int small = (hi <= (word + 4u));
+
+    if (small && (g_jit_data_word[slot] == (word | 1u)))
+        return;
+
+    int word_clear = 1;
     const uint32_t first = lo >> PSX_JIT_PAGE_SHIFT;
     const uint32_t last = (hi - 1u) >> PSX_JIT_PAGE_SHIFT;
 
@@ -634,9 +710,13 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_invalidate(uint32_t 
                 jit_kill_block(i);
 
                 killed++;
+                word_clear = 0;
             }
             else
             {
+                if ((b_lo < (word + 4u)) && ((b_lo + b_len) > word))
+                    word_clear = 0; /* code in the rest of the word */
+
                 cells |= jit_cell_mask(b_lo, b_len);
                 link_to_me = &m->page_next;
             }
@@ -649,6 +729,9 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_invalidate(uint32_t 
 
         /* what is left of the page */
         jit_page_set_cells(p, cells);
+
+        if (small && word_clear)
+            g_jit_data_word[slot] = word | 1u;
     }
 }
 
@@ -824,6 +907,7 @@ static uint32_t jit_compile(psx_cpu_t *cpu, uint32_t pc)
     }
 
     g_jit_regs.ram = (uint32_t)(uintptr_t)cpu->bus->ram->buf;
+    g_jit_regs.helpers[PSX_JIT_H_SPAD / 4u] = (uint32_t)(uintptr_t)cpu->bus->scratchpad->buf;
 
     const uint32_t index = jit_get_block(pc);
 
@@ -906,6 +990,8 @@ static uint32_t jit_compile(psx_cpu_t *cpu, uint32_t pc)
         const uint32_t b_len = jit_block_span(index, &b_lo);
 
         jit_page_set_cells(page, g_jit_page_cells[page] | jit_cell_mask(b_lo, b_len));
+
+        jit_data_words_forget(); /* this block may cover one of them */
     }
 
     PROF_ADD(jit_cmp, t_cmp);
