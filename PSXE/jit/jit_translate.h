@@ -11,11 +11,21 @@
     RAM accesses run as native code.
 
     Host register usage inside a block:
-      r0..r3  scratch / helper arguments
+      r0..r3  scratch / helper arguments (r3: where the block goes next)
       r4      psx_cpu_t *
       r5      emulated cycles of the natively translated instructions
       r6      base of the guest RAM buffer
       r7      base of the "this page holds translated code" table
+      r8      cycle budget: a block only hands over to the next one below it
+      r9      table of helper entry points
+      r10     where a block returns to (the dispatcher's entry stub)
+
+    A block has no prologue or epilogue of its own - the entry stub sets the
+    registers up once and every block leaves through r10 - and it holds no
+    address that depends on where it sits: branches stay inside the block,
+    helpers are called through r9 and other blocks are reached through their
+    link. That makes a block a plain run of bytes that can be copied between the
+    code tiers.
 */
 
 #include <stdint.h>
@@ -23,7 +33,6 @@
 
 #include "jit_emit.h"
 #include "../cpu.h"
-#include "../bus_fast.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +42,53 @@ extern "C" {
 #define PSX_JIT_CYC PSX_R5
 #define PSX_JIT_RAM PSX_R6
 #define PSX_JIT_PAGES PSX_R7
+#define PSX_JIT_BUDGET PSX_R8
+#define PSX_JIT_HELPERS PSX_R9
+#define PSX_JIT_EXIT PSX_R10
+
+/* slots of the helper table, as byte offsets from r9 */
+#define PSX_JIT_H_INTERP 0u     /* uint32_t f(cpu)              run one instruction       */
+#define PSX_JIT_H_INTERP_AT 4u  /* uint32_t f(cpu, pc)          ... after publishing pc   */
+#define PSX_JIT_H_LOAD_AT 8u    /* uint32_t f(cpu, pc)          ... and apply the load    */
+#define PSX_JIT_H_DELAY 12u     /* void f(cpu, pc, next_pc)     run a branch delay slot   */
+#define PSX_JIT_H_GTE 16u       /* int32_t f(cpu, opcode)       GTE command               */
+#define PSX_JIT_H_GTE_READ 20u  /* uint32_t f(cpu, reg)         MFC2 / CFC2               */
+#define PSX_JIT_H_GTE_WRITE 24u /* void f(cpu, reg, value)      MTC2 / CTC2               */
+#define PSX_JIT_H_GTE_MEM 28u   /* uint32_t f(cpu, pc, opcode)  LWC2 / SWC2               */
+#define PSX_JIT_H_MEM 32u       /* uint32_t f(cpu, pc, addr, d) access that is not RAM    */
+#define PSX_JIT_H_COUNT 9u
+
+/*
+    What PSX_JIT_H_MEM is told about the access, so it does not have to fetch and
+    decode the instruction: the scratchpad is served right there, everything else
+    goes to the interpreter as before.
+*/
+#define PSX_JIT_MD_RT(d) ((d) & 0x1fu)
+#define PSX_JIT_MD_SIZE(d) (1u << (((d) >> 5) & 3u))
+#define PSX_JIT_MD_SIGNED 0x080u
+#define PSX_JIT_MD_STORE 0x100u
+#define PSX_JIT_MD_PENDING 0x200u /* a load: leave it in the load delay slot */
+
+/*
+    A link is how blocks refer to each other: the entry point of the block at a
+    guest address. It exists from the moment some block branches to that address,
+    before anything has been compiled for it - until then (and again after the
+    block has been invalidated) the entry point is the dispatcher's, so jumping
+    through a link is always safe. Moving a block between the code tiers only has
+    to update its one link.
+*/
+typedef struct
+{
+    uint32_t code; /* host entry point (Thumb) */
+    uint32_t pc;   /* guest address           */
+} psx_jit_link_t;
+
+#define PSX_JIT_LINK_CODE 0u
+#define PSX_JIT_LINK_PC 4u
+
+/* what a block ending branch leaves in r3 */
+#define PSX_JIT_EXIT_PC 0   /* the guest pc: the block returns to the dispatcher */
+#define PSX_JIT_EXIT_LINK 1 /* the link of the next block: it may be run directly */
 
 /* Guest RAM window test: bits 28:21 are zero exactly for the three RAM mirrors
    (KUSEG / KSEG0 / KSEG1, low 2 MB). Scratchpad, I/O, BIOS and the cache
@@ -62,15 +118,20 @@ typedef struct
     psx_emit_t *e;
     uint32_t guest;         /* address of the instruction being translated */
     uint32_t next_op;       /* the instruction that follows it             */
-    uint32_t helper_interp; /* psx_jit_interp_op                           */
-    uint32_t helper_mem;    /* psx_jit_interp_load                         */
     uint16_t **exits;       /* branches that leave the block               */
     uint32_t *exit_count;
     uint32_t exit_max;
     int force_next;         /* the next instruction must be interpreted    */
     int cycles_done;        /* the instruction accounted for its own cycles*/
-    uint32_t helper_gte;    /* psx_cpu_gte_command                         */
-    psx_bus_t *bus;         /* to read the instructions a branch leads to  */
+    int exit_mode;          /* PSX_JIT_EXIT_*: what the ending branch left in r3 */
+
+    /* guest code, to look at the instructions a branch leads to */
+    uint32_t (*read32)(void *ud, uint32_t addr);
+
+    /* address of the link for the block at pc, 0 when none can be had */
+    uint32_t (*get_link)(void *ud, uint32_t pc);
+
+    void *ud;
 } psx_jit_ctx_t;
 
 /* offsets of the load delay slot, written by natively translated loads whose
@@ -149,6 +210,21 @@ static inline void psx_jit_commit_pc_reg(psx_emit_t *e)
     }
 }
 
+/* The end of a block whose r3 holds the link of the next one: publish the pc
+   that block starts at - whatever happens next finds the guest state complete -
+   and, while the slice still has cycles left, run it without going back to the
+   dispatcher. Falls through when the budget is used up. */
+static inline void psx_jit_emit_chain(psx_emit_t *e)
+{
+    psx_emit_ldr_imm(e, PSX_R0, PSX_R3, PSX_JIT_LINK_PC);
+    psx_emit_add_imm12(e, PSX_R1, PSX_R0, 4);
+    psx_emit_strd_imm(e, PSX_R0, PSX_R1, PSX_JIT_CPU, PSX_JIT_OFF_PC);
+
+    psx_emit_cmp_reg(e, PSX_JIT_CYC, PSX_JIT_BUDGET);
+    psx_emit_it(e, PSX_CC_CC); /* unsigned lower */
+    psx_emit_ldr_pc(e, PSX_R3, PSX_JIT_LINK_CODE);
+}
+
 /* Loads a constant into r3 with a fixed two instruction sequence, so it can sit
    inside an IT block. */
 static inline void psx_jit_pc_const(psx_emit_t *e, uint32_t value)
@@ -160,15 +236,33 @@ static inline void psx_jit_pc_const(psx_emit_t *e, uint32_t value)
 /* "Run this one instruction in the interpreter, leave the block if control flow
    diverged." Used for untranslatable instructions and as the escape hatch of
    the native memory fast paths. */
-static inline void psx_jit_emit_interp_call(psx_jit_ctx_t *c, int publish_pc, uint32_t helper)
+/* Calls a helper through the table in r9. The helpers live in ITCM and OCRAM
+   while a block may run from SDRAM, far outside BL range - and a PC relative
+   call would not survive the block being copied anyway. */
+static inline void psx_jit_emit_call(psx_emit_t *e, uint32_t slot)
 {
-    if (publish_pc)
-        psx_jit_publish_pc(c->e, c->guest);
+    psx_emit_ldr_imm(e, PSX_R12, PSX_JIT_HELPERS, slot);
+    psx_emit_blx(e, PSX_R12);
+}
 
-    /* The helper compares against cpu->saved_pc itself, so the block does not
-       have to materialise the expected pc. */
+static inline void psx_jit_emit_interp_call(psx_jit_ctx_t *c, int publish_pc, int is_load)
+{
     psx_emit_mov(c->e, PSX_R0, PSX_JIT_CPU);
-    psx_emit_bl(c->e, helper);
+
+    /* The helper publishes the pc itself when it is handed one: that is two
+       instructions here instead of the four it takes to store pc / next_pc.
+       It also compares against cpu->saved_pc, so the block does not have to
+       materialise the pc it expects back. */
+    if (publish_pc)
+    {
+        psx_emit_imm32(c->e, PSX_R1, c->guest);
+        psx_jit_emit_call(c->e, is_load ? PSX_JIT_H_LOAD_AT : PSX_JIT_H_INTERP_AT);
+    }
+    else
+    {
+        psx_jit_emit_call(c->e, PSX_JIT_H_INTERP);
+    }
+
     psx_emit_cmp_imm8(c->e, PSX_R0, 0);
 
     psx_jit_add_exit(c, psx_emit_bcond_fwd(c->e, PSX_CC_NE));
@@ -176,7 +270,32 @@ static inline void psx_jit_emit_interp_call(psx_jit_ctx_t *c, int publish_pc, ui
 
 static inline void psx_jit_emit_interp_one(psx_jit_ctx_t *c, int publish_pc)
 {
-    psx_jit_emit_interp_call(c, publish_pc, c->helper_interp);
+    psx_jit_emit_interp_call(c, publish_pc, 0);
+}
+
+/* Escape of an instruction that sits in a branch delay slot: hand it to the
+   interpreter with the branch pending. The helper sets pc to the delay slot,
+   next_pc to the branch target and the branch flag, so the interpreter runs it
+   as a delay slot and leaves pc at the target - or at an exception vector with
+   the right EPC and BD bit, which is why this path never hands over to the next
+   block. The interpreter accounts for the delay slot's cycles, the branch's are
+   added here. c->guest is the delay slot, r3 what the branch left there. */
+static inline void psx_jit_emit_delay_escape(psx_jit_ctx_t *c)
+{
+    psx_emit_t *const e = c->e;
+
+    psx_emit_mov(e, PSX_R0, PSX_JIT_CPU);
+    psx_emit_imm32(e, PSX_R1, c->guest);
+
+    if (c->exit_mode == PSX_JIT_EXIT_LINK)
+        psx_emit_ldr_imm(e, PSX_R2, PSX_R3, PSX_JIT_LINK_PC);
+    else
+        psx_emit_mov(e, PSX_R2, PSX_R3);
+
+    psx_jit_emit_call(e, PSX_JIT_H_DELAY);
+
+    psx_emit_add_imm12(e, PSX_JIT_CYC, PSX_JIT_CYC, 2);
+    psx_emit_bx(e, PSX_JIT_EXIT);
 }
 
 /* Does this instruction read guest register r? Conservative. */
@@ -201,6 +320,28 @@ static inline int psx_jit_reads_reg(uint32_t op, uint32_t r)
 
     if ((o >= 0x28) && (o <= 0x2e))
         return (PSX_RS(op) == r) || (PSX_RT(op) == r);
+
+    /* COP2. These matter: 3D code is one load after another with GTE register
+       moves in between, and treating those as "touches everything" sent every
+       such load through the load delay slot and the move to the interpreter. */
+    if (o == 0x12)
+    {
+        if (op & 0x02000000u)
+            return 0; /* a GTE command works on GTE registers only */
+
+        const uint32_t rs = PSX_RS(op);
+
+        if ((rs == 0x04) || (rs == 0x06)) /* MTC2 / CTC2 */
+            return PSX_RT(op) == r;
+
+        if ((rs == 0x00) || (rs == 0x02)) /* MFC2 / CFC2 */
+            return 0;
+
+        return 1;
+    }
+
+    if ((o == 0x32) || (o == 0x3a)) /* LWC2 / SWC2: the base register */
+        return PSX_RS(op) == r;
 
     return 1;
 }
@@ -239,6 +380,25 @@ static inline int psx_jit_writes_reg(uint32_t op, uint32_t r)
         return PSX_RT(op) == r;
 
     if ((o >= 0x28) && (o <= 0x2e))
+        return 0;
+
+    if (o == 0x12)
+    {
+        if (op & 0x02000000u)
+            return 0;
+
+        const uint32_t rs = PSX_RS(op);
+
+        if ((rs == 0x00) || (rs == 0x02)) /* MFC2 / CFC2 */
+            return PSX_RT(op) == r;
+
+        if ((rs == 0x04) || (rs == 0x06)) /* MTC2 / CTC2 */
+            return 0;
+
+        return 1;
+    }
+
+    if ((o == 0x32) || (o == 0x3a)) /* LWC2 / SWC2 */
         return 0;
 
     return 1;
@@ -500,7 +660,16 @@ static inline int psx_jit_translate_alu(psx_emit_t *e, uint32_t op)
     flags and escapes to the interpreter when V is set - the interpreter is what
     raises the exception, with the correct EPC.
 */
-static inline int psx_jit_translate_trap_alu(psx_jit_ctx_t *c, uint32_t op)
+static inline int psx_jit_is_trap_alu(uint32_t op)
+{
+    const uint32_t o = PSX_OP(op);
+
+    return (o == 0x08) || ((o == 0x00) && ((PSX_FN(op) == 0x20) || (PSX_FN(op) == 0x22)));
+}
+
+/* in_delay: the instruction is the delay slot of the branch being translated -
+   r3 is taken, and an overflow has to reach the interpreter as a delay slot */
+static inline int psx_jit_translate_trap_alu_ex(psx_jit_ctx_t *c, uint32_t op, int in_delay)
 {
     psx_emit_t *const e = c->e;
 
@@ -554,44 +723,134 @@ static inline int psx_jit_translate_trap_alu(psx_jit_ctx_t *c, uint32_t op)
             psx_emit_adds_reg(e, PSX_R0, PSX_R0, PSX_R1);
     }
 
-    uint16_t *overflow = psx_emit_bcond_fwd(e, PSX_CC_VS);
+    uint16_t *overflow = psx_emit_bcond_short_fwd(e, PSX_CC_VS);
 
     psx_jit_st_reg(e, PSX_R0, dst);
 
-    uint16_t *done = psx_emit_b_fwd(e);
+    uint16_t *done = psx_emit_b_short_fwd(e);
 
-    psx_emit_patch_bcond(overflow, PSX_CC_VS, psx_emit_here(e));
+    psx_emit_patch_bcond_short(e, overflow, PSX_CC_VS, psx_emit_here(e));
 
-    psx_jit_emit_interp_one(c, 1);
+    if (in_delay)
+        psx_jit_emit_delay_escape(c);
+    else
+        psx_jit_emit_interp_one(c, 1);
 
-    psx_emit_patch_b(done, psx_emit_here(e));
+    psx_emit_patch_b_short(e, done, psx_emit_here(e));
 
     return 1;
+}
+
+static inline int psx_jit_translate_trap_alu(psx_jit_ctx_t *c, uint32_t op)
+{
+    return psx_jit_translate_trap_alu_ex(c, op, 0);
 }
 
 /* --------------------------------------------------------------- GTE */
 
 /*
-    GTE commands become one indirect call. The helper lives in OCRAM, which is
-    far outside BL range from the ITCM code cache, so the call goes through r12;
-    it also returns the cycle count, which is why the block adds r0 to the cycle
-    counter instead of carrying a copy of the timing table.
+    GTE commands become one call. The helper returns the cycle count, which is
+    why the block adds r0 to the cycle counter instead of carrying a copy of the
+    timing table.
 
-    Everything else on COP2 (MFC2 / CFC2 / MTC2 / CTC2) keeps the interpreter:
-    those carry a load delay.
+    The register moves are a call each as well. MTC2 / CTC2 are plain writes.
+    MFC2 / CFC2 are loads, with the load delay of one: like a memory load, the
+    value goes straight into the guest register when the next instruction does
+    not touch it, and into the load delay slot - with the next instruction
+    interpreted, which applies it - when it does.
 */
 static inline int psx_jit_translate_cop2(psx_jit_ctx_t *c, uint32_t op)
 {
-    if ((PSX_OP(op) != 0x12) || !(op & 0x02000000u))
+    if (PSX_OP(op) != 0x12)
+        return 0;
+
+    psx_emit_t *const e = c->e;
+
+    if (!(op & 0x02000000u))
+    {
+        const uint32_t rt = PSX_RT(op);
+        const uint32_t rd = PSX_RD(op);
+
+        switch (PSX_RS(op))
+        {
+        case 0x04: /* MTC2 */
+        case 0x06: /* CTC2 */
+        {
+            psx_emit_mov(e, PSX_R0, PSX_JIT_CPU);
+            psx_emit_mov_imm8(e, PSX_R1, rd + ((PSX_RS(op) == 0x06) ? 32u : 0u));
+            psx_jit_ld_reg(e, PSX_R2, rt);
+            psx_jit_emit_call(e, PSX_JIT_H_GTE_WRITE);
+
+            return 1;
+        }
+
+        case 0x00: /* MFC2 */
+        case 0x02: /* CFC2 */
+        {
+            psx_emit_mov(e, PSX_R0, PSX_JIT_CPU);
+            psx_emit_mov_imm8(e, PSX_R1, rd + ((PSX_RS(op) == 0x02) ? 32u : 0u));
+            psx_jit_emit_call(e, PSX_JIT_H_GTE_READ);
+
+            if (rt == 0)
+                return 1; /* the read has no side effects and nowhere to go */
+
+            if (psx_jit_reads_reg(c->next_op, rt) || psx_jit_writes_reg(c->next_op, rt))
+            {
+                psx_emit_mov_imm8(e, PSX_R1, rt);
+
+                if ((PSX_JIT_OFF_LOAD_V == (PSX_JIT_OFF_LOAD_D + 4u)) &&
+                    ((PSX_JIT_OFF_LOAD_D & 3u) == 0u) && (PSX_JIT_OFF_LOAD_D <= 1020u))
+                {
+                    psx_emit_strd_imm(e, PSX_R1, PSX_R0, PSX_JIT_CPU, PSX_JIT_OFF_LOAD_D);
+                }
+                else
+                {
+                    psx_emit_str_imm(e, PSX_R1, PSX_JIT_CPU, PSX_JIT_OFF_LOAD_D);
+                    psx_emit_str_imm(e, PSX_R0, PSX_JIT_CPU, PSX_JIT_OFF_LOAD_V);
+                }
+
+                c->force_next = 1;
+            }
+            else
+            {
+                psx_jit_st_reg(e, PSX_R0, rt);
+            }
+
+            return 1;
+        }
+
+        default:
+            return 0;
+        }
+    }
+
+    psx_emit_mov(e, PSX_R0, PSX_JIT_CPU);
+    psx_emit_imm32(e, PSX_R1, op);
+    psx_jit_emit_call(e, PSX_JIT_H_GTE);
+    psx_emit_add_reg(e, PSX_JIT_CYC, PSX_JIT_CYC, PSX_R0);
+
+    c->cycles_done = 1;
+
+    return 1;
+}
+
+/* LWC2 / SWC2: one call into the interpreter's handlers, see psx_cpu_gte_transfer.
+   The helper accounts for the cycles itself. */
+static inline int psx_jit_translate_gte_mem(psx_jit_ctx_t *c, uint32_t op)
+{
+    if ((PSX_OP(op) != 0x32u) && (PSX_OP(op) != 0x3au))
         return 0;
 
     psx_emit_t *const e = c->e;
 
     psx_emit_mov(e, PSX_R0, PSX_JIT_CPU);
-    psx_emit_imm32(e, PSX_R1, op);
-    psx_emit_imm32(e, PSX_R12, c->helper_gte);
-    psx_emit_blx(e, PSX_R12);
-    psx_emit_add_reg(e, PSX_JIT_CYC, PSX_JIT_CYC, PSX_R0);
+    psx_emit_imm32(e, PSX_R1, c->guest);
+    psx_emit_imm32(e, PSX_R2, op);
+    psx_jit_emit_call(e, PSX_JIT_H_GTE_MEM);
+
+    psx_emit_cmp_imm8(e, PSX_R0, 0);
+
+    psx_jit_add_exit(c, psx_emit_bcond_fwd(e, PSX_CC_NE));
 
     c->cycles_done = 1;
 
@@ -621,7 +880,7 @@ static inline int psx_jit_translate_div(psx_jit_ctx_t *c, uint32_t op)
 
     psx_emit_cmp_imm8(e, PSX_R1, 0);
 
-    uint16_t *zero = psx_emit_bcond_fwd(e, PSX_CC_EQ);
+    uint16_t *zero = psx_emit_bcond_short_fwd(e, PSX_CC_EQ);
 
     if (is_signed)
         psx_emit_sdiv(e, PSX_R2, PSX_R0, PSX_R1);
@@ -632,9 +891,9 @@ static inline int psx_jit_translate_div(psx_jit_ctx_t *c, uint32_t op)
 
     psx_emit_strd_imm(e, PSX_R3, PSX_R2, PSX_JIT_CPU, PSX_JIT_OFF_HI);
 
-    uint16_t *done = psx_emit_b_fwd(e);
+    uint16_t *done = psx_emit_b_short_fwd(e);
 
-    psx_emit_patch_bcond(zero, PSX_CC_EQ, psx_emit_here(e));
+    psx_emit_patch_bcond_short(e, zero, PSX_CC_EQ, psx_emit_here(e));
 
     /* divisor zero: hi = numerator, lo = 0xffffffff, or +1 when the signed
        numerator is negative */
@@ -649,7 +908,7 @@ static inline int psx_jit_translate_div(psx_jit_ctx_t *c, uint32_t op)
 
     psx_emit_strd_imm(e, PSX_R0, PSX_R2, PSX_JIT_CPU, PSX_JIT_OFF_HI);
 
-    psx_emit_patch_b(done, psx_emit_here(e));
+    psx_emit_patch_b_short(e, done, psx_emit_here(e));
 
     return 1;
 }
@@ -691,7 +950,7 @@ static inline void psx_jit_emit_addr(psx_emit_t *e, uint32_t rs, uint32_t simm, 
         psx_emit_tst_imm12(e, PSX_R0, align_mask);
     }
 
-    slots[(*slot_count)++] = psx_emit_bcond_fwd(e, PSX_CC_NE);
+    slots[(*slot_count)++] = psx_emit_bcond_short_fwd(e, PSX_CC_NE);
 
     psx_emit_bic_imm12(e, PSX_R1, PSX_R0, psx_thumb_expand_imm(0xe0000000u));
 }
@@ -804,13 +1063,20 @@ static inline int psx_jit_translate_mem_ex(psx_jit_ctx_t *c, uint32_t op, uint32
         psx_jit_ld_reg(e, PSX_R2, rt);
 
         /* A store into a page some block was translated from has to invalidate
-           it, and the generic write path is what does that. r12 is the scratch
-           here: inside a delay slot r3 carries the pc the block leaves behind. */
-        psx_emit_shift_imm(e, 1, PSX_R12, PSX_R1, 10); /* 1 KB page index */
-        psx_emit_ldrb_reg(e, PSX_R12, PSX_JIT_PAGES, PSX_R12);
-        psx_emit_cmp_imm12(e, PSX_R12, 0);
+           it, and the generic write path is what does that. Inside a delay slot
+           r3 says where the block goes next, so the scratch is r12 there - which
+           costs the wide encodings; everywhere else r3 is free. */
+        const uint32_t tmp = (flags & PSX_JIT_MEM_DELAY) ? PSX_R12 : PSX_R3;
 
-        escapes[escape_count++] = psx_emit_bcond_fwd(e, PSX_CC_NE);
+        psx_emit_shift_imm(e, 1, tmp, PSX_R1, 10); /* 1 KB page index */
+        psx_emit_ldrb_reg(e, tmp, PSX_JIT_PAGES, tmp);
+
+        if (PSX_EMIT_LOW(tmp))
+            psx_emit_cmp_imm8(e, tmp, 0);
+        else
+            psx_emit_cmp_imm12(e, tmp, 0);
+
+        escapes[escape_count++] = psx_emit_bcond_short_fwd(e, PSX_CC_NE);
 
         if (size == 4)
             psx_emit_str_reg(e, PSX_R2, PSX_JIT_RAM, PSX_R1);
@@ -820,34 +1086,19 @@ static inline int psx_jit_translate_mem_ex(psx_jit_ctx_t *c, uint32_t op, uint32
             psx_emit_strb_reg(e, PSX_R2, PSX_JIT_RAM, PSX_R1);
     }
 
-    /* In a delay slot the pc the block leaves behind is already in place, so the
-       fast path falls through to it and the escape, which ends the block itself,
-       is laid out after it. */
-    if (flags & PSX_JIT_MEM_DELAY)
-        psx_jit_commit_pc_reg(e);
-
-    /* fast path done: jump over the escape code */
-    uint16_t *done = psx_emit_b_fwd(e);
+    /* fast path done: jump over the escape code. In a delay slot that leads to
+       the end of the block, where the pc is committed; the escape ends the block
+       itself. */
+    uint16_t *done = psx_emit_b_short_fwd(e);
 
     const uint32_t escape_here = psx_emit_here(e);
 
     for (uint32_t i = 0; i < escape_count; i++)
-        psx_emit_patch_bcond(escapes[i], PSX_CC_NE, escape_here);
+        psx_emit_patch_bcond_short(e, escapes[i], PSX_CC_NE, escape_here);
 
     if (flags & PSX_JIT_MEM_DELAY)
     {
-        /* Hand the delay slot to the interpreter with the branch pending:
-           pc is the delay slot, next_pc the branch target in r3 and branch is
-           set, so the interpreter runs it as a delay slot and leaves pc at the
-           target. The block ends right after, so the result is not checked. */
-        psx_emit_imm32(e, PSX_R0, c->guest);
-        psx_emit_str_imm(e, PSX_R0, PSX_JIT_CPU, PSX_JIT_OFF_PC);
-        psx_emit_str_imm(e, PSX_R3, PSX_JIT_CPU, PSX_JIT_OFF_NEXT_PC);
-        psx_emit_mov_imm8(e, PSX_R0, 1);
-        psx_emit_str_imm(e, PSX_R0, PSX_JIT_CPU, PSX_JIT_OFF_BRANCH);
-
-        psx_emit_mov(e, PSX_R0, PSX_JIT_CPU);
-        psx_emit_bl(e, c->helper_interp);
+        psx_jit_emit_delay_escape(c);
     }
     else
     {
@@ -855,13 +1106,23 @@ static inline int psx_jit_translate_mem_ex(psx_jit_ctx_t *c, uint32_t op, uint32
            slot, and native code never applies a pending load - so unless the
            block wants it pending anyway, the escape uses the helper that
            applies it before returning. */
-        psx_jit_emit_interp_call(c, 1,
-                                 (is_load && !(flags & PSX_JIT_MEM_PENDING))
-                                     ? c->helper_mem
-                                     : c->helper_interp);
+        /* r0 still holds the guest address: both escapes leave it alone */
+        const uint32_t desc = rt | ((size == 4u) ? 0x40u : ((size == 2u) ? 0x20u : 0u)) |
+                              (is_signed ? PSX_JIT_MD_SIGNED : 0u) | (is_load ? 0u : PSX_JIT_MD_STORE) |
+                              ((flags & PSX_JIT_MEM_PENDING) ? PSX_JIT_MD_PENDING : 0u);
+
+        psx_emit_mov(e, PSX_R2, PSX_R0);
+        psx_emit_mov(e, PSX_R0, PSX_JIT_CPU);
+        psx_emit_imm32(e, PSX_R1, c->guest);
+        psx_emit_movw(e, PSX_R3, desc);
+        psx_jit_emit_call(e, PSX_JIT_H_MEM);
+
+        psx_emit_cmp_imm8(e, PSX_R0, 0);
+
+        psx_jit_add_exit(c, psx_emit_bcond_fwd(e, PSX_CC_NE));
     }
 
-    psx_emit_patch_b(done, psx_emit_here(e));
+    psx_emit_patch_b_short(e, done, psx_emit_here(e));
 
     return 1;
 }
@@ -981,63 +1242,27 @@ static inline int psx_jit_translate_branch(psx_jit_ctx_t *c, uint32_t op, uint32
     uint16_t scratch[32];
     psx_emit_t se;
     int delay_is_mem = 0;
+    uint32_t mem_flags = PSX_JIT_MEM_DELAY;
 
     psx_emit_init(&se, scratch, (uint32_t)sizeof(scratch));
 
+    int delay_is_trap = 0;
+
     if (!psx_jit_translate_alu(&se, delay_op) || se.overflow)
     {
-        if (!psx_jit_mem_supported(delay_op))
+        /* ADD / ADDI / SUB: hand written code likes ADDI in delay slots, and
+           leaving those pairs to the interpreter was most of what it still ran
+           during full motion video */
+        delay_is_trap = psx_jit_is_trap_alu(delay_op);
+
+        if (!delay_is_trap && !psx_jit_mem_supported(delay_op))
             return 0;
 
-        delay_is_mem = 1;
+        delay_is_mem = !delay_is_trap;
     }
 
-    /* r3 = the pc the block leaves behind */
-    if (indirect)
-    {
-        psx_jit_ld_reg(e, PSX_R3, rs); /* read rs before the link register is written */
-    }
-    else if (cond == 0xffffffffu)
-    {
-        psx_jit_pc_const(e, jump_target);
-    }
-    else
-    {
-        psx_jit_ld_reg(e, PSX_R0, rs);
-
-        if ((o == 0x04) || (o == 0x05)) /* BEQ / BNE compare two registers */
-        {
-            psx_jit_ld_reg(e, PSX_R1, rt);
-            psx_emit_cmp_reg(e, PSX_R0, PSX_R1);
-        }
-        else
-        {
-            psx_emit_cmp_imm8(e, PSX_R0, 0);
-        }
-
-        psx_jit_pc_const(e, fall);
-        psx_emit_itt(e, cond);
-        psx_jit_pc_const(e, target);
-    }
-
-    /* the return address is written whether or not the branch is taken */
-    if (link)
-    {
-        psx_emit_imm32(e, PSX_R0, fall);
-        psx_jit_st_reg(e, PSX_R0, link_reg);
-    }
-
-    /* delay slot */
     if (delay_is_mem)
     {
-        /* r3 holds the pc to leave behind and the access does not touch it;
-           translate_mem_ex stores it and lays out its own escape. */
-        psx_jit_ctx_t dc = *c;
-
-        dc.guest = c->guest + 4u;
-        dc.next_op = 0xffffffffu; /* the next instruction is the branch target */
-
-        uint32_t mem_flags = PSX_JIT_MEM_DELAY;
 
         /* A load here would normally have to be left pending, which costs the
            next step an interpreted instruction. When the branch target is known
@@ -1057,13 +1282,13 @@ static inline int psx_jit_translate_branch(psx_jit_ctx_t *c, uint32_t op, uint32
             if (!indirect && ((after & 0x1fffffffu) < 0x00200000u) &&
                 ((fall & 0x1fffffffu) < 0x00200000u))
             {
-                const uint32_t op_after = psx_bus_fast_read32(c->bus, after);
+                const uint32_t op_after = c->read32(c->ud, after);
 
                 conflict = psx_jit_reads_reg(op_after, drt) || psx_jit_writes_reg(op_after, drt);
 
                 if (!conflict && (cond != 0xffffffffu))
                 {
-                    const uint32_t op_fall = psx_bus_fast_read32(c->bus, fall);
+                    const uint32_t op_fall = c->read32(c->ud, fall);
 
                     conflict = psx_jit_reads_reg(op_fall, drt) || psx_jit_writes_reg(op_fall, drt);
                 }
@@ -1072,6 +1297,90 @@ static inline int psx_jit_translate_branch(psx_jit_ctx_t *c, uint32_t op, uint32
             if (conflict)
                 mem_flags |= PSX_JIT_MEM_PENDING;
         }
+    }
+
+    /*
+        Where the block goes next travels in r3 across the delay slot. For a
+        target known at compile time that is the link of the block there, so the
+        end of this block can jump straight into it; a register target, or a
+        load left pending (which the next instruction has to see through the
+        interpreter), is the plain pc and goes back to the dispatcher.
+    */
+    uint32_t go_taken = (cond == 0xffffffffu) ? jump_target : target;
+    uint32_t go_fall = fall;
+
+    c->exit_mode = PSX_JIT_EXIT_PC;
+
+    if (!indirect && !(mem_flags & PSX_JIT_MEM_PENDING) && c->get_link)
+    {
+        const uint32_t link_taken = c->get_link(c->ud, go_taken);
+        const uint32_t link_fall = (cond == 0xffffffffu) ? link_taken : c->get_link(c->ud, go_fall);
+
+        if (link_taken && link_fall)
+        {
+            go_taken = link_taken;
+            go_fall = link_fall;
+
+            c->exit_mode = PSX_JIT_EXIT_LINK;
+        }
+    }
+
+    if (indirect)
+    {
+        psx_jit_ld_reg(e, PSX_R3, rs); /* read rs before the link register is written */
+    }
+    else if (cond == 0xffffffffu)
+    {
+        psx_jit_pc_const(e, go_taken);
+    }
+    else
+    {
+        psx_jit_ld_reg(e, PSX_R0, rs);
+
+        if ((o == 0x04) || (o == 0x05)) /* BEQ / BNE compare two registers */
+        {
+            psx_jit_ld_reg(e, PSX_R1, rt);
+            psx_emit_cmp_reg(e, PSX_R0, PSX_R1);
+        }
+        else
+        {
+            psx_emit_cmp_imm8(e, PSX_R0, 0);
+        }
+
+        psx_jit_pc_const(e, go_fall);
+        psx_emit_itt(e, cond);
+        psx_jit_pc_const(e, go_taken);
+    }
+
+    /* the return address is written whether or not the branch is taken */
+    if (link)
+    {
+        psx_emit_imm32(e, PSX_R0, fall);
+        psx_jit_st_reg(e, PSX_R0, link_reg);
+    }
+
+    /* delay slot; whoever called commits what r3 says once it is through */
+    if (delay_is_trap)
+    {
+        psx_jit_ctx_t dc = *c;
+
+        dc.guest = c->guest + 4u;
+
+        if (!psx_jit_translate_trap_alu_ex(&dc, delay_op, 1))
+            return 0; /* cannot happen: is_trap_alu already said yes */
+
+        *c->exit_count = *dc.exit_count;
+
+        return 1;
+    }
+
+    if (delay_is_mem)
+    {
+        /* the access does not touch r3, and lays out its own escape */
+        psx_jit_ctx_t dc = *c;
+
+        dc.guest = c->guest + 4u;
+        dc.next_op = 0xffffffffu; /* the next instruction is the branch target */
 
         if (!psx_jit_translate_mem_ex(&dc, delay_op, mem_flags))
             return 0; /* cannot happen: mem_supported already said yes */
@@ -1085,8 +1394,6 @@ static inline int psx_jit_translate_branch(psx_jit_ctx_t *c, uint32_t op, uint32
 
     for (uint32_t i = 0; i < half_words; i++)
         psx_emit16(e, scratch[i]);
-
-    psx_jit_commit_pc_reg(e);
 
     return 1;
 }
@@ -1106,7 +1413,6 @@ static inline int psx_jit_leaves_pending_load(uint32_t op)
     case 0x26:
     case 0x30:
     case 0x31:
-    case 0x32:
     case 0x33:
     case 0x10: /* MFC0 */
     case 0x12: /* MFC2 / CFC2 */

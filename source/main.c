@@ -99,6 +99,28 @@ static void BOARD_SDRAM_SetBurstLen8(void)
     __ISB();
 }
 
+/* Core cycles for one data cache line fill from SDRAM, averaged over lines that
+   cannot be in the cache: every emulator hot path that leaves the tightly
+   coupled memories is bound by this number. About 100 with 8 beat bursts, many
+   times that without. Needs the DWT cycle counter running. */
+static uint32_t BOARD_SDRAM_LineFillCycles(void)
+{
+    /* far away from anything that has been touched this early */
+    const volatile uint8_t *p = (const volatile uint8_t *)0x81400000u;
+    uint32_t sum = 0;
+
+    const uint32_t t0 = DWT->CYCCNT;
+
+    for (uint32_t i = 0; i < 1024u; i++)
+        sum += p[i * 64u];
+
+    const uint32_t cyc = DWT->CYCCNT - t0;
+
+    (void)sum;
+
+    return cyc / 1024u;
+}
+
 __attribute__((unused)) static void psx_mem_benchmark(void *vram, const char *tag)
 {
     volatile uint16_t *p16 = (volatile uint16_t *)vram;
@@ -248,6 +270,24 @@ int main(void)
 #if PSX_MEM_BENCH
     psx_mem_benchmark((void *)0x81000000u, "BL8");
 #endif
+
+    /* Everything outside the tightly coupled memories runs at the speed of this
+       number, so it is worth one line in every boot log: if a game is ever
+       unaccountably slow, this says whether the memory was. */
+    {
+        uint32_t fill = BOARD_SDRAM_LineFillCycles();
+
+        if (fill > 400u)
+        {
+            /* the mode register write did not take: once more */
+            BOARD_SDRAM_SetBurstLen8();
+
+            fill = BOARD_SDRAM_LineFillCycles();
+        }
+
+        PRINTF("SDRAM: %u core cycles per cache line fill, SDRAMCR0=%08x%s\r\n",
+               (unsigned int)fill, (unsigned int)SEMC->SDRAMCR0, (fill > 400u) ? " - SLOW" : "");
+    }
     PRINTF("Initial Core Clock: %u Hz (%u MHz)\r\n", (unsigned int)SystemCoreClock, (unsigned int)(SystemCoreClock / 1000000));
 
 /* Display architecture information */

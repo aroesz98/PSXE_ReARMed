@@ -108,6 +108,115 @@ psx_gpu_t *psx_gpu_create(void)
 
 static PSX_GPU_HOT void psx_gpu_update_cmd_impl(psx_gpu_t *gpu);
 
+/*
+    vram_dirty: "the picture on the panel is out of date".
+
+    Presenting a frame means reading the whole display window out of SDRAM,
+    repacking it and scaling it - about 2 M core cycles - so it should happen
+    when the picture changed and only then. "Something was written to the GPU"
+    is far too eager a test for that: games draw the next frame into a buffer
+    that is not on screen and then move the display window onto it, so between
+    two flips every write goes to VRAM that is not visible. Counting those made
+    the panel get the same picture two to four times over, and during full
+    motion video, where a frame is uploaded strip by strip over several vertical
+    blanks, it was most of the presenting work.
+
+    So the flag is raised when a write lands inside the display window, and when
+    the window itself moves or changes shape (see GP1 below).
+
+    The top and bottom GPU_DIRTY_MARGIN lines of the window do not count: they
+    are overscan on a television, and FF7's video player keeps its second frame
+    buffer eight lines into the first one's window, which would otherwise make
+    every strip it uploads look visible.
+*/
+#define GPU_DIRTY_MARGIN 8u
+
+/* Is any of [x0, x1) x [y0, y1), in VRAM coordinates, on screen? */
+static inline int gpu_rect_visible(const psx_gpu_t *gpu, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+{
+    /* empty, or wrapping around VRAM: not worth working out */
+    if ((x1 > 1024u) || (y1 > 512u) || (x1 <= x0) || (y1 <= y0))
+        return 1;
+
+    static const uint16_t hres[4] = {256, 320, 512, 640};
+
+    const uint32_t mode = gpu->display_mode;
+
+    uint32_t w = (mode & 0x40u) ? 384u : hres[mode & 3u];
+
+    if (mode & 0x10u)
+        w = (w * 3u + 1u) / 2u; /* 24 bpp: three bytes per pixel in 16 bit cells */
+
+    const uint32_t h = ((mode & 0x24u) == 0x24u) ? 480u : 240u;
+
+    const uint32_t wx0 = gpu->disp_x;
+    const uint32_t wx1 = gpu->disp_x + w;
+    const uint32_t wy0 = gpu->disp_y + GPU_DIRTY_MARGIN;
+    const uint32_t wy1 = gpu->disp_y + h - GPU_DIRTY_MARGIN;
+
+    return (x0 < wx1) && (x1 > wx0) && (y0 < wy1) && (y1 > wy0);
+}
+
+/* [x0, x1) x [y0, y1) was written */
+static inline void gpu_touch(psx_gpu_t *gpu, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+{
+    if (!gpu->vram_dirty && gpu_rect_visible(gpu, x0, y0, x1, y1))
+        gpu->vram_dirty = 1;
+}
+
+/* Polygons, lines and rectangles are clipped to the drawing area, so whether
+   they can show is a property of that area and of the display window - worked
+   out when either changes instead of once per primitive. */
+static inline void gpu_update_draw_visible(psx_gpu_t *gpu)
+{
+    gpu->draw_visible = gpu_rect_visible(gpu, gpu->draw_x1, gpu->draw_y1, gpu->draw_x2 + 1u, gpu->draw_y2 + 1u);
+}
+
+/* A GP0 word arrived for the command in buf[0]: note what it can change.
+   Called for every word, so the common case has to be the first test. */
+static inline void gpu_note_cmd(psx_gpu_t *gpu)
+{
+    if (gpu->vram_dirty)
+        return;
+
+    const uint32_t cmd = gpu->buf[0] >> 24;
+
+    /* polygons, lines, rectangles */
+    if ((cmd >= 0x20u) && (cmd < 0x80u))
+    {
+        if (gpu->draw_visible)
+            gpu->vram_dirty = 1;
+
+        return;
+    }
+
+    /* fill and VRAM to VRAM copy ignore the drawing area; their rectangle is in
+       the arguments, which are complete when the last one has arrived */
+    if ((gpu->state != GPU_STATE_RECV_ARGS) || gpu->cmd_args_remaining)
+        return;
+
+    if (cmd == 0x02u)
+    {
+        const uint32_t x = gpu->buf[1] & 0x3f0u;
+        const uint32_t y = (gpu->buf[1] >> 16) & 0x1ffu;
+        const uint32_t w = ((gpu->buf[2] & 0x3ffu) + 0x0fu) & ~0x0fu;
+        const uint32_t h = (gpu->buf[2] >> 16) & 0x1ffu;
+
+        if (w && h)
+            gpu_touch(gpu, x, y, x + w, y + h);
+    }
+    else if (cmd == 0x80u)
+    {
+        const uint32_t x = gpu->buf[2] & 0xffffu;
+        const uint32_t y = gpu->buf[2] >> 16;
+        const uint32_t w = gpu->buf[3] & 0xffffu;
+        const uint32_t h = gpu->buf[3] >> 16;
+
+        if (w && h)
+            gpu_touch(gpu, x, y, x + w, y + h);
+    }
+}
+
 void psx_gpu_init(psx_gpu_t *gpu, psx_ic_t *ic)
 {
     memset(gpu, 0, sizeof(psx_gpu_t));
@@ -1885,6 +1994,65 @@ PSX_GPU_HOT void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
     const uint16_t *const clut = gpu_clut_ptr(gpu, depth, clutx, cluty,
                                               (uint32_t)rect_w * (uint32_t)(y1 - y0));
 
+    /*
+        The rectangle a game actually draws: a sprite or a background tile in the
+        texture's own colours (raw, or modulated by the neutral 0x808080, which
+        leaves every 5 bit channel as it was), no texture window, no wrap around
+        the 256 texel page. FF7's field screens are a few hundred of these per
+        frame and they were the single biggest item in the rasterizer: the
+        general loop below runs the texture window arithmetic, a switch on the
+        texture depth and three multiplies with saturation for every pixel, only
+        to arrive at the texel it started with.
+
+        Texels and the palette are read per pixel, in the same order as below,
+        so even a rectangle that overlaps its own texture comes out the same.
+        Checked against the general loop on the host, bit for bit.
+    */
+    const int neutral = is_raw || ((mod_r == 0x80) && (mod_g == 0x80) && (mod_b == 0x80));
+
+    if (neutral && !gpu->texw_mx && !gpu->texw_my && (tex_start_x >= 0) &&
+        ((tex_start_x + rect_w) <= 256) && (tex_y >= 0) && ((tex_y + (y1 - y0)) <= 256))
+    {
+        /* modulation drops the texel's mask bit (rgb888_to_bgr555 has none) */
+        const uint16_t keep = is_raw ? 0xffffu : 0x7fffu;
+
+#if PSX_PROFILE
+        g_prof.px_fast += (uint32_t)rect_w * (uint32_t)(y1 - y0);
+#endif
+
+        for (int32_t y = y0; y < y1; ++y, ++tex_y)
+        {
+            uint16_t *dst = &gpu->vram[x0 + y * 1024];
+            const uint16_t *const trow = &gpu->vram[tpx + ((tpy + tex_y) * 1024)];
+
+            int32_t tx = tex_start_x;
+
+            for (int32_t i = 0; i < rect_w; ++i, ++tx, ++dst)
+            {
+                uint16_t texel;
+
+                if (depth == 0)
+                    texel = clut[(trow[tx >> 2] >> ((tx & 3) << 2)) & 0xf];
+                else if (depth == 1)
+                    texel = clut[(trow[tx >> 1] >> ((tx & 1) << 3)) & 0xff];
+                else
+                    texel = trow[tx];
+
+                if (!texel)
+                    continue;
+
+                const uint16_t out = texel & keep;
+
+                if (__builtin_expect(base_transp && (texel & 0x8000), 0))
+                    *dst = gpu_blend_bgr555(out, *dst, transp_mode);
+                else
+                    *dst = out;
+            }
+        }
+
+        return;
+    }
+
     for (int32_t y = y0; y < y1; ++y, ++tex_y)
     {
         uint16_t *dst = &gpu->vram[x0 + y * 1024];
@@ -2601,6 +2769,11 @@ PSX_GPU_HOT void gpu_cmd_a0(psx_gpu_t *gpu)
 
     case GPU_STATE_RECV_DATA:
     {
+        /* Judged as a whole rectangle, but with every word: a transfer can
+           straddle a presented frame, and what arrives after that has to
+           raise the flag again. One test while the flag is already up. */
+        gpu_touch(gpu, gpu->xpos, gpu->ypos, gpu->xpos + gpu->xsiz, gpu->ypos + gpu->ysiz);
+
         unsigned int xpos = (gpu->xpos + gpu->xcnt) & 0x3ff;
         unsigned int ypos = (gpu->ypos + gpu->ycnt) & 0x1ff;
 
@@ -2706,7 +2879,7 @@ uint32_t PSX_GPU_HOT psx_gpu_write_bulk(psx_gpu_t *gpu, const uint32_t *src, uin
     }
 
     if (used)
-        gpu->vram_dirty = 1;
+        gpu_touch(gpu, gpu->xpos, gpu->ypos, gpu->xpos + gpu->xsiz, gpu->ypos + gpu->ysiz);
 
     return used;
 }
@@ -3379,6 +3552,7 @@ PSX_GPU_HOT void psx_gpu_update_cmd(psx_gpu_t *gpu)
 {
     PROF_T0(t_gp0);
     PROF_INC(gp0cmds);
+    gpu_note_cmd(gpu);
     psx_gpu_update_cmd_impl(gpu);
     PROF_ADD(gp0, t_gp0);
 }
@@ -3532,12 +3706,16 @@ static PSX_GPU_HOT void psx_gpu_update_cmd_impl(psx_gpu_t *gpu)
     {
         gpu->draw_x1 = (gpu->buf[0] >> 0) & 0x3ff;
         gpu->draw_y1 = (gpu->buf[0] >> 10) & 0x1ff;
+
+        gpu_update_draw_visible(gpu);
     }
     break;
     case 0xe4:
     {
         gpu->draw_x2 = (gpu->buf[0] >> 0) & 0x3ff;
         gpu->draw_y2 = (gpu->buf[0] >> 10) & 0x1ff;
+
+        gpu_update_draw_visible(gpu);
     }
     break;
     case 0xe5:
@@ -3560,8 +3738,6 @@ static PSX_GPU_HOT void psx_gpu_update_cmd_impl(psx_gpu_t *gpu)
 
 PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value)
 {
-    gpu->vram_dirty = 1;
-
     switch (offset)
     {
     // GP0
@@ -3607,11 +3783,28 @@ PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value
 
         switch (cmd)
         {
+        /* What follows decides which part of VRAM is on screen and how, so a
+           change here is a new picture even though no pixel was written - this
+           is the buffer flip. Games rewrite these registers every frame with
+           the values they already hold, which is not a change. */
+
+        // Reset
+        case 0x00:
+        {
+            gpu->vram_dirty = 1;
+        }
+        break;
+
         // Display enable
         case 0x03:
         {
+            const uint32_t before = gpu->gpustat;
+
             gpu->gpustat &= ~0x00800000;
             gpu->gpustat |= (value << 23) & 0x00800000;
+
+            if (gpu->gpustat != before)
+                gpu->vram_dirty = 1;
         }
         break;
         case 0x04:
@@ -3620,24 +3813,49 @@ PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value
         break;
         case 0x05:
         {
-            gpu->disp_x = value & 0x3ff;
-            gpu->disp_y = (value >> 10) & 0x1ff;
+            const uint32_t x = value & 0x3ff;
+            const uint32_t y = (value >> 10) & 0x1ff;
+
+            if ((x != gpu->disp_x) || (y != gpu->disp_y))
+                gpu->vram_dirty = 1;
+
+            gpu->disp_x = x;
+            gpu->disp_y = y;
+
+            gpu_update_draw_visible(gpu);
         }
         break;
         case 0x06:
         {
-            gpu->disp_x1 = value & 0xfff;
-            gpu->disp_x2 = (value >> 12) & 0xfff;
+            const uint32_t x1 = value & 0xfff;
+            const uint32_t x2 = (value >> 12) & 0xfff;
+
+            if ((x1 != gpu->disp_x1) || (x2 != gpu->disp_x2))
+                gpu->vram_dirty = 1;
+
+            gpu->disp_x1 = x1;
+            gpu->disp_x2 = x2;
         }
         break;
         case 0x07:
         {
-            gpu->disp_y1 = value & 0x1ff;
-            gpu->disp_y2 = (value >> 10) & 0x1ff;
+            const uint32_t y1 = value & 0x1ff;
+            const uint32_t y2 = (value >> 10) & 0x1ff;
+
+            if ((y1 != gpu->disp_y1) || (y2 != gpu->disp_y2))
+                gpu->vram_dirty = 1;
+
+            gpu->disp_y1 = y1;
+            gpu->disp_y2 = y2;
         }
         break;
         case 0x08:
+            if (gpu->display_mode != (value & 0xffffff))
+                gpu->vram_dirty = 1;
+
             gpu->display_mode = value & 0xffffff;
+
+            gpu_update_draw_visible(gpu);
 
             if (gpu->event_cb_table[GPU_EVENT_DMODE])
                 gpu->event_cb_table[GPU_EVENT_DMODE](gpu);
@@ -3748,6 +3966,15 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_gpu_update(psx_gpu_t *gp
 
         gpu->cycles_fp = curr - GPU_FP_SCANL_NTSC;
     }
+}
+
+/* CPU cycles until psx_gpu_update has something to do: the next hblank edge */
+uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_gpu_cycles_to_edge(const psx_gpu_t *gpu)
+{
+    if (gpu->cycles_fp >= gpu->next_edge_fp)
+        return 0;
+
+    return ((gpu->next_edge_fp - gpu->cycles_fp) / GPU_FP_RATIO) + 1u;
 }
 
 void *psx_gpu_get_display_buffer(psx_gpu_t *gpu)

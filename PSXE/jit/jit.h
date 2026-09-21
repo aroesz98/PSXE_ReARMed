@@ -26,17 +26,25 @@ extern "C" {
 #define PSX_JIT_ENABLE 1
 #endif
 
-/* Code cache lives in ITCM: zero wait state fetch and no cache maintenance */
+/* Hot tier, in ITCM: zero wait state fetch and no cache maintenance. Holds
+   copies of the blocks that run the most. */
 #ifndef PSX_JIT_CODE_SIZE
-#define PSX_JIT_CODE_SIZE (80 * 1024)
+#define PSX_JIT_CODE_SIZE (88 * 1024)
 #endif
 
+/* Every translated block, in SDRAM. Sized so that a scene's whole working set
+   fits and nothing has to be translated twice; emptied as a whole when full. */
+#ifndef PSX_JIT_MASTER_SIZE
+#define PSX_JIT_MASTER_SIZE (2 * 1024 * 1024)
+#endif
+
+/* Blocks and links to not yet translated ones. Referred to by 16 bit index. */
 #ifndef PSX_JIT_MAX_BLOCKS
-#define PSX_JIT_MAX_BLOCKS 1024
+#define PSX_JIT_MAX_BLOCKS 4096
 #endif
 
 #ifndef PSX_JIT_HASH_SIZE
-#define PSX_JIT_HASH_SIZE 2048 /* must be a power of two */
+#define PSX_JIT_HASH_SIZE 4096 /* must be a power of two */
 #endif
 
 /* Instructions per block. Bounded so the device update granularity (and the
@@ -45,27 +53,20 @@ extern "C" {
 #define PSX_JIT_MAX_INSTR 16
 #endif
 
-typedef struct psx_jit_block_t
-{
-    uint32_t pc;                        /* guest address of the first instruction */
-    uint32_t code;                      /* host entry point (Thumb, bit0 set)     */
-    uint16_t instr;                     /* translated instructions                */
-    uint16_t page;                      /* guest page this block was built from   */
-    struct psx_jit_block_t *next;       /* hash chain                             */
-    struct psx_jit_block_t *page_next;  /* chain of blocks built from one page    */
-} psx_jit_block_t;
-
 typedef struct
 {
-    uint32_t blocks;         /* blocks currently compiled        */
+    uint32_t blocks;         /* blocks and links in use          */
     uint32_t killed;         /* blocks dropped by invalidation   */
     uint32_t compiles;       /* blocks compiled since reset      */
-    uint32_t flushes;        /* code cache flushes               */
+    uint32_t flushes;        /* times the code area was emptied  */
     uint32_t invalidations;  /* invalidations from stores / DMA  */
-    uint32_t code_used;      /* bytes of code cache in use       */
+    uint32_t code_used;      /* bytes of the SDRAM code area in use */
     uint32_t interp_steps;   /* instructions run by the fallback */
     uint32_t dispatch_steps; /* instructions the dispatcher had to run itself */
     uint32_t native;         /* instructions translated natively */
+    uint32_t hot_used;       /* bytes of the ITCM tier in use    */
+    uint32_t hot_blocks;     /* blocks running from ITCM         */
+    uint32_t retiers;        /* times the ITCM tier was revised  */
 } psx_jit_stats_t;
 
 /* Counts the instructions the fallback runs, per opcode class, so the next
@@ -78,8 +79,10 @@ typedef struct
 void psx_jit_init(void);
 void psx_jit_reset(void);
 
-/* Runs one block starting at cpu->pc and returns the emulated cycles it used */
-uint32_t psx_jit_step(psx_cpu_t *cpu);
+/* Runs translated code starting at cpu->pc and returns the emulated cycles it
+   used. Blocks run one another directly for as long as fewer than `budget`
+   cycles have been used, so that is roughly how long this stays away. */
+uint32_t psx_jit_step(psx_cpu_t *cpu, uint32_t budget);
 
 /* Guest memory changed (store, DMA, CD): drop any code compiled from it */
 void psx_jit_invalidate(uint32_t addr, uint32_t size);

@@ -16,6 +16,79 @@ static cue_track_t sCue_track;
 static cue_file_t sCue_file;
 static cue_t sCue;
 
+/*
+    Read ahead for disc images on the SD card.
+
+    A CD sector is 2352 bytes, which is no multiple of the card's 512: read one
+    at a time, every sector turned into three card transactions - the tail of one
+    block through the file's sector buffer, a few whole blocks, the head of the
+    next - and their latency, not the amount of data, was what reading cost. A
+    drive reads sequentially almost all of the time, so the image is read in
+    block aligned windows instead: one transaction serves about fourteen sectors,
+    data and the XA audio interleaved with it alike.
+
+    The window is its own cache line aligned buffer because the card driver runs
+    its DMA into it and invalidates the data cache over exactly that range.
+*/
+#define CUE_RA_BLOCK 512u
+#define CUE_RA_SIZE (64u * CUE_RA_BLOCK)
+
+static uint8_t __attribute__((section(".bss.$BOARD_SDRAM"), aligned(64))) g_cue_ra_buf[CUE_RA_SIZE];
+static FIL *g_cue_ra_file = NULL; /* the image the window belongs to */
+static uint32_t g_cue_ra_pos = 0; /* file offset of its first byte   */
+static uint32_t g_cue_ra_len = 0; /* valid bytes in it               */
+
+static void cue_ra_drop(void)
+{
+    g_cue_ra_file = NULL;
+    g_cue_ra_len = 0;
+}
+
+/* 2352 bytes at `offset` of an image file, through the window */
+static void cue_ra_read(FIL *fp, uint32_t offset, uint8_t *dst)
+{
+    uint32_t left = 2352u;
+
+    while (left)
+    {
+        if ((fp != g_cue_ra_file) || (offset < g_cue_ra_pos) || (offset >= (g_cue_ra_pos + g_cue_ra_len)))
+        {
+            UINT got = 0;
+
+            g_cue_ra_file = fp;
+            g_cue_ra_pos = offset & ~(CUE_RA_BLOCK - 1u);
+            g_cue_ra_len = 0;
+
+            if ((f_lseek(fp, g_cue_ra_pos) != FR_OK) ||
+                (f_read(fp, g_cue_ra_buf, CUE_RA_SIZE, &got) != FR_OK) || (got == 0) ||
+                (offset >= (g_cue_ra_pos + got)))
+            {
+                /* past the end of the image, or a card error: reads as zeroes,
+                   like the short read this replaces */
+                cue_ra_drop();
+                memset(dst, 0, left);
+
+                return;
+            }
+
+            g_cue_ra_len = got;
+        }
+
+        const uint32_t at = offset - g_cue_ra_pos;
+
+        uint32_t n = g_cue_ra_len - at;
+
+        if (n > left)
+            n = left;
+
+        memcpy(dst, &g_cue_ra_buf[at], n);
+
+        dst += n;
+        offset += n;
+        left -= n;
+    }
+}
+
 /* FATFS helper functions for character-by-character reading */
 static int32_t cue_load_buffer(cue_t *cue)
 {
@@ -561,6 +634,8 @@ void cue_destroy(cue_t *cue)
         }
         else
         {
+            /* the window may still hold this image's data */
+            cue_ra_drop();
             f_close((FIL *)file->buf);
             free(file->buf);
         }
@@ -691,11 +766,7 @@ int32_t cue_read(cue_t *cue, uint32_t lba, void *buf)
     }
     else
     {
-        DWORD offset = (lba - file->start) * 2352;
-        f_lseek((FIL *)file->buf, offset);
-
-        UINT bytesRead;
-        f_read((FIL *)file->buf, buf, 2352, &bytesRead);
+        cue_ra_read((FIL *)file->buf, (uint32_t)(lba - file->start) * 2352u, (uint8_t *)buf);
     }
 
     return (track->mode == CUE_MODE2_2352) ? TS_DATA : TS_AUDIO;

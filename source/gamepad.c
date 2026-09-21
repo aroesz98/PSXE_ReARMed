@@ -285,8 +285,43 @@ void psxe_gamepad_init(void)
     EnableIRQ(GAMEPAD_UART_IRQ);
 }
 
+#if PSXE_AUTOTEST
+#include "FreeRTOS.h"
+#include "task.h"
+
+/* one button for 200 ms out of every three seconds, up and circle in turn: FF7's
+   title screen starts on "Continue" when a memory card is present, so the cursor
+   has to go up to "New Game" before anything is confirmed */
+static void gamepad_autotest(void)
+{
+    static const uint32_t order[2] = {PSXI_SW_SDA_PAD_UP, PSXI_SW_SDA_CIRCLE};
+    static uint32_t held = 0;
+
+    if (!g_pad)
+        return;
+
+    const uint32_t now = xTaskGetTickCount();
+    const uint32_t want = ((now % 3000u) < 200u) ? order[(now / 3000u) % 2u] : 0u;
+
+    if (want == held)
+        return;
+
+    if (held)
+        psx_pad_button_release(g_pad, g_slot, held);
+
+    if (want)
+        psx_pad_button_press(g_pad, g_slot, want);
+
+    held = want;
+}
+#endif
+
 void psxe_gamepad_poll(void)
 {
+#if PSXE_AUTOTEST
+    gamepad_autotest();
+#endif
+
     if (!g_fresh || !g_pad)
         return;
 

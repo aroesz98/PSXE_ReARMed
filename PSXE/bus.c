@@ -407,12 +407,16 @@ uint8_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_bus_read8(psx_bus_t *
     return 0x00;
 }
 
+uint32_t __attribute__((section(".bss.$SRAM_DTC"))) g_psx_bus_io_written;
+
 void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_bus_write32(psx_bus_t *bus, uint32_t addr, uint32_t value)
 {
     if (bus == NULL)
     {
         return; /* Do nothing if bus is NULL */
     }
+
+    g_psx_bus_io_written = 1;
 
     bus->access_cycles = 0;
 
@@ -453,6 +457,8 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_bus_write16(psx_bus_t *b
         return; /* Do nothing if bus is NULL */
     }
 
+    g_psx_bus_io_written = 1;
+
     bus->access_cycles = 0;
 
     uint32_t vaddr = addr;
@@ -486,6 +492,8 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_bus_write8(psx_bus_t *bu
     {
         return; /* Do nothing if bus is NULL */
     }
+
+    g_psx_bus_io_written = 1;
 
     bus->access_cycles = 0;
 

@@ -446,6 +446,32 @@ int32_t psxe_menu_pick(char *path, uint32_t path_size)
     /* and a moment of grace for the first frames after the link settles */
     int32_t warmup = 20;
 
+#if PSXE_AUTOTEST
+    for (int32_t i = 0; i < g_count; i++)
+    {
+        char lower[96];
+        uint32_t k = 0;
+
+        for (; g_entries[i].name[k] && (k < (sizeof(lower) - 1u)); k++)
+        {
+            const char ch = g_entries[i].name[k];
+
+            lower[k] = ((ch >= 'A') && (ch <= 'Z')) ? (char)(ch + 32) : ch;
+        }
+
+        lower[k] = 0;
+
+        if (strstr(lower, PSXE_AUTOTEST_GAME))
+        {
+            snprintf(path, path_size, "%s", g_entries[i].path);
+
+            PRINTF("menu: autotest, starting %s\r\n", g_entries[i].path);
+
+            return 1;
+        }
+    }
+#endif
+
     if (g_count == 1)
     {
         /* nothing to choose from, but show what is loading for a moment */

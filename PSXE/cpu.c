@@ -3157,6 +3157,56 @@ int32_t PSX_GTE_HOT psx_cpu_gte_command(psx_cpu_t *cpu, uint32_t opcode)
     return psx_cpu_exec_cop2(cpu);
 }
 
+/*
+    GTE register moves for the recompiler: MFC2 / CFC2 and MTC2 / CTC2. A 3D scene
+    does several of these per vertex - load the vertex, run a command, fetch the
+    result - and through the interpreter each one cost a full fetch and decode;
+    they were most of what the interpreter still ran in a field scene. `reg` is
+    0..31 for the data registers and 32..63 for the control registers, the same
+    numbering the interpreter's handlers use, and these are the same two
+    functions those handlers call, side effects included.
+
+    LWC2 / SWC2 for the recompiler: the interpreter's own handlers, entered
+    directly. What this saves over a full interpreter step is the fetch - a data
+    cache miss on guest code nothing else reads -, the interrupt test and the
+    decode. The handlers see the state an interpreter step would have set up, so
+    an address error raised in here carries the right EPC.
+
+    Returns non zero when control flow left the straight line (an exception).
+*/
+uint32_t PSX_GTE_HOT psx_cpu_gte_transfer(psx_cpu_t *cpu, uint32_t pc, uint32_t opcode)
+{
+    cpu->opcode = opcode;
+    cpu->saved_pc = pc;
+    cpu->pc = pc + 4u;
+    cpu->next_pc = pc + 8u;
+    cpu->delay_slot = 0;
+    cpu->branch = 0;
+    cpu->branch_taken = 0;
+
+    if ((opcode >> 26) == 0x32u)
+        psx_cpu_i_lwc2(cpu);
+    else
+        psx_cpu_i_swc2(cpu);
+
+    cpu->last_cycles = 2u + psx_bus_fast_take_cycles(cpu->bus);
+    cpu->total_cycles += cpu->last_cycles;
+
+    cpu->r[0] = 0;
+
+    return (cpu->pc != (pc + 4u)) ? 1u : 0u;
+}
+
+uint32_t PSX_GTE_HOT psx_cpu_gte_read(psx_cpu_t *cpu, uint32_t reg)
+{
+    return gte_read_register(cpu, reg);
+}
+
+void PSX_GTE_HOT psx_cpu_gte_write(psx_cpu_t *cpu, uint32_t reg, uint32_t value)
+{
+    gte_write_register(cpu, reg, value);
+}
+
 int32_t __attribute__((section(".ramfunc.$SRAM_OC"))) psx_cpu_execute(psx_cpu_t *cpu)
 {
     /* Straight switch dispatch: every handler is a static inline, so the

@@ -5,7 +5,7 @@
    Set PSX_PROFILE to 0 to compile out completely. */
 
 #ifndef PSX_PROFILE
-#define PSX_PROFILE 1
+#define PSX_PROFILE 0
 #endif
 
 #include <stdint.h>
@@ -31,6 +31,8 @@ typedef struct
     uint32_t mdec_idct;/* core cycles in MDEC block decode + IDCT */
     uint32_t mdec_yuv; /* core cycles in MDEC colour conversion */
     uint32_t mdec_blk; /* MDEC blocks decoded */
+    uint32_t jit_cmp;  /* core cycles translating blocks (part of cpu) */
+    uint32_t jit_tier; /* core cycles revising the ITCM code tier (part of cpu) */
     uint32_t bwait;    /* core cycles spent waiting for PXP */
     uint32_t frames;   /* screen updates */
     uint32_t gp0cmds;  /* GP0 commands executed */

@@ -142,15 +142,43 @@ static inline void psx_emit_imm32(psx_emit_t *e, uint32_t rd, uint32_t imm32)
 
 /* ---------------------------------------------------------------- memory */
 
+/*
+    Narrow encodings.
+
+    Most of what a block does is move guest registers in and out of host ones,
+    and the guest register file sits in the first 128 bytes of psx_cpu_t - exactly
+    what the 16 bit LDR / STR forms can reach. The same goes for the two operand
+    arithmetic on r0..r7. Halving those instructions shrinks a block by about a
+    third, which is a third more guest code inside the tightly coupled memory.
+
+    The 16 bit data processing forms set the flags where the 32 bit ones used
+    here did not. No translation keeps flags alive across one of them: every
+    compare is consumed by the IT block or the branch right behind it. Anything
+    that does need its flags uses the explicit ADDS / SUBS / CMP encoders.
+*/
+#define PSX_EMIT_LOW(r) ((r) < 8u)
+
 /* LDR Rt, [Rn, #imm12] */
 static inline void psx_emit_ldr_imm(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t imm12)
 {
+    if (PSX_EMIT_LOW(rt) && PSX_EMIT_LOW(rn) && (imm12 <= 124u) && !(imm12 & 3u))
+    {
+        psx_emit16(e, 0x6800u | ((imm12 >> 2) << 6) | (rn << 3) | rt);
+        return;
+    }
+
     psx_emit32(e, 0xf8d0u | rn, (rt << 12) | (imm12 & 0xfffu));
 }
 
 /* STR Rt, [Rn, #imm12] */
 static inline void psx_emit_str_imm(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t imm12)
 {
+    if (PSX_EMIT_LOW(rt) && PSX_EMIT_LOW(rn) && (imm12 <= 124u) && !(imm12 & 3u))
+    {
+        psx_emit16(e, 0x6000u | ((imm12 >> 2) << 6) | (rn << 3) | rt);
+        return;
+    }
+
     psx_emit32(e, 0xf8c0u | rn, (rt << 12) | (imm12 & 0xfffu));
 }
 
@@ -177,6 +205,18 @@ static inline void psx_emit_cmp_imm8(psx_emit_t *e, uint32_t rn, uint32_t imm8)
 /* ADD Rd, Rn, #imm12 (T4, no flags) */
 static inline void psx_emit_add_imm12(psx_emit_t *e, uint32_t rd, uint32_t rn, uint32_t imm12)
 {
+    if (PSX_EMIT_LOW(rd) && (rd == rn) && (imm12 <= 255u))
+    {
+        psx_emit16(e, 0x3000u | (rd << 8) | imm12); /* ADDS Rdn, #imm8 */
+        return;
+    }
+
+    if (PSX_EMIT_LOW(rd) && PSX_EMIT_LOW(rn) && (imm12 <= 7u))
+    {
+        psx_emit16(e, 0x1c00u | (imm12 << 6) | (rn << 3) | rd); /* ADDS Rd, Rn, #imm3 */
+        return;
+    }
+
     const uint32_t i = (imm12 >> 11) & 1u;
     const uint32_t imm3 = (imm12 >> 8) & 0x7u;
     const uint32_t imm8 = imm12 & 0xffu;
@@ -190,26 +230,56 @@ static inline void psx_emit_add_imm12(psx_emit_t *e, uint32_t rd, uint32_t rn, u
 /* register forms, 32 bit encodings so any register can be used */
 static inline void psx_emit_add_reg(psx_emit_t *e, uint32_t rd, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rd) && PSX_EMIT_LOW(rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x1800u | (rm << 6) | (rn << 3) | rd); /* ADDS Rd, Rn, Rm */
+        return;
+    }
+
     psx_emit32(e, 0xeb00u | rn, (rd << 8) | rm);
 }
 
 static inline void psx_emit_sub_reg(psx_emit_t *e, uint32_t rd, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rd) && PSX_EMIT_LOW(rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x1a00u | (rm << 6) | (rn << 3) | rd); /* SUBS Rd, Rn, Rm */
+        return;
+    }
+
     psx_emit32(e, 0xeba0u | rn, (rd << 8) | rm);
 }
 
 static inline void psx_emit_and_reg(psx_emit_t *e, uint32_t rd, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rd) && (rd == rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x4000u | (rm << 3) | rd); /* ANDS Rdn, Rm */
+        return;
+    }
+
     psx_emit32(e, 0xea00u | rn, (rd << 8) | rm);
 }
 
 static inline void psx_emit_orr_reg(psx_emit_t *e, uint32_t rd, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rd) && (rd == rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x4300u | (rm << 3) | rd); /* ORRS Rdn, Rm */
+        return;
+    }
+
     psx_emit32(e, 0xea40u | rn, (rd << 8) | rm);
 }
 
 static inline void psx_emit_eor_reg(psx_emit_t *e, uint32_t rd, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rd) && (rd == rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x4040u | (rm << 3) | rd); /* EORS Rdn, Rm */
+        return;
+    }
+
     psx_emit32(e, 0xea80u | rn, (rd << 8) | rm);
 }
 
@@ -243,6 +313,12 @@ static inline void psx_emit_adds_imm12(psx_emit_t *e, uint32_t rd, uint32_t rn, 
 /* MVN Rd, Rm */
 static inline void psx_emit_mvn_reg(psx_emit_t *e, uint32_t rd, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rd) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x43c0u | (rm << 3) | rd); /* MVNS Rd, Rm */
+        return;
+    }
+
     psx_emit32(e, 0xea6fu, (rd << 8) | rm);
 }
 
@@ -254,6 +330,14 @@ static inline void psx_emit_shift_imm(psx_emit_t *e, uint32_t type, uint32_t rd,
     if (imm5 == 0)
         type = 0;
 
+    /* LSLS / LSRS / ASRS Rd, Rm, #imm5 - a zero shift would be a different
+       instruction in this form, so that one keeps the wide encoding */
+    if (imm5 && PSX_EMIT_LOW(rd) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, (type << 11) | (imm5 << 6) | (rm << 3) | rd);
+        return;
+    }
+
     const uint32_t imm3 = (imm5 >> 2) & 0x7u;
     const uint32_t imm2 = imm5 & 0x3u;
 
@@ -264,14 +348,24 @@ static inline void psx_emit_shift_imm(psx_emit_t *e, uint32_t type, uint32_t rd,
 static inline void psx_emit_shift_reg(psx_emit_t *e, uint32_t type, uint32_t rd, uint32_t rn, uint32_t rm)
 {
     static const uint32_t op[3] = {0xfa00u, 0xfa20u, 0xfa40u};
+    static const uint32_t op16[3] = {0x4080u, 0x40c0u, 0x4100u};
+
+    if (PSX_EMIT_LOW(rd) && (rd == rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, op16[type] | (rm << 3) | rd); /* LSLS / LSRS / ASRS Rdn, Rm */
+        return;
+    }
 
     psx_emit32(e, op[type] | rn, 0xf000u | (rd << 8) | rm);
 }
 
-/* CMP Rn, Rm (16 bit form, low registers only) */
+/* CMP Rn, Rm (16 bit forms: T1 for low registers, T2 when a high one is involved) */
 static inline void psx_emit_cmp_reg(psx_emit_t *e, uint32_t rn, uint32_t rm)
 {
-    psx_emit16(e, 0x4280u | (rm << 3) | rn);
+    if (PSX_EMIT_LOW(rn) && PSX_EMIT_LOW(rm))
+        psx_emit16(e, 0x4280u | (rm << 3) | rn);
+    else
+        psx_emit16(e, 0x4500u | ((rn & 8u) << 4) | (rm << 3) | (rn & 7u));
 }
 
 /* MOVS Rd, #imm8 (inside an IT block this is MOV) */
@@ -455,6 +549,12 @@ static inline void psx_emit_strd_imm(psx_emit_t *e, uint32_t rt, uint32_t rt2, u
 /* SUB Rd, Rn, #imm12 (T4, no flags) */
 static inline void psx_emit_sub_imm12(psx_emit_t *e, uint32_t rd, uint32_t rn, uint32_t imm12)
 {
+    if (PSX_EMIT_LOW(rd) && (rd == rn) && (imm12 <= 255u))
+    {
+        psx_emit16(e, 0x3800u | (rd << 8) | imm12); /* SUBS Rdn, #imm8 */
+        return;
+    }
+
     const uint32_t i = (imm12 >> 11) & 1u;
     const uint32_t imm3 = (imm12 >> 8) & 0x7u;
     const uint32_t imm8 = imm12 & 0xffu;
@@ -467,42 +567,90 @@ static inline void psx_emit_sub_imm12(psx_emit_t *e, uint32_t rd, uint32_t rn, u
 /* LDR/LDRB/LDRH/LDRSB/LDRSH Rt, [Rn, Rm] */
 static inline void psx_emit_ldr_reg(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rt) && PSX_EMIT_LOW(rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x5800u | (rm << 6) | (rn << 3) | rt);
+        return;
+    }
+
     psx_emit32(e, 0xf850u | rn, (rt << 12) | rm);
 }
 
 static inline void psx_emit_ldrb_reg(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rt) && PSX_EMIT_LOW(rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x5c00u | (rm << 6) | (rn << 3) | rt);
+        return;
+    }
+
     psx_emit32(e, 0xf810u | rn, (rt << 12) | rm);
 }
 
 static inline void psx_emit_ldrh_reg(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rt) && PSX_EMIT_LOW(rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x5a00u | (rm << 6) | (rn << 3) | rt);
+        return;
+    }
+
     psx_emit32(e, 0xf830u | rn, (rt << 12) | rm);
 }
 
 static inline void psx_emit_ldrsb_reg(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rt) && PSX_EMIT_LOW(rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x5600u | (rm << 6) | (rn << 3) | rt);
+        return;
+    }
+
     psx_emit32(e, 0xf910u | rn, (rt << 12) | rm);
 }
 
 static inline void psx_emit_ldrsh_reg(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rt) && PSX_EMIT_LOW(rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x5e00u | (rm << 6) | (rn << 3) | rt);
+        return;
+    }
+
     psx_emit32(e, 0xf930u | rn, (rt << 12) | rm);
 }
 
 /* STR/STRB/STRH Rt, [Rn, Rm] */
 static inline void psx_emit_str_reg(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rt) && PSX_EMIT_LOW(rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x5000u | (rm << 6) | (rn << 3) | rt);
+        return;
+    }
+
     psx_emit32(e, 0xf840u | rn, (rt << 12) | rm);
 }
 
 static inline void psx_emit_strb_reg(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rt) && PSX_EMIT_LOW(rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x5400u | (rm << 6) | (rn << 3) | rt);
+        return;
+    }
+
     psx_emit32(e, 0xf800u | rn, (rt << 12) | rm);
 }
 
 static inline void psx_emit_strh_reg(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t rm)
 {
+    if (PSX_EMIT_LOW(rt) && PSX_EMIT_LOW(rn) && PSX_EMIT_LOW(rm))
+    {
+        psx_emit16(e, 0x5200u | (rm << 6) | (rn << 3) | rt);
+        return;
+    }
+
     psx_emit32(e, 0xf820u | rn, (rt << 12) | rm);
 }
 
@@ -590,6 +738,59 @@ static inline void psx_emit_patch_bcond(uint16_t *slot, uint32_t cond, uint32_t 
     slot[1] = (uint16_t)(0x8000u | (j1 << 13) | (j2 << 11) | imm11);
 }
 
+/*
+    Short forward branches, for the hops inside one translated instruction: over
+    its escape code, or into it. Those distances are a few dozen bytes and known
+    to be, so the 16 bit forms always reach; should one ever not, the block is
+    given up rather than emitted wrong.
+*/
+
+/* placeholder for a forward B<cond>.N (up to 254 bytes ahead) */
+static inline uint16_t *psx_emit_bcond_short_fwd(psx_emit_t *e, uint32_t cond)
+{
+    uint16_t *slot = e->cur;
+
+    psx_emit16(e, 0xd000u | (cond << 8));
+
+    return slot;
+}
+
+static inline void psx_emit_patch_bcond_short(psx_emit_t *e, uint16_t *slot, uint32_t cond, uint32_t target)
+{
+    const uint32_t off = target - ((uint32_t)(uintptr_t)slot + 4u);
+
+    if ((off > 254u) || (off & 1u))
+    {
+        e->overflow = 1;
+        return;
+    }
+
+    slot[0] = (uint16_t)(0xd000u | (cond << 8) | (off >> 1));
+}
+
+/* placeholder for a forward B.N (up to 2046 bytes ahead) */
+static inline uint16_t *psx_emit_b_short_fwd(psx_emit_t *e)
+{
+    uint16_t *slot = e->cur;
+
+    psx_emit16(e, 0xe000u);
+
+    return slot;
+}
+
+static inline void psx_emit_patch_b_short(psx_emit_t *e, uint16_t *slot, uint32_t target)
+{
+    const uint32_t off = target - ((uint32_t)(uintptr_t)slot + 4u);
+
+    if ((off > 2046u) || (off & 1u))
+    {
+        e->overflow = 1;
+        return;
+    }
+
+    slot[0] = (uint16_t)(0xe000u | (off >> 1));
+}
+
 /* BL <target> (call into C, +-16MB) */
 static inline void psx_emit_bl(psx_emit_t *e, uint32_t target)
 {
@@ -615,6 +816,13 @@ static inline void psx_emit_blx(psx_emit_t *e, uint32_t rm)
 static inline void psx_emit_bx(psx_emit_t *e, uint32_t rm)
 {
     psx_emit16(e, 0x4700u | (rm << 3));
+}
+
+/* LDR PC, [Rn, #imm12]: an indirect jump through memory. Always the wide form;
+   inside an IT block it has to be the last instruction, which is how it is used. */
+static inline void psx_emit_ldr_pc(psx_emit_t *e, uint32_t rn, uint32_t imm12)
+{
+    psx_emit32(e, 0xf8d0u | rn, 0xf000u | (imm12 & 0xfffu));
 }
 
 #ifdef __cplusplus

@@ -178,8 +178,9 @@ void psx_prof_tick(void)
 
     uint32_t other = elapsed - g_prof.cpu - g_prof.dev;
 
-    PRINTF("PROF-MDEC idct=%u yuv=%u blocks=%u\r\n",
-           (unsigned)g_prof.mdec_idct, (unsigned)g_prof.mdec_yuv, (unsigned)g_prof.mdec_blk);
+    PRINTF("PROF-MDEC idct=%u yuv=%u blocks=%u | PROF-JIT compile=%u retier=%u\r\n",
+           (unsigned)g_prof.mdec_idct, (unsigned)g_prof.mdec_yuv, (unsigned)g_prof.mdec_blk,
+           (unsigned)g_prof.jit_cmp, (unsigned)g_prof.jit_tier);
 
     PRINTF("PROF inst=%u ecyc=%u | cpu=%u gp0=%u dma=%u | dev=%u (cd=%u gpu=%u pad=%u tmr=%u dma=%u) blit=%u bwait=%u | other=%u | frames=%u gp0cmds=%u px=%u (f=%u s=%u t4=%u t8=%u t15=%u r=%u fast=%u tr=%u raw=%u) | elapsed=%u\r\n",
            g_prof.instr, g_prof.ecycles,
@@ -262,16 +263,85 @@ void psx_prof_tick(void)
 }
 #endif
 
-/* Emulated CPU cycles executed between two device update rounds.
-   The devices only need ~scanline resolution; updating them after every
-   single instruction cost more than the interpreter itself.
-   Must stay well below the GPU hblank window so no hblank/vblank edge can be
-   stepped over: that window is 853 GPU cycles, about 538 CPU cycles now that the
-   GPU:CPU clock ratio is right (it was a tenth of that, hence the old 21). A
-   block may overshoot the slice by one block's worth of cycles, which is why
-   this stays far away from the limit. */
-#define PSX_DEV_SLICE_CYCLES 64
+/*
+    Emulated CPU cycles between two device update rounds.
+
+    A round costs a couple of hundred core cycles whether or not any device has
+    anything to do, and at a fixed 64 cycle slice there were half a million of
+    them per emulated second, nearly all of them finding nothing. Every device
+    already knows when it next has to act - the GPU its next hblank edge, the
+    timers their next target or wrap, the drive, the controller port and the
+    MDEC DMA their delays - so the slice is sized to end there instead:
+
+      - never shorter than PSX_DEV_SLICE_MIN, the old fixed slice: a deadline
+        closer than that is served as late as it always was;
+      - never longer than PSX_DEV_SLICE_MAX, which bounds how stale a register
+        read can be (a timer counter, say) and how early a delay that was armed
+        in the middle of a slice can fire, since it is charged the whole slice.
+        It also stays well below the hblank window (853 GPU cycles, about 538 CPU
+        cycles), so no edge can be stepped over;
+      - planned again whenever the guest writes a device register, because that
+        is how a nearer deadline comes about; the recompiler returns right
+        after such a write.
+
+    A block may overshoot the slice by one block's worth of cycles.
+*/
+#define PSX_DEV_SLICE_MIN 64u
+#define PSX_DEV_SLICE_MAX 256u
 #define PSX_DEV_SLICE_MAX_STEPS 32
+
+static inline uint32_t __attribute__((always_inline)) psx_cycles_to_event(const psx_t *psx)
+{
+    uint32_t n = PSX_DEV_SLICE_MAX;
+    uint32_t c;
+
+    c = psx_gpu_cycles_to_edge(psx->gpu);
+
+    if (c < n)
+        n = c;
+
+    const psx_timer_t *const timer = psx->timer;
+
+    c = (timer->pending_cycles < timer->deadline_cycles)
+            ? (uint32_t)(timer->deadline_cycles - timer->pending_cycles)
+            : 0u;
+
+    if (c < n)
+        n = c;
+
+    const psx_cdrom_t *const cd = psx->cdrom;
+
+    if (cd->delay > 0)
+    {
+        if ((uint32_t)cd->delay < n)
+            n = (uint32_t)cd->delay;
+    }
+    else if ((cd->state != CD_STATE_IDLE) && (cd->state != CD_STATE_PLAY))
+    {
+        n = 0; /* acts on the very next update */
+    }
+
+    if ((psx->pad->cycles_until_irq > 0) && ((uint32_t)psx->pad->cycles_until_irq < n))
+        n = (uint32_t)psx->pad->cycles_until_irq;
+
+    const psx_dma_t *const dma = psx->dma;
+
+    if (dma->cdrom_irq_delay | dma->spu_irq_delay | dma->gpu_irq_delay | dma->otc_irq_delay)
+    {
+        n = 0; /* completion flags are raised by the next update */
+    }
+    else
+    {
+        /* counted in units of the original 21 cycle slice, see psx_dma_update */
+        if (dma->mdec_in_irq_delay && ((dma->mdec_in_irq_delay * 21u) < n))
+            n = dma->mdec_in_irq_delay * 21u;
+
+        if (dma->mdec_out_irq_delay && ((dma->mdec_out_irq_delay * 21u) < n))
+            n = dma->mdec_out_irq_delay * 21u;
+    }
+
+    return (n < PSX_DEV_SLICE_MIN) ? PSX_DEV_SLICE_MIN : n;
+}
 
 void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_update(psx_t *psx)
 {
@@ -281,20 +351,37 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_update(psx_t *psx)
 
     PROF_T0(t_cpu);
 
+    uint32_t limit = psx_cycles_to_event(psx);
+
+    g_psx_bus_io_written = 0;
+
     do
     {
 #if PSX_JIT_ENABLE
-        /* One recompiled block; instructions the translator cannot emit
-           natively call back into the interpreter from inside the block. */
-        acc += psx_jit_step(cpu);
+        /* Recompiled blocks, handing over to one another for as long as the
+           slice lasts; instructions the translator cannot emit natively call
+           back into the interpreter from inside the block. */
+        acc += psx_jit_step(cpu, limit - acc);
 #else
         psx_cpu_cycle(cpu);
 
         acc += cpu->last_cycles;
 #endif
         steps++;
+
+        if (g_psx_bus_io_written)
+        {
+            g_psx_bus_io_written = 0;
+
+            /* Both are measured from the last round: the devices have not been
+               told about this slice's cycles yet. */
+            const uint32_t again = psx_cycles_to_event(psx);
+
+            if (again < limit)
+                limit = again;
+        }
     }
-    while ((acc < PSX_DEV_SLICE_CYCLES) && (steps < PSX_DEV_SLICE_MAX_STEPS));
+    while ((acc < limit) && (steps < PSX_DEV_SLICE_MAX_STEPS));
 
     PROF_ADD(cpu, t_cpu);
 

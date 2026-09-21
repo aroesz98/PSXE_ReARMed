@@ -1,12 +1,16 @@
 /*
-    Recompiler core: code cache, block lookup, translation and dispatch.
+    Recompiler core: code tiers, block lookup, translation and dispatch.
 
-    Phase 1 translates every guest instruction into a call to the interpreter
-    step. That is deliberately slower than the plain interpreter, but it puts
-    the whole machinery (cache, block management, invalidation, exit protocol)
-    under test with behaviour that is identical to the interpreter by
-    construction. Native instruction translation is added on top of this
-    structure, one opcode class at a time, without touching the protocol.
+    Every block is translated once into a large code area in SDRAM, which holds
+    the working set of a whole game scene, so nothing is ever translated twice
+    just because the fast memory ran out. The 80 KB of ITCM are a cache on top
+    of that: the blocks that actually run the most are copied into it, chosen
+    from execution counts, and the choice is revised as the hot code moves.
+
+    Blocks refer to one another through links (see jit_translate.h), so a block
+    can be copied, moved between the tiers or invalidated by updating one
+    pointer, and a block that ends in a branch with a known target jumps
+    straight into the next block instead of returning here.
 */
 
 #include <stdint.h>
@@ -15,99 +19,133 @@
 #include "jit.h"
 #include "jit_emit.h"
 #include "jit_translate.h"
+#include "jit_block.h"
 
 #include "../bus.h"
 #include "../bus_init.h"
 #include "../bus_fast.h"
+#include "../prof.h"
 #include "fsl_debug_console.h"
 
 #if PSX_JIT_ENABLE
 
 /* ------------------------------------------------------------------ memory */
 
-/* Generated code runs from ITCM: no instruction cache maintenance is needed,
-   a data barrier is enough. */
+/* Hot tier. Generated code runs from ITCM with zero wait states and without
+   touching the instruction cache. */
 static uint8_t __attribute__((section(".bss.$SRAM_ITC"), aligned(8))) g_jit_code[PSX_JIT_CODE_SIZE];
 
-/* Block bookkeeping is touched once per block execution, so OCRAM (cached) is
-   the right place for it - DTCM is reserved for what the inner loops touch. */
-static psx_jit_block_t __attribute__((section(".bss.$SRAM_OC"))) g_jit_blocks[PSX_JIT_MAX_BLOCKS];
-static psx_jit_block_t *__attribute__((section(".bss.$SRAM_OC"))) g_jit_hash[PSX_JIT_HASH_SIZE];
+/* Every block lives here; this copy is what the hot tier is filled from. Code
+   that runs from here goes through the instruction cache, so what costs is a
+   cache line fill now and then - a small fraction of translating it again. */
+static uint8_t __attribute__((section(".bss.$BOARD_SDRAM"), aligned(32))) g_jit_master[PSX_JIT_MASTER_SIZE];
+
+/* Links are read on every jump from one block into the next, so they sit in
+   DTCM: one cycle, and nothing of the data cache is spent on them. */
+static psx_jit_link_t __attribute__((section(".bss.$SRAM_DTC"))) g_jit_link[PSX_JIT_MAX_BLOCKS];
+
+/* The rest of the bookkeeping is touched once per dispatch at most. Blocks are
+   referred to by index + 1 so that 0 can mean "none". */
+typedef struct
+{
+    uint32_t master;    /* offset of the code inside g_jit_master          */
+    uint16_t size;      /* bytes of code; 0: a link only, nothing compiled */
+    uint16_t next;      /* hash chain                                      */
+    uint16_t page_next; /* blocks built from one guest page                */
+    uint16_t heat;      /* dispatches since the tiers were last revised    */
+    uint8_t hot;        /* runs from the ITCM copy                         */
+    uint8_t instr;      /* guest instructions covered                      */
+    uint16_t reserved;
+} psx_jit_meta_t;
+
+static psx_jit_meta_t __attribute__((section(".bss.$SRAM_OC"))) g_jit_meta[PSX_JIT_MAX_BLOCKS];
+static uint16_t __attribute__((section(".bss.$SRAM_OC"))) g_jit_hash[PSX_JIT_HASH_SIZE];
 
 /* 1 KB page granularity over the 2 MB of guest RAM. Coarser pages caused code
    and data that merely live close to each other to invalidate one another. */
 #define PSX_JIT_PAGE_SHIFT 10
 #define PSX_JIT_PAGE_COUNT (0x200000u >> PSX_JIT_PAGE_SHIFT)
+#define PSX_JIT_PAGE_MASK ((1u << PSX_JIT_PAGE_SHIFT) - 1u)
 
-static psx_jit_block_t *__attribute__((section(".bss.$SRAM_OC"))) g_jit_page_head[PSX_JIT_PAGE_COUNT];
+static uint16_t __attribute__((section(".bss.$SRAM_OC"))) g_jit_page_head[PSX_JIT_PAGE_COUNT];
 
 /* Shared with the memory write fast path (see bus_fast.h): one byte per page,
    checked on every guest store, so this one stays in DTCM. */
 uint8_t __attribute__((section(".bss.$SRAM_DTC"))) g_psx_jit_code_pages[PSX_JIT_PAGE_COUNT];
 
+/* A block is translated into this much scratch space and copied out once its
+   size is known. The longest translation of one instruction is below 100 bytes. */
+#define PSX_JIT_SCRATCH_BYTES 2560u
+
+/* What the entry stub loads the block registers from; the helper table r9
+   points at is the tail of it. */
+typedef struct
+{
+    uint32_t ram;   /* r6  */
+    uint32_t pages; /* r7  */
+    uint32_t exit;  /* r10 */
+    uint32_t helpers[PSX_JIT_H_COUNT];
+} psx_jit_regs_t;
+
+static psx_jit_regs_t __attribute__((section(".bss.$SRAM_DTC"))) g_jit_regs;
+
 static uint32_t g_jit_block_count;
-static uint32_t g_jit_code_used;
+static uint32_t g_jit_master_used;
+static uint32_t g_jit_hot_used;
 static psx_jit_stats_t g_jit_stats;
 
-/* Emulated cycles accumulated by the fallback inside the running block */
+/* Dispatches that ran a block from SDRAM since the tiers were last revised,
+   and how many of those it takes to revise them again. */
+#ifndef PSX_JIT_RETIER_BASE
+#define PSX_JIT_RETIER_BASE 16384u
+#endif
+#define PSX_JIT_RETIER_MAX_SHIFT 6u
+
+static uint32_t g_jit_cold_runs;
+static uint32_t g_jit_retier_at = PSX_JIT_RETIER_BASE;
+static uint32_t g_jit_retier_shift;
+
+/* Emulated cycles accumulated by the fallback inside the running blocks */
 static uint32_t g_jit_cycles;
 
-typedef uint32_t (*psx_jit_fn)(psx_cpu_t *cpu);
+/* ------------------------------------------------------------------ entry stub */
+
+/*
+    Runs translated code: sets up the registers every block relies on and jumps
+    to `code`. Blocks hand over to one another without coming back; whichever
+    block stops - out of budget, a register jump, a miss - returns to
+    psx_jit_block_exit through r10, and r5 is the emulated cycles of all of them.
+
+    psx_jit_block_exit is also what the link of a block that has no code points
+    at, so "jump into the next block" is safe whether or not there is one.
+*/
+uint32_t psx_jit_enter(psx_cpu_t *cpu, uint32_t code, uint32_t budget, const psx_jit_regs_t *regs);
+void psx_jit_block_exit(void);
+
+__attribute__((naked, noinline, used, section(".ramfunc.$SRAM_ITC")))
+uint32_t psx_jit_enter(psx_cpu_t *cpu, uint32_t code, uint32_t budget, const psx_jit_regs_t *regs)
+{
+    __asm__(
+        "push {r4-r10, lr}\n"
+        "mov r4, r0\n"
+        "movs r5, #0\n"
+        "mov r8, r2\n"
+        "ldr r6, [r3, #0]\n"
+        "ldr r7, [r3, #4]\n"
+        "ldr r10, [r3, #8]\n"
+        "add r9, r3, #12\n"
+        "bx r1\n"
+        ".balign 4\n"
+        ".global psx_jit_block_exit\n"
+        ".thumb_func\n"
+        ".type psx_jit_block_exit, %function\n"
+        "psx_jit_block_exit:\n"
+        "mov r0, r5\n"
+        "pop {r4-r10, pc}\n"
+    );
+}
 
 /* ------------------------------------------------------------------ helpers */
-
-/* Runs exactly one guest instruction through the interpreter and reports
-   whether control flow left the straight line the block was compiled for.
-   Re-fetching the opcode here is what makes self modifying code safe. */
-/* Slow path helpers for guest memory accesses that are not plain RAM. They are
-   plain C calls, so the generated code only needs to pass the address. */
-uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_read32_slow(psx_cpu_t *cpu, uint32_t addr)
-{
-    const uint32_t value = psx_bus_fast_read32(cpu->bus, addr);
-
-    g_jit_cycles += psx_bus_fast_take_cycles(cpu->bus);
-
-    return value;
-}
-
-uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_read16_slow(psx_cpu_t *cpu, uint32_t addr)
-{
-    const uint32_t value = psx_bus_fast_read16(cpu->bus, addr);
-
-    g_jit_cycles += psx_bus_fast_take_cycles(cpu->bus);
-
-    return value;
-}
-
-uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_read8_slow(psx_cpu_t *cpu, uint32_t addr)
-{
-    const uint32_t value = psx_bus_fast_read8(cpu->bus, addr);
-
-    g_jit_cycles += psx_bus_fast_take_cycles(cpu->bus);
-
-    return value;
-}
-
-void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_write32_slow(psx_cpu_t *cpu, uint32_t addr, uint32_t value)
-{
-    psx_bus_fast_write32(cpu->bus, addr, value);
-
-    g_jit_cycles += psx_bus_fast_take_cycles(cpu->bus);
-}
-
-void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_write16_slow(psx_cpu_t *cpu, uint32_t addr, uint32_t value)
-{
-    psx_bus_fast_write16(cpu->bus, addr, value);
-
-    g_jit_cycles += psx_bus_fast_take_cycles(cpu->bus);
-}
-
-void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_write8_slow(psx_cpu_t *cpu, uint32_t addr, uint32_t value)
-{
-    psx_bus_fast_write8(cpu->bus, addr, value);
-
-    g_jit_cycles += psx_bus_fast_take_cycles(cpu->bus);
-}
 
 #if PSX_JIT_HIST
 static uint32_t __attribute__((section(".bss.$SRAM_DTC"))) g_jit_hist[PSX_JIT_HIST_SIZE];
@@ -131,13 +169,20 @@ static inline void jit_hist_note(uint32_t opcode)
 }
 #endif
 
-/* Runs one instruction in the interpreter and reports whether control flow left
-   the straight line: cpu->saved_pc is the address the interpreter fetched from,
-   so the block does not have to pass the expected pc in. */
-uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_op(psx_cpu_t *cpu)
-{
-    psx_cpu_cycle(cpu);
+/*
+    What an interpreted instruction in the middle of a block reports back: non
+    zero makes the block return to the dispatcher.
 
+    That is the case when control flow left the straight line (cpu->saved_pc is
+    the address the interpreter fetched from, so the block does not have to pass
+    the expected pc in) - and when the instruction produced state that only the
+    dispatcher deals with: an interrupt that is now pending and enabled, or an
+    isolated cache. Blocks hand over to each other without looking at either, so
+    this is the one place that keeps both from going unnoticed until the end of
+    the slice; pc / next_pc are correct here, the interpreter just ran.
+*/
+static inline uint32_t jit_after_interp(psx_cpu_t *cpu)
+{
     g_jit_cycles += cpu->last_cycles;
     g_jit_stats.interp_steps++;
 
@@ -145,7 +190,40 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_op(psx_cp
     jit_hist_note(cpu->opcode);
 #endif
 
-    return (cpu->pc != (cpu->saved_pc + 4u)) ? 1u : 0u;
+    if (cpu->pc != (cpu->saved_pc + 4u))
+        return 1u;
+
+    const uint32_t sr = cpu->cop0_r[COP0_SR];
+
+    if ((sr & SR_ISC) || ((sr & SR_IEC) && (sr & cpu->cop0_r[COP0_CAUSE] & 0x00000700u)))
+        return 1u;
+
+    /* A device register was written: the slice this block runs in was sized
+       from the devices' deadlines, and one of them may just have moved closer.
+       psx_update looks at it again before anything else runs. */
+    if (g_psx_bus_io_written)
+        return 1u;
+
+    return 0u;
+}
+
+/* One instruction through the interpreter; pc / next_pc are already right */
+uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_op(psx_cpu_t *cpu)
+{
+    psx_cpu_cycle(cpu);
+
+    return jit_after_interp(cpu);
+}
+
+/* The same after natively translated instructions, which do not advance the pc */
+uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_op_at(psx_cpu_t *cpu, uint32_t pc)
+{
+    cpu->pc = pc;
+    cpu->next_pc = pc + 4u;
+
+    psx_cpu_cycle(cpu);
+
+    return jit_after_interp(cpu);
 }
 
 /* Escape path of a natively translated load: the address turned out not to be
@@ -154,22 +232,133 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_op(psx_cp
    apply it, so it is applied here. That is equivalent: the translator only
    takes the native path when the following instruction neither reads nor writes
    the loaded register, so nobody can observe the earlier write back. */
-uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_load(psx_cpu_t *cpu)
+uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_load_at(psx_cpu_t *cpu, uint32_t pc)
 {
+    cpu->pc = pc;
+    cpu->next_pc = pc + 4u;
+
     psx_cpu_cycle(cpu);
 
-    g_jit_cycles += cpu->last_cycles;
-    g_jit_stats.interp_steps++;
-
     if (cpu->pc != (cpu->saved_pc + 4u))
-        return 1u; /* exception or branch: leave the load pending, block exits */
+    {
+        /* exception: the load stays pending, the block exits */
+        g_jit_cycles += cpu->last_cycles;
+        g_jit_stats.interp_steps++;
+
+        return 1u;
+    }
 
     cpu->r[cpu->load_d] = cpu->load_v;
     cpu->r[0] = 0;
     cpu->load_v = 0xffffffffu;
     cpu->load_d = 0;
 
-    return 0u;
+    return jit_after_interp(cpu);
+}
+
+/*
+    Escape of a natively translated load or store whose address is not plain RAM.
+
+    Nearly all of those are the scratchpad - FF7 keeps its 3D working set there -
+    and that is memory like any other, so it is served here, from what the block
+    passes along about the access, at a fraction of an interpreter step (whose
+    fetch alone is a data cache miss). Anything else, and anything misaligned,
+    still goes to the interpreter, which does the device access or raises the
+    address error.
+*/
+uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_mem_escape(psx_cpu_t *cpu, uint32_t pc,
+                                                                           uint32_t addr, uint32_t desc)
+{
+    const uint32_t off = (addr & 0x1fffffffu) - PSX_SPAD_FAST_BASE;
+    const uint32_t size = PSX_JIT_MD_SIZE(desc);
+
+    if ((off < PSX_SPAD_FAST_SIZE) && !(addr & (size - 1u)))
+    {
+        uint8_t *const p = cpu->bus->scratchpad->buf + off;
+        const uint32_t rt = PSX_JIT_MD_RT(desc);
+
+        if (desc & PSX_JIT_MD_STORE)
+        {
+            const uint32_t v = cpu->r[rt];
+
+            if (size == 4u)
+                *(uint32_t *)p = v;
+            else if (size == 2u)
+                *(uint16_t *)p = (uint16_t)v;
+            else
+                *p = (uint8_t)v;
+        }
+        else
+        {
+            uint32_t v;
+
+            if (size == 4u)
+                v = *(const uint32_t *)p;
+            else if (size == 2u)
+                v = (desc & PSX_JIT_MD_SIGNED) ? (uint32_t)(int32_t)*(const int16_t *)p : *(const uint16_t *)p;
+            else
+                v = (desc & PSX_JIT_MD_SIGNED) ? (uint32_t)(int32_t)*(const int8_t *)p : *p;
+
+            if (desc & PSX_JIT_MD_PENDING)
+            {
+                /* as the interpreter leaves it: the next instruction, which
+                   the block has interpreted, applies it */
+                cpu->load_d = rt;
+                cpu->load_v = v;
+            }
+            else if (rt)
+            {
+                cpu->r[rt] = v;
+            }
+        }
+
+        const uint32_t cycles = 2u + cpu->bus->scratchpad->bus_delay;
+
+        g_jit_cycles += cycles;
+        cpu->total_cycles += cycles;
+
+        return 0u;
+    }
+
+    if ((desc & PSX_JIT_MD_STORE) || (desc & PSX_JIT_MD_PENDING))
+        return psx_jit_interp_op_at(cpu, pc);
+
+    return psx_jit_interp_load_at(cpu, pc);
+}
+
+/* LWC2 / SWC2 */
+uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_gte_transfer(psx_cpu_t *cpu, uint32_t pc,
+                                                                             uint32_t opcode)
+{
+    const uint32_t diverged = psx_cpu_gte_transfer(cpu, pc, opcode);
+
+    g_jit_cycles += cpu->last_cycles;
+
+    if (diverged)
+        return 1u;
+
+    /* the store may have been to a device register */
+    return g_psx_bus_io_written ? 1u : 0u;
+}
+
+/* A delay slot the block could not run natively after all: the interpreter runs
+   it with the branch pending, and leaves pc at the target (or at an exception
+   vector). The block ends right after, so there is nothing to report. */
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_delay(psx_cpu_t *cpu, uint32_t pc,
+                                                                         uint32_t next_pc)
+{
+    cpu->pc = pc;
+    cpu->next_pc = next_pc;
+    cpu->branch = 1;
+
+    psx_cpu_cycle(cpu);
+
+    g_jit_cycles += cpu->last_cycles;
+    g_jit_stats.interp_steps++;
+
+#if PSX_JIT_HIST
+    jit_hist_note(cpu->opcode);
+#endif
 }
 
 /* ------------------------------------------------------------------ lookup */
@@ -179,19 +368,53 @@ static inline uint32_t jit_hash(uint32_t pc)
     return (pc >> 2) & (PSX_JIT_HASH_SIZE - 1u);
 }
 
-static inline psx_jit_block_t *jit_lookup(uint32_t pc)
+/* index + 1 of the block at pc, 0 when there is none */
+static inline uint32_t jit_lookup(uint32_t pc)
 {
-    psx_jit_block_t *b = g_jit_hash[jit_hash(pc)];
+    uint32_t i = g_jit_hash[jit_hash(pc)];
 
-    while (b)
+    while (i)
     {
-        if (b->pc == pc)
-            return b;
+        if (g_jit_link[i - 1u].pc == pc)
+            return i;
 
-        b = b->next;
+        i = g_jit_meta[i - 1u].next;
     }
 
     return 0;
+}
+
+/* The block at pc, created as a bare link when it is not known yet */
+static uint32_t jit_get_block(uint32_t pc)
+{
+    uint32_t i = jit_lookup(pc);
+
+    if (i)
+        return i;
+
+    if (g_jit_block_count >= PSX_JIT_MAX_BLOCKS)
+        return 0;
+
+    i = ++g_jit_block_count;
+
+    psx_jit_link_t *const l = &g_jit_link[i - 1u];
+    psx_jit_meta_t *const m = &g_jit_meta[i - 1u];
+
+    l->pc = pc;
+    l->code = g_jit_regs.exit;
+
+    m->master = 0;
+    m->size = 0;
+    m->page_next = 0;
+    m->heat = 0;
+    m->hot = 0;
+    m->instr = 0;
+    m->next = g_jit_hash[jit_hash(pc)];
+
+    g_jit_hash[jit_hash(pc)] = (uint16_t)i;
+    g_jit_stats.blocks = g_jit_block_count;
+
+    return i;
 }
 
 void psx_jit_reset(void)
@@ -201,45 +424,60 @@ void psx_jit_reset(void)
     memset(g_psx_jit_code_pages, 0, sizeof(g_psx_jit_code_pages));
 
     g_jit_block_count = 0;
-    g_jit_code_used = 0;
+    g_jit_master_used = 0;
+    g_jit_hot_used = 0;
+
+    g_jit_cold_runs = 0;
+    g_jit_retier_shift = 0;
+    g_jit_retier_at = PSX_JIT_RETIER_BASE;
 
     g_jit_stats.blocks = 0;
     g_jit_stats.code_used = 0;
+    g_jit_stats.hot_used = 0;
+    g_jit_stats.hot_blocks = 0;
     g_jit_stats.flushes++;
-
-    __asm volatile("dsb\n\tisb" ::: "memory");
 }
 
 void psx_jit_init(void)
 {
     memset(&g_jit_stats, 0, sizeof(g_jit_stats));
+    memset(&g_jit_regs, 0, sizeof(g_jit_regs));
+
+    g_jit_regs.pages = (uint32_t)(uintptr_t)g_psx_jit_code_pages;
+    g_jit_regs.exit = (uint32_t)(uintptr_t)&psx_jit_block_exit | 1u;
+
+    g_jit_regs.helpers[PSX_JIT_H_INTERP / 4u] = (uint32_t)(uintptr_t)&psx_jit_interp_op;
+    g_jit_regs.helpers[PSX_JIT_H_INTERP_AT / 4u] = (uint32_t)(uintptr_t)&psx_jit_interp_op_at;
+    g_jit_regs.helpers[PSX_JIT_H_LOAD_AT / 4u] = (uint32_t)(uintptr_t)&psx_jit_interp_load_at;
+    g_jit_regs.helpers[PSX_JIT_H_DELAY / 4u] = (uint32_t)(uintptr_t)&psx_jit_interp_delay;
+    g_jit_regs.helpers[PSX_JIT_H_GTE / 4u] = (uint32_t)(uintptr_t)&psx_cpu_gte_command;
+    g_jit_regs.helpers[PSX_JIT_H_GTE_READ / 4u] = (uint32_t)(uintptr_t)&psx_cpu_gte_read;
+    g_jit_regs.helpers[PSX_JIT_H_GTE_WRITE / 4u] = (uint32_t)(uintptr_t)&psx_cpu_gte_write;
+    g_jit_regs.helpers[PSX_JIT_H_GTE_MEM / 4u] = (uint32_t)(uintptr_t)&psx_jit_gte_transfer;
+    g_jit_regs.helpers[PSX_JIT_H_MEM / 4u] = (uint32_t)(uintptr_t)&psx_jit_mem_escape;
 
     psx_jit_reset();
 
     g_jit_stats.flushes = 0;
 }
 
-/* Unlinks one block from the lookup structures. The code it occupies is not
-   reclaimed - the cache is compacted by a full flush when it runs out. */
-static void jit_kill_block(psx_jit_block_t *b)
+/* Takes the code away from one block. Its link stays - other blocks jump
+   through it - and points back at the dispatcher, which translates the block
+   again the next time it is reached. The code it occupied is not reclaimed; the
+   code area is only ever emptied as a whole. */
+static void jit_kill_block(uint32_t i)
 {
-    psx_jit_block_t **pp = &g_jit_hash[jit_hash(b->pc)];
+    psx_jit_meta_t *const m = &g_jit_meta[i - 1u];
 
-    while (*pp)
-    {
-        if (*pp == b)
-        {
-            *pp = b->next;
-            break;
-        }
+    g_jit_link[i - 1u].code = g_jit_regs.exit;
 
-        pp = &(*pp)->next;
-    }
+    if (m->size)
+        g_jit_stats.killed++;
 
-    b->pc = 0xffffffffu;
-    b->code = 0;
-
-    g_jit_stats.killed++;
+    m->size = 0;
+    m->hot = 0;
+    m->heat = 0;
+    m->page_next = 0;
 }
 
 void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_invalidate(uint32_t addr, uint32_t size)
@@ -258,15 +496,15 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_invalidate(uint32_t 
 
         g_jit_stats.invalidations++;
 
-        psx_jit_block_t *b = g_jit_page_head[p];
+        uint32_t i = g_jit_page_head[p];
 
-        while (b)
+        while (i)
         {
-            psx_jit_block_t *next = b->page_next;
+            const uint32_t next = g_jit_meta[i - 1u].page_next;
 
-            jit_kill_block(b);
+            jit_kill_block(i);
 
-            b = next;
+            i = next;
         }
 
         g_jit_page_head[p] = 0;
@@ -274,220 +512,225 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_invalidate(uint32_t 
     }
 }
 
-/* ------------------------------------------------------------------ compile */
+/* ------------------------------------------------------------------ tiers */
 
-static psx_jit_block_t *jit_alloc_block(uint32_t pc)
+/* 0 for a block that never ran, otherwise the position of the top bit + 1 */
+static inline uint32_t jit_heat_class(uint32_t heat)
 {
-    if (g_jit_block_count >= PSX_JIT_MAX_BLOCKS)
-        return 0;
-
-    psx_jit_block_t *b = &g_jit_blocks[g_jit_block_count++];
-
-    b->pc = pc;
-    b->instr = 0;
-    b->page = 0;
-    b->code = 0;
-    b->page_next = 0;
-    b->next = g_jit_hash[jit_hash(pc)];
-
-    g_jit_hash[jit_hash(pc)] = b;
-    g_jit_stats.blocks = g_jit_block_count;
-
-    return b;
+    return heat ? (32u - (uint32_t)__builtin_clz(heat)) : 0u;
 }
 
-static psx_jit_block_t *jit_compile(psx_cpu_t *cpu, uint32_t pc)
-{
-    psx_emit_t e;
-    uint16_t *exits[PSX_JIT_MAX_INSTR * 2 + 4];
-    uint32_t exit_count = 0;
+/*
+    Revises which blocks run from ITCM.
 
-    if ((g_jit_block_count >= PSX_JIT_MAX_BLOCKS) ||
-        ((PSX_JIT_CODE_SIZE - g_jit_code_used) < 2048u))
+    The blocks are ranked by how often the dispatcher entered them since the last
+    revision (halved each time, so the past fades rather than vanishes) and the
+    hot tier is filled from the top: whole heat classes while they fit, then as
+    much of the next one as there is room for. The tier is rebuilt from the
+    master copies rather than patched up, which keeps it free of holes; that is
+    80 KB of copying at worst, and it only happens when enough dispatches ran
+    from SDRAM to be worth it.
+
+    Only called from the dispatcher, never while a block is on the stack.
+*/
+static void jit_retier(void)
+{
+    PROF_T0(t_tier);
+
+    uint32_t bytes[18];
+
+    for (uint32_t k = 0; k < 18u; k++)
+        bytes[k] = 0;
+
+    for (uint32_t i = 0; i < g_jit_block_count; i++)
     {
-        psx_jit_reset();
+        const psx_jit_meta_t *const m = &g_jit_meta[i];
+
+        if (m->size)
+            bytes[jit_heat_class(m->heat)] += m->size;
     }
 
-    psx_jit_block_t *b = jit_alloc_block(pc);
+    /* classes `full` and above go in entirely, class `part` as far as it fits */
+    uint32_t room = PSX_JIT_CODE_SIZE;
+    uint32_t full = 17u;
+    uint32_t part = 0;
 
-    if (!b)
-        return 0;
-
-    psx_emit_init(&e, &g_jit_code[g_jit_code_used], PSX_JIT_CODE_SIZE - g_jit_code_used);
-
-    /* prologue */
-    psx_emit_push(&e, (1u << PSX_R4) | (1u << PSX_R5) | (1u << PSX_R6) | (1u << PSX_R7) | (1u << PSX_LR));
-    psx_emit_mov(&e, PSX_JIT_CPU, PSX_R0);
-    psx_emit_mov_imm8(&e, PSX_JIT_CYC, 0);
-    psx_emit_imm32(&e, PSX_JIT_RAM, (uint32_t)(uintptr_t)cpu->bus->ram->buf);
-    psx_emit_imm32(&e, PSX_JIT_PAGES, (uint32_t)(uintptr_t)g_psx_jit_code_pages);
-
-    psx_jit_ctx_t ctx;
-
-    ctx.e = &e;
-    ctx.helper_interp = (uint32_t)(uintptr_t)&psx_jit_interp_op;
-    ctx.helper_mem = (uint32_t)(uintptr_t)&psx_jit_interp_load;
-    ctx.exits = exits;
-    ctx.exit_count = &exit_count;
-    ctx.exit_max = (uint32_t)(sizeof(exits) / sizeof(exits[0]));
-    ctx.force_next = 0;
-    ctx.cycles_done = 0;
-    ctx.helper_gte = (uint32_t)(uintptr_t)&psx_cpu_gte_command;
-    ctx.bus = cpu->bus;
-
-    uint32_t guest = pc;
-    uint32_t count = 0;
-    uint32_t native = 0;
-    uint32_t pending_cycles = 0;
-
-    /* The dispatcher guarantees there is no pending load and no pending branch
-       when a block is entered, so the first instruction needs no special care. */
-    int force_interp = 0;
-
-    /* Natively translated instructions do not advance pc / next_pc */
-    int state_stale = 0;
-
-    const uint32_t page_end = (pc | ((1u << PSX_JIT_PAGE_SHIFT) - 1u)) + 1u;
-
-    uint32_t op = psx_bus_fast_read32(cpu->bus, guest);
-
-    while ((count < PSX_JIT_MAX_INSTR) && (guest < page_end) && !e.overflow)
+    for (uint32_t k = 16u; k >= 1u; k--)
     {
-        const uint32_t next_op = ((guest + 4u) < page_end)
-                                     ? psx_bus_fast_read32(cpu->bus, guest + 4u)
-                                     : 0xffffffffu; /* unknown: treated as "uses everything" */
-
-        ctx.guest = guest;
-        ctx.next_op = next_op;
-
-        /* The interpreter fires the BIOS TTY hook when it fetches from 0xb4, so
-           that instruction - and the branch it may be the delay slot of - stays
-           interpreted. Decided at compile time, so it costs nothing to run. */
-        if ((((guest & 0x3fffffffu) == 0x000000b4u)) ||
-            (((guest + 4u) & 0x3fffffffu) == 0x000000b4u))
-            force_interp = 1;
-
-        int emitted = 0;
-        int ended = 0;
-
-        if (!force_interp)
+        if (bytes[k] > room)
         {
-            emitted = psx_jit_translate_alu(&e, op);
-
-            if (!emitted)
-            {
-                /* Anything that can escape to the interpreter needs the cycle
-                   counter flushed first: the interpreter adds its own. */
-                if (pending_cycles)
-                {
-                    psx_emit_add_imm12(&e, PSX_JIT_CYC, PSX_JIT_CYC, pending_cycles);
-                    pending_cycles = 0;
-                }
-
-                emitted = psx_jit_translate_mem(&ctx, op);
-
-                if (!emitted)
-                    emitted = psx_jit_translate_trap_alu(&ctx, op);
-
-                if (!emitted)
-                    emitted = psx_jit_translate_div(&ctx, op);
-
-                if (!emitted)
-                    emitted = psx_jit_translate_cop2(&ctx, op);
-            }
-
-            /* A branch is translated together with its delay slot and always
-               ends the block, so both instructions have to fit in it. */
-            if (!emitted && ((count + 2u) <= PSX_JIT_MAX_INSTR) && ((guest + 4u) < page_end))
-            {
-                emitted = psx_jit_translate_branch(&ctx, op, next_op);
-                ended = emitted;
-            }
-        }
-
-        if (ended)
-        {
-            /* branch plus delay slot: two instructions, and the pc the block
-               leaves behind has already been stored */
-            pending_cycles += 4u;
-            native += 2u;
-            guest += 8u;
-            count += 2u;
-            state_stale = 0;
-
+            part = k;
             break;
         }
 
-        if (emitted)
-        {
-            /* a GTE command adds its own, variable, cycle count */
-            if (!ctx.cycles_done)
-                pending_cycles += 2u;
+        room -= bytes[k];
+        full = k;
+    }
 
-            native++;
-            force_interp = ctx.force_next;
-            state_stale = 1;
-            ctx.force_next = 0;
-            ctx.cycles_done = 0;
+    uint32_t used = 0;
+    uint32_t hot_blocks = 0;
+    uint32_t promoted = 0;
+
+    for (uint32_t i = 0; i < g_jit_block_count; i++)
+    {
+        psx_jit_meta_t *const m = &g_jit_meta[i];
+
+        if (!m->size)
+            continue;
+
+        const uint32_t k = jit_heat_class(m->heat);
+
+        int want = (k >= full);
+
+        if (!want && part && (k == part) && (m->size <= room))
+        {
+            want = 1;
+            room -= m->size;
+        }
+
+        if (want && ((used + m->size) <= PSX_JIT_CODE_SIZE))
+        {
+            memcpy(&g_jit_code[used], &g_jit_master[m->master], m->size);
+
+            g_jit_link[i].code = (uint32_t)(uintptr_t)&g_jit_code[used] | 1u;
+
+            used += m->size;
+            hot_blocks++;
+
+            if (!m->hot)
+                promoted++;
+
+            m->hot = 1;
         }
         else
         {
-            if (pending_cycles)
-            {
-                psx_emit_add_imm12(&e, PSX_JIT_CYC, PSX_JIT_CYC, pending_cycles);
-                pending_cycles = 0;
-            }
+            g_jit_link[i].code = (uint32_t)(uintptr_t)&g_jit_master[m->master] | 1u;
 
-            /* The interpreter fetches from cpu->pc, so publish it when the
-               natively translated instructions left it behind. It must not be
-               touched when the previous instruction was interpreted: it may
-               have set up a branch (pc = delay slot, next_pc = target). */
-            psx_jit_emit_interp_one(&ctx, state_stale);
-
-            state_stale = 0;
-
-            /* After a branch the next instruction is its delay slot and only
-               the interpreter keeps pc / next_pc consistent through it; after a
-               load the next instruction must observe the load delay slot. */
-            force_interp = psx_jit_is_branch(op) || psx_jit_leaves_pending_load(op);
+            m->hot = 0;
         }
 
-        guest += 4u;
-        count++;
-        op = next_op;
+        m->heat >>= 1;
     }
 
-    if (pending_cycles)
-        psx_emit_add_imm12(&e, PSX_JIT_CYC, PSX_JIT_CYC, pending_cycles);
+    g_jit_hot_used = used;
 
-    /* Straight line end: publish where the block stopped, unless the last
-       instruction was interpreted (it already left pc / next_pc correct,
-       including branch targets). */
-    if (state_stale)
-        psx_jit_publish_pc(&e, guest);
+    /* ITCM was written through the data side: make it visible to fetch */
+    __asm volatile("dsb\n\tisb" ::: "memory");
 
-    /* exits from the middle land here: pc is already correct */
-    const uint32_t epilogue = psx_emit_here(&e);
+    /* When a revision changes next to nothing the hot code simply does not fit,
+       and revising it again soon would only burn time: back off. */
+    if (promoted < 8u)
+    {
+        if (g_jit_retier_shift < PSX_JIT_RETIER_MAX_SHIFT)
+            g_jit_retier_shift++;
+    }
+    else
+    {
+        g_jit_retier_shift = 0;
+    }
 
-    for (uint32_t i = 0; i < exit_count; i++)
-        psx_emit_patch_bcond(exits[i], PSX_CC_NE, epilogue);
+    g_jit_retier_at = PSX_JIT_RETIER_BASE << g_jit_retier_shift;
+    g_jit_cold_runs = 0;
 
-    psx_emit_mov(&e, PSX_R0, PSX_JIT_CYC);
-    psx_emit_pop(&e, (1u << PSX_R4) | (1u << PSX_R5) | (1u << PSX_R6) | (1u << PSX_R7) | (1u << PSX_PC));
+    g_jit_stats.retiers++;
+    g_jit_stats.hot_used = used;
+    g_jit_stats.hot_blocks = hot_blocks;
 
-    if (e.overflow || (count == 0))
+    PROF_ADD(jit_tier, t_tier);
+}
+
+/* ------------------------------------------------------------------ compile */
+
+static uint32_t jit_read32(void *ud, uint32_t addr)
+{
+    return psx_bus_fast_read32(((psx_cpu_t *)ud)->bus, addr);
+}
+
+static uint32_t jit_link_of(void *ud, uint32_t pc)
+{
+    (void)ud;
+
+    const uint32_t i = jit_get_block(pc);
+
+    return i ? (uint32_t)(uintptr_t)&g_jit_link[i - 1u] : 0u;
+}
+
+/* Translates the block at pc; returns its index + 1, 0 when that failed */
+static uint32_t jit_compile(psx_cpu_t *cpu, uint32_t pc)
+{
+    PROF_T0(t_cmp);
+
+    /* A block needs a link for itself and one for each way out of it, and the
+       code area is only ever emptied as a whole: no block is running while the
+       dispatcher is here, so nothing can be left pointing into it. */
+    if (((g_jit_block_count + 3u) > PSX_JIT_MAX_BLOCKS) ||
+        ((PSX_JIT_MASTER_SIZE - g_jit_master_used) < PSX_JIT_SCRATCH_BYTES))
     {
         psx_jit_reset();
+    }
+
+    g_jit_regs.ram = (uint32_t)(uintptr_t)cpu->bus->ram->buf;
+
+    const uint32_t index = jit_get_block(pc);
+
+    if (!index)
+        return 0;
+
+    uint16_t scratch[PSX_JIT_SCRATCH_BYTES / 2u];
+
+    psx_emit_t e;
+    psx_jit_ctx_t ctx;
+    psx_jit_block_info_t info;
+
+    int ok = 0;
+
+    /* A block that does not fit the scratch space is cut shorter; with the
+       sizes above that is a formality. */
+    for (uint32_t max_instr = PSX_JIT_MAX_INSTR; max_instr && !ok; max_instr >>= 1)
+    {
+        psx_emit_init(&e, scratch, (uint32_t)sizeof(scratch));
+
+        ctx.e = &e;
+        ctx.read32 = jit_read32;
+        ctx.get_link = jit_link_of;
+        ctx.ud = cpu;
+
+        ok = psx_jit_build_block(&ctx, pc, max_instr, PSX_JIT_PAGE_MASK, &info);
+    }
+
+    if (!ok)
+    {
+        PROF_ADD(jit_cmp, t_cmp);
         return 0;
     }
 
-    b->instr = (uint16_t)count;
-    b->code = (uint32_t)(uintptr_t)e.start | 1u; /* Thumb */
+    const uint32_t size = (psx_emit_size(&e) + 3u) & ~3u;
 
-    g_jit_code_used += psx_emit_size(&e);
-    g_jit_stats.code_used = g_jit_code_used;
+    uint8_t *const code = &g_jit_master[g_jit_master_used];
+
+    memcpy(code, scratch, size);
+
+    /* The code went in through the data cache and will be fetched through the
+       instruction cache: push it out to SDRAM and drop whatever the instruction
+       cache still holds for these addresses from before the last flush. */
+    SCB_CleanDCache_by_Addr((void *)code, (int32_t)size);
+    SCB_InvalidateICache_by_Addr((void *)code, (int32_t)size);
+
+    psx_jit_meta_t *const m = &g_jit_meta[index - 1u];
+
+    m->master = g_jit_master_used;
+    m->size = (uint16_t)size;
+    m->instr = (uint8_t)info.instr;
+    m->heat = 0;
+    m->hot = 0;
+
+    g_jit_link[index - 1u].code = (uint32_t)(uintptr_t)code | 1u; /* Thumb */
+
+    g_jit_master_used += size;
+
+    g_jit_stats.code_used = g_jit_master_used;
     g_jit_stats.compiles++;
-    g_jit_stats.native += native;
+    g_jit_stats.native += info.native;
 
     /* Register the block with the page it was translated from, so a store into
        that page only drops the blocks actually built from it. A block never
@@ -496,28 +739,28 @@ static psx_jit_block_t *jit_compile(psx_cpu_t *cpu, uint32_t pc)
 
     if (phys < 0x200000u)
     {
-        const uint32_t page = (phys & 0x1fffffu) >> PSX_JIT_PAGE_SHIFT;
+        const uint32_t page = phys >> PSX_JIT_PAGE_SHIFT;
 
-        b->page = (uint16_t)page;
-        b->page_next = g_jit_page_head[page];
+        m->page_next = g_jit_page_head[page];
 
-        g_jit_page_head[page] = b;
+        g_jit_page_head[page] = (uint16_t)index;
         g_psx_jit_code_pages[page] = 1;
     }
 
-    /* the code was written through the data path, make it visible to fetch */
-    __asm volatile("dsb\n\tisb" ::: "memory");
+    PROF_ADD(jit_cmp, t_cmp);
 
-    return b;
+    return index;
 }
 
 /* ------------------------------------------------------------------ trap */
 
 /* Diagnostic: the guest pc must always point at RAM, BIOS or the scratchpad.
    When a translation bug corrupts control flow the pc walks into nowhere, and
-   the blocks executed just before that are what has to be inspected - so they
+   the blocks entered just before that are what has to be inspected - so they
    are kept in a ring and dumped, once, with the guest code they were built
-   from. Set PSX_JIT_TRAP to 0 for the shipped firmware. */
+   from. Blocks reached by a direct jump from another block do not pass the
+   dispatcher and are not in the ring. Set PSX_JIT_TRAP to 0 for the shipped
+   firmware. */
 #ifndef PSX_JIT_TRAP
 #define PSX_JIT_TRAP 0
 #endif
@@ -598,7 +841,7 @@ static void jit_trap_dump(psx_cpu_t *cpu)
 
 /* ------------------------------------------------------------------ dispatch */
 
-uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_step(psx_cpu_t *cpu)
+uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_step(psx_cpu_t *cpu, uint32_t budget)
 {
     const uint32_t sr = cpu->cop0_r[COP0_SR];
 
@@ -618,7 +861,11 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_step(psx_cpu_t *
 
        Keeping these here rather than in every block is what lets the first
        instruction of a block be translated natively: the block can assume the
-       plain, straight line case. */
+       plain, straight line case. Blocks that run one another directly keep to
+       the same rule: the first two can only come about through an interpreted
+       instruction or a device update, and the helpers make a block return here
+       after the former; the last two are never left behind by an exit that
+       hands over. */
     if ((sr & SR_ISC) || cpu->load_d || cpu->branch ||
         ((sr & SR_IEC) && (sr & cpu->cop0_r[COP0_CAUSE] & 0x00000700u)))
     {
@@ -636,13 +883,13 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_step(psx_cpu_t *
         jit_trap_dump(cpu);
 #endif
 
-    psx_jit_block_t *b = jit_lookup(pc);
+    uint32_t index = jit_lookup(pc);
 
-    if (!b)
+    if (!index || !g_jit_meta[index - 1u].size)
     {
-        b = jit_compile(cpu, pc);
+        index = jit_compile(cpu, pc);
 
-        if (!b)
+        if (!index)
         {
             /* could not translate: run a single instruction and try again */
             psx_cpu_cycle(cpu);
@@ -651,13 +898,21 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_step(psx_cpu_t *
         }
     }
 
+    psx_jit_meta_t *const m = &g_jit_meta[index - 1u];
+
+    if (m->heat != 0xffffu)
+        m->heat++;
+
+    if (!m->hot && (++g_jit_cold_runs >= g_jit_retier_at))
+        jit_retier();
+
 #if PSX_JIT_TRAP
     if (!g_jit_trapped)
     {
         jit_trace_t *t = &g_jit_trace[g_jit_trace_i];
 
         t->pc = pc;
-        t->instr = b->instr;
+        t->instr = m->instr;
         t->r31 = cpu->r[31];
         t->r29 = cpu->r[29];
 
@@ -667,7 +922,7 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_step(psx_cpu_t *
 
     g_jit_cycles = 0;
 
-    const uint32_t native_cycles = ((psx_jit_fn)(uintptr_t)b->code)(cpu);
+    const uint32_t native_cycles = psx_jit_enter(cpu, g_jit_link[index - 1u].code, budget, &g_jit_regs);
 
     /* Natively translated instructions never touch total_cycles, so the speed
        counters would only ever see the interpreted part of the work. */
@@ -689,8 +944,10 @@ void psx_jit_init(void) {}
 void psx_jit_reset(void) {}
 void psx_jit_invalidate(uint32_t addr, uint32_t size) { (void)addr; (void)size; }
 
-uint32_t psx_jit_step(psx_cpu_t *cpu)
+uint32_t psx_jit_step(psx_cpu_t *cpu, uint32_t budget)
 {
+    (void)budget;
+
     psx_cpu_cycle(cpu);
 
     return cpu->last_cycles;

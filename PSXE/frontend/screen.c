@@ -110,12 +110,14 @@ int32_t screen_get_base_width(psxe_screen_t *screen)
 static uint16_t __attribute__((section(".bss.$BOARD_SDRAM"), aligned(32)))
     g_rgb24_stage[SCREEN_STAGE_MAX_PIXELS];
 
-/* Native PSX pixel (mask, blue, green, red) to the RGB565 the panel wants. */
-static void screen_repack_bgr555(const uint16_t *src, int32_t width, int32_t height, uint16_t *dst)
+/* Native PSX pixel (mask, blue, green, red) to the RGB565 the panel wants.
+   `height` rows come out; every `row_step`-th source row goes in. */
+static void screen_repack_bgr555(const uint16_t *src, int32_t width, int32_t height, int32_t row_step,
+                                 uint16_t *dst)
 {
     for (int32_t y = 0; y < height; y++)
     {
-        const uint16_t *s = src + (uint32_t)y * (PSX_GPU_FB_STRIDE / 2u);
+        const uint16_t *s = src + (uint32_t)(y * row_step) * (PSX_GPU_FB_STRIDE / 2u);
         uint16_t *d = dst + (uint32_t)y * (uint32_t)width;
 
         int32_t x = 0;
@@ -203,11 +205,12 @@ static void screen_test_pattern(int32_t width, int32_t height, uint16_t *dst)
 }
 #endif
 
-static void screen_repack_rgb24(const uint8_t *src, int32_t width, int32_t height, uint16_t *dst)
+static void screen_repack_rgb24(const uint8_t *src, int32_t width, int32_t height, int32_t row_step,
+                                uint16_t *dst)
 {
     for (int32_t y = 0; y < height; y++)
     {
-        const uint8_t *s = src + (uint32_t)y * PSX_GPU_FB_STRIDE;
+        const uint8_t *s = src + (uint32_t)(y * row_step) * PSX_GPU_FB_STRIDE;
         uint16_t *d = dst + (uint32_t)y * (uint32_t)width;
 
         int32_t x = 0;
@@ -377,8 +380,153 @@ void psxe_screen_toggle_debug_mode(psxe_screen_t *screen)
 volatile uint32_t log = 0;
 
 static void psxe_screen_update_impl(psxe_screen_t *screen);
+static void psxe_screen_poll_pxp(void);
 
 static uint32_t g_presented_frames = 0;
+static int32_t s_pxp_busy = 0;
+
+#if PSXE_AUTOTEST
+static uint32_t g_diag_pxp_start, g_diag_pxp_last, g_diag_pxp_jobs, g_diag_pxp_stillbusy;
+#endif
+
+/*
+    Real time pacing.
+
+    The emulator used to be slower than a PlayStation everywhere, so it simply
+    ran flat out. It no longer is: menus, dialogue and the BIOS now run at 1.3 to
+    2 times real speed, which is as wrong as too slow. Every emulated vertical
+    blank therefore has a time at which it is due, a frame's worth of real time
+    after the previous one, and one that comes early waits for it.
+
+    Set PSXE_FRAME_LIMIT to 0 to run unthrottled, e.g. to measure a change.
+*/
+#ifndef PSXE_FRAME_LIMIT
+#define PSXE_FRAME_LIMIT 1
+#endif
+
+/* Free running core cycle counter (wraps every 7 s at 600 MHz; only ever used
+   for differences well below that). The profiler uses it as well, but it may
+   be compiled out, so it is switched on here. */
+static inline uint32_t psxe_screen_cycles(void)
+{
+    static int32_t enabled = 0;
+
+    if (!enabled)
+    {
+        CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+        DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+        enabled = 1;
+    }
+
+    return DWT->CYCCNT;
+}
+
+#if PSXE_FRAME_LIMIT
+
+/* 263 lines of 3413 GPU cycles at 53.693175 MHz: what the GPU model counts out */
+#define PSXE_FRAME_MICROSECONDS 16718u
+
+static void psxe_screen_pace(void)
+{
+    static uint32_t due = 0; /* when this vblank should happen, in core cycles */
+    static int32_t primed = 0;
+
+    const uint32_t period = (uint32_t)(((uint64_t)SystemCoreClock * PSXE_FRAME_MICROSECONDS) / 1000000u);
+    const uint32_t tick = SystemCoreClock / configTICK_RATE_HZ;
+
+    const uint32_t now = psxe_screen_cycles();
+
+    if (!primed)
+    {
+        primed = 1;
+        due = now;
+
+        return;
+    }
+
+    due += period;
+
+    /* The counter wraps, so "how late" is a signed difference; both sides stay
+       within a few frames of each other, far below half its range. */
+    const int32_t late = (int32_t)(now - due);
+
+    if (late >= 0)
+    {
+        /*
+            Behind schedule: nothing to wait for. The schedule is kept, though,
+            so that the shorter frames that follow make the time up again. A game
+            that renders every other vblank alternates a long frame with a short
+            one; waiting after every short one while writing the long ones off
+            cost such scenes a fifth of their speed (88% became 70%), and the
+            bursty video decoder much the same.
+
+            Only so far: more than a few frames behind means the emulation simply
+            is slower than real time here, and a schedule kept through that would
+            be a debt the next light scene pays back by running fast.
+        */
+        if ((uint32_t)late > (4u * period))
+            due = now;
+
+        return;
+    }
+
+    /* ahead: sleep through the whole ticks, spin through the rest */
+    for (;;)
+    {
+        const int32_t left = (int32_t)(due - psxe_screen_cycles());
+
+        if (left <= 0)
+            break;
+
+        if ((uint32_t)left > (2u * tick))
+            vTaskDelay(1);
+    }
+}
+
+#endif
+
+#if PSXE_AUTOTEST
+/* What is on screen, as 64 x 24 characters on the console: an unattended run
+   has nobody looking at the panel. 15 bpp pictures only. */
+static void psxe_screen_thumbnail(psxe_screen_t *screen)
+{
+    static const char ramp[] = " .:-=+*#%@";
+
+    psx_gpu_t *const gpu = screen->psx->gpu;
+
+    const int32_t w = (int32_t)psx_get_display_width(screen->psx);
+    const int32_t h = 240;
+
+    if (psx_get_display_format(screen->psx))
+    {
+        PRINTF("THUMB 24bpp picture, not drawn" "\r\n");
+        return;
+    }
+
+    PRINTF("THUMB %dx%d at (%u,%u)" "\r\n", (int)w, (int)h, (unsigned)gpu->disp_x, (unsigned)gpu->disp_y);
+
+    for (int32_t ty = 0; ty < 24; ty++)
+    {
+        char line[66];
+
+        for (int32_t tx = 0; tx < 64; tx++)
+        {
+            const uint32_t x = (gpu->disp_x + (uint32_t)((tx * w) / 64)) & 0x3ffu;
+            const uint32_t y = (gpu->disp_y + (uint32_t)((ty * h) / 24)) & 0x1ffu;
+            const uint32_t p = gpu->vram[x + y * 1024u];
+
+            const uint32_t luma = ((p & 0x1fu) * 2u + ((p >> 5) & 0x1fu) * 5u + ((p >> 10) & 0x1fu)) / 8u;
+
+            line[tx] = ramp[(luma * 9u) / 31u];
+        }
+
+        line[64] = 0;
+
+        PRINTF("|%s|" "\r\n", line);
+    }
+}
+#endif
 
 void psxe_screen_update(psxe_screen_t *screen)
 {
@@ -444,12 +592,17 @@ void psxe_screen_update(psxe_screen_t *screen)
             }
 #endif
 
-            PRINTF("emu: %u kcyc/s (%u%% of PS1) | vbl/s: %u | fps: %u | jit blk=%u cmp=%u flush=%u inv=%u code=%uB nat=%u int=%u\r\n",
+            PRINTF("emu: %u kcyc/s (%u%% of PS1) | vbl/s: %u | fps: %u | jit blk=%u cmp=%u flush=%u inv=%u code=%uB hot=%uB/%u tier=%u int=%u\r\n",
                    kcyc, (unsigned)((kcyc * 100u) / 33869u), vblanks, g_presented_frames,
                    (unsigned)jit->blocks, (unsigned)jit->compiles, (unsigned)jit->flushes,
                    (unsigned)jit->invalidations, (unsigned)jit->code_used,
-                   (unsigned)jit->native, (unsigned)jit->interp_steps);
+                   (unsigned)jit->hot_used, (unsigned)jit->hot_blocks, (unsigned)jit->retiers,
+                   (unsigned)jit->interp_steps);
 
+/* Display mode and pad link counters: for chasing display problems, so they
+   come with the profiler rather than costing UART time in a build that is
+   meant to be played. */
+#if PSX_PROFILE
             {
                 /* Frames from the ESP32 pad bridge, so a wiring or baud rate
                    problem is visible without a debugger: frames climbing means
@@ -468,9 +621,54 @@ void psxe_screen_update(psxe_screen_t *screen)
                        (unsigned)screen->psx->gpu->disp_x, (unsigned)screen->psx->gpu->disp_y,
                        (unsigned)pad_frames, (unsigned)pad_errors);
             }
+#endif
 
 #if PSX_JIT_HIST
             PRINTF("jit dispatch-interp=%u\r\n", (unsigned)jit->dispatch_steps);
+#endif
+
+#if PSXE_AUTOTEST
+            {
+                /* how fast is SDRAM right now: 64 KB of VRAM, read cold */
+                const uint16_t *v = (const uint16_t *)screen->psx->gpu->vram + (300u * 1024u);
+                uint32_t sum = 0;
+                const uint32_t t0 = DWT->CYCCNT;
+
+                for (uint32_t i = 0; i < 32768u; i += 16u)
+                    sum += v[i];
+
+                const uint32_t t1 = DWT->CYCCNT;
+
+                PRINTF("DIAG ccr=%08x sdramcr0=%08x sdram64k=%u cyc (sum %u) | pxp last=%u cyc jobs=%u stillbusy=%u" "\r\n",
+                       (unsigned)SCB->CCR, (unsigned)SEMC->SDRAMCR0, (unsigned)(t1 - t0), (unsigned)sum,
+                       (unsigned)g_diag_pxp_last, (unsigned)g_diag_pxp_jobs, (unsigned)g_diag_pxp_stillbusy);
+
+                PRINTF("DIAG-HW lcdif ctrl=%08x ctrl1=%08x stat=%08x cur=%08x next=%08x | pllv=%08x cscdr2=%08x cbcmr=%08x | pxp ctrl=%08x stat=%08x | semc sts0=%08x intr=%08x\r\n",
+                       (unsigned)LCDIF->CTRL, (unsigned)LCDIF->CTRL1, (unsigned)LCDIF->STAT,
+                       (unsigned)LCDIF->CUR_BUF, (unsigned)LCDIF->NEXT_BUF,
+                       (unsigned)CCM_ANALOG->PLL_VIDEO, (unsigned)CCM->CSCDR2, (unsigned)CCM->CBCMR,
+                       (unsigned)PXP->CTRL, (unsigned)PXP->STAT, (unsigned)SEMC->STS0, (unsigned)SEMC->INTR);
+
+#if PSXE_AUTOTEST_REBOOT_S
+                {
+                    /* boot soak: see what state each boot ends up in, then go again */
+                    static uint32_t up = 0;
+
+                    if (++up >= PSXE_AUTOTEST_REBOOT_S)
+                        NVIC_SystemReset();
+                }
+#endif
+
+                g_diag_pxp_jobs = 0;
+                g_diag_pxp_stillbusy = 0;
+            }
+
+            {
+                static uint32_t seconds = 0;
+
+                if ((++seconds % 15u) == 0u)
+                    psxe_screen_thumbnail(screen);
+            }
 #endif
 
             last_tick = now;
@@ -480,10 +678,37 @@ void psxe_screen_update(psxe_screen_t *screen)
         }
     }
 
-    /* Nothing was drawn since the last presented frame: the LCD already
+#if PSXE_FRAME_LIMIT
+    psxe_screen_pace();
+#endif
+
+    /* The frame the scaler was given at the last vblank goes to the panel now.
+       This must not wait for the next changed picture: there may not be one for
+       a long time - a dialogue box waiting for a button - and the frame in the
+       scaler is the box. */
+    psxe_screen_poll_pxp();
+
+    /* Nothing visible changed since the last presented frame: the LCD already
        shows this picture, so re-scaling it would be pure overhead. */
-    if (!gpu->vram_dirty)
+    if (!gpu->vram_dirty && !screen->debug_mode)
         return;
+
+    /* The panel takes one frame per refresh, so frames started closer together
+       than that only replace one another unseen: an emulation running above
+       real time was paying a full repack and scale for pictures nobody saw. The
+       picture stays marked as changed, so the next vblank tries again with
+       whatever is newest then. (15 ms rather than the panel's 16.7, so that a
+       game running at exactly the panel's rate is never made to skip.) */
+    {
+        static uint32_t last_start = 0;
+
+        const uint32_t now_cyc = psxe_screen_cycles();
+
+        if (s_pxp_busy || ((now_cyc - last_start) < ((SystemCoreClock / 1000u) * 15u)))
+            return;
+
+        last_start = now_cyc;
+    }
 
     gpu->vram_dirty = 0;
 
@@ -493,7 +718,28 @@ void psxe_screen_update(psxe_screen_t *screen)
     PROF_ADD(blit, t_blit);
 }
 
-static int32_t s_pxp_busy = 0;
+/* Hands the frame over to the panel if the scaler is done with it */
+static void psxe_screen_poll_pxp(void)
+{
+#if PSXE_AUTOTEST
+    if (s_pxp_busy && !(kPXP_CompleteFlag & PXP_GetStatusFlags(APP_PXP)))
+        g_diag_pxp_stillbusy++;
+#endif
+
+    if (!s_pxp_busy || !(kPXP_CompleteFlag & PXP_GetStatusFlags(APP_PXP)))
+        return;
+
+#if PSXE_AUTOTEST
+    g_diag_pxp_last = DWT->CYCCNT - g_diag_pxp_start;
+    g_diag_pxp_jobs++;
+#endif
+
+    PXP_ClearStatusFlags(APP_PXP, kPXP_CompleteFlag);
+
+    s_pxp_busy = 0;
+
+    DEMO_SwapBuffers();
+}
 
 /* Present the frame PXP was working on (started during the previous update) */
 static void psxe_screen_finish_pxp(void)
@@ -520,7 +766,7 @@ static void psxe_screen_finish_pxp(void)
 static void psxe_screen_update_impl(psxe_screen_t *screen)
 {
     static int32_t last_scaled_w = -1, last_scaled_h = -1;
-    static int32_t clear_pending = 2;
+    static int32_t clear_pending = 3; /* one per frame buffer */
 
     /* finish and present the previously started scaling job */
     psxe_screen_finish_pxp();
@@ -611,8 +857,8 @@ static void psxe_screen_update_impl(psxe_screen_t *screen)
         last_scaled_w = scaled_width;
         last_scaled_h = scaled_height;
 
-        /* Both buffers have to lose the old letterbox bars */
-        clear_pending = 2;
+        /* All three buffers have to lose the old letterbox bars */
+        clear_pending = 3;
 
         PRINTF("PXP scaling: %dx%d -> %dx%d, offset=(%d,%d), vram start=(%u,%u), mode=%03x\r\n",
                src_width, src_height, scaled_width, scaled_height, x_offset, y_offset,
@@ -649,10 +895,20 @@ static void psxe_screen_update_impl(psxe_screen_t *screen)
 #if PSXE_SCREEN_TEST_PATTERN
         screen_test_pattern(src_width, src_height, g_rgb24_stage);
 #else
+        /*
+            A 480 line picture is scaled down to the panel's 272, so every other
+            source row is enough to fill it - and the repack, which is bound by
+            reading the picture out of SDRAM, costs half as much. (An interlaced
+            display shows one such field per refresh anyway.)
+        */
+        const int32_t row_step = (src_height > 272) ? 2 : 1;
+
+        src_height /= row_step;
+
         if (is_24bpp)
-            screen_repack_rgb24((const uint8_t *)src, src_width, src_height, g_rgb24_stage);
+            screen_repack_rgb24((const uint8_t *)src, src_width, src_height, row_step, g_rgb24_stage);
         else
-            screen_repack_bgr555(src, src_width, src_height, g_rgb24_stage);
+            screen_repack_bgr555(src, src_width, src_height, row_step, g_rgb24_stage);
 #endif
 
         ps_buffer = g_rgb24_stage;
@@ -680,6 +936,10 @@ static void psxe_screen_update_impl(psxe_screen_t *screen)
     PXP_SetOutputBufferConfig(APP_PXP, &g_pxp_output_config);
 
     PXP_Start(APP_PXP);
+
+#if PSXE_AUTOTEST
+    g_diag_pxp_start = DWT->CYCCNT;
+#endif
 
     /* Do not block here: the emulator keeps running while PXP scales the
        frame, the result is presented at the beginning of the next frame. */

@@ -61,6 +61,23 @@ uint32_t psxe_gamepad_raw_buttons(void);
 */
 void psxe_gamepad_poll(void);
 
+/* Unattended test runs: the picker starts the first image whose name contains
+   PSXE_AUTOTEST_GAME and the pad taps the confirm button every few seconds, so
+   a build can be driven into a game without anyone at the board. Never enabled
+   in a build that is meant to be played. */
+#ifndef PSXE_AUTOTEST
+#define PSXE_AUTOTEST 0
+#endif
+
+/* Unattended boot soak: restart this many seconds into the emulation (0: never) */
+#ifndef PSXE_AUTOTEST_REBOOT_S
+#define PSXE_AUTOTEST_REBOOT_S 0
+#endif
+
+#ifndef PSXE_AUTOTEST_GAME
+#define PSXE_AUTOTEST_GAME "final"
+#endif
+
 /* Non zero once at least one valid frame has arrived. */
 int32_t psxe_gamepad_is_connected(void);
 

@@ -328,6 +328,35 @@ static void DEMO_InitLcdBackLight(void)
 
 void DEMO_InitLcd(void)
 {
+    /*
+        The panel is brought up exactly once.
+
+        It is asked for twice - by the game picker, which needs the screen before
+        there is an emulator, and by the emulator's screen layer - and the second
+        bring-up used to go through all of it again: the video PLL reprogrammed
+        under a running LCDIF, the controller reset in the middle of a frame and
+        restarted on buffer 1 whatever the buffer bookkeeping said was on screen.
+        Depending on where in the frame that hit, the LCDIF came back with its
+        FIFO overflow flag set and never let go of the SDRAM bus again: every
+        cache line fill then took about 2700 core cycles instead of 100, and the
+        whole emulator ran at a fifth of its speed until the next power cycle -
+        in roughly one boot out of ten. The same race is what shifted the picture
+        sideways now and then.
+
+        So a second call only wipes the frame buffers, which is all the caller
+        wants from it: a black screen to start from.
+    */
+    static bool s_lcdRunning = false;
+
+    if (s_lcdRunning)
+    {
+        memset((void *)s_frameBuffer, 0, sizeof(s_frameBuffer));
+
+        return;
+    }
+
+    s_lcdRunning = true;
+
     /* Initialize the display. */
     const elcdif_rgb_mode_config_t config = {
         .panelWidth    = LCD_WIDTH,
