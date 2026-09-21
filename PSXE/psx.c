@@ -56,6 +56,189 @@ uint32_t frame_count = 0;
 #if PSX_PROFILE
 psx_prof_t g_prof;
 
+/*
+    PC sampler. The cycle counters above say how long the emulator spends in the
+    parts that were instrumented; this says where the core actually is, a
+    thousand times a second, from the tick: by memory region - which is what
+    tells translated code running from the ITCM from translated code running
+    from SDRAM - and, for the two code RAMs, in 256 byte buckets that a script
+    turns into function names.
+
+    The tick interrupts a task, so the interrupted pc is in the frame on the
+    process stack. (When it interrupts another handler instead, that is still
+    the task's frame: the sample goes to what the task was doing.)
+*/
+enum
+{
+    PCS_JIT_FAST, /* translated code, ITCM tier  */
+    PCS_JIT_SLOW, /* translated code, SDRAM      */
+    PCS_ITCM,     /* dispatcher, helpers, ...    */
+    PCS_OCRAM,    /* interpreter, GTE, GPU       */
+    PCS_SDRAM,    /* anything else in SDRAM      */
+    PCS_FLASH,
+    PCS_OTHER,
+    PCS_REGIONS
+};
+
+#define PCS_SHIFT 8
+#define PCS_ITCM_BUCKETS (0x20000u >> PCS_SHIFT)
+#define PCS_OCRAM_BUCKETS (0x40000u >> PCS_SHIFT)
+#define PCS_FLASH_BUCKETS (0x80000u >> PCS_SHIFT) /* the image is about 520 KB */
+#define PCS_BUCKETS (PCS_ITCM_BUCKETS + PCS_OCRAM_BUCKETS + PCS_FLASH_BUCKETS)
+
+static volatile uint32_t g_pcs_region[PCS_REGIONS];
+static uint32_t g_pcs_range[4];
+static uint16_t __attribute__((section(".bss.$BOARD_SDRAM"))) g_pcs_hist[PCS_BUCKETS];
+
+/* translated code running from SDRAM, by where in the master area: how much
+   code would the fast tier have to hold to take most of it over? */
+#define PCS_SLOW_BUCKETS (0x400000u >> PCS_SHIFT)
+
+static uint16_t __attribute__((section(".bss.$BOARD_SDRAM"))) g_pcs_slow[PCS_SLOW_BUCKETS];
+
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) vApplicationTickHook(void)
+{
+    const uint32_t pc = ((const uint32_t *)__get_PSP())[6];
+
+    uint32_t region;
+
+    if (pc < 0x00020000u)
+    {
+        region = ((pc >= g_pcs_range[0]) && (pc < g_pcs_range[1])) ? PCS_JIT_FAST : PCS_ITCM;
+
+        if (region == PCS_ITCM)
+            g_pcs_hist[pc >> PCS_SHIFT]++;
+    }
+    else if ((pc >= 0x20200000u) && (pc < 0x20240000u))
+    {
+        region = PCS_OCRAM;
+        g_pcs_hist[PCS_ITCM_BUCKETS + ((pc - 0x20200000u) >> PCS_SHIFT)]++;
+    }
+    else if ((pc >= g_pcs_range[2]) && (pc < g_pcs_range[3]))
+    {
+        region = PCS_JIT_SLOW;
+
+        const uint32_t b = (pc - g_pcs_range[2]) >> PCS_SHIFT;
+
+        if (b < PCS_SLOW_BUCKETS)
+            g_pcs_slow[b]++;
+    }
+    else if ((pc >= 0x80000000u) && (pc < 0x82000000u))
+        region = PCS_SDRAM;
+    else if ((pc >= 0x60000000u) && (pc < 0x64000000u))
+    {
+        region = PCS_FLASH;
+
+        if (pc < 0x60080000u)
+            g_pcs_hist[PCS_ITCM_BUCKETS + PCS_OCRAM_BUCKETS + ((pc - 0x60000000u) >> PCS_SHIFT)]++;
+    }
+    else
+        region = PCS_OTHER;
+
+    g_pcs_region[region]++;
+}
+
+/* once a second: the regions; every 16th time the busiest buckets as well */
+static void psx_pcs_report(void)
+{
+    static uint32_t round = 0;
+
+    if (!g_pcs_range[1])
+        psx_jit_code_ranges(g_pcs_range);
+
+    PRINTF("PROF-PC jitfast=%u jitslow=%u itcm=%u ocram=%u sdram=%u flash=%u other=%u\r\n",
+           (unsigned)g_pcs_region[PCS_JIT_FAST], (unsigned)g_pcs_region[PCS_JIT_SLOW],
+           (unsigned)g_pcs_region[PCS_ITCM], (unsigned)g_pcs_region[PCS_OCRAM],
+           (unsigned)g_pcs_region[PCS_SDRAM], (unsigned)g_pcs_region[PCS_FLASH],
+           (unsigned)g_pcs_region[PCS_OTHER]);
+
+    for (uint32_t i = 0; i < PCS_REGIONS; i++)
+        g_pcs_region[i] = 0;
+
+    if ((++round & 15u) != 0u)
+        return;
+
+    /* the slow tier: buckets (256 bytes of code each) it takes to cover half,
+       80% and 95% of the samples, busiest first */
+    {
+        uint32_t total = 0, used = 0;
+
+        for (uint32_t i = 0; i < PCS_SLOW_BUCKETS; i++)
+        {
+            total += g_pcs_slow[i];
+            used += g_pcs_slow[i] ? 1u : 0u;
+        }
+
+        uint32_t acc = 0, n = 0, n50 = 0, n80 = 0, n95 = 0;
+
+        while (total && (acc * 100u < total * 95u))
+        {
+            uint32_t best = 0, at = 0;
+
+            for (uint32_t i = 0; i < PCS_SLOW_BUCKETS; i++)
+            {
+                if (g_pcs_slow[i] > best)
+                {
+                    best = g_pcs_slow[i];
+                    at = i;
+                }
+            }
+
+            g_pcs_slow[at] = 0;
+            acc += best;
+            n++;
+
+            if (!n50 && (acc * 100u >= total * 50u))
+                n50 = n;
+
+            if (!n80 && (acc * 100u >= total * 80u))
+                n80 = n;
+
+            n95 = n;
+        }
+
+        PRINTF("PROF-PCSLOW samples=%u buckets=%u half=%u p80=%u p95=%u\r\n", (unsigned)total, (unsigned)used,
+               (unsigned)n50, (unsigned)n80, (unsigned)n95);
+
+        for (uint32_t i = 0; i < PCS_SLOW_BUCKETS; i++)
+            g_pcs_slow[i] = 0;
+    }
+
+    PRINTF("PROF-PCTOP");
+
+    for (uint32_t n = 0; n < 110u; n++)
+    {
+        uint32_t best = 0, at = 0;
+
+        for (uint32_t i = 0; i < PCS_BUCKETS; i++)
+        {
+            if (g_pcs_hist[i] > best)
+            {
+                best = g_pcs_hist[i];
+                at = i;
+            }
+        }
+
+        if (!best)
+            break;
+
+        g_pcs_hist[at] = 0;
+
+        PRINTF(" %x=%u",
+               (unsigned)((at < PCS_ITCM_BUCKETS)
+                              ? (at << PCS_SHIFT)
+                              : ((at < (PCS_ITCM_BUCKETS + PCS_OCRAM_BUCKETS))
+                                     ? (0x20200000u + ((at - PCS_ITCM_BUCKETS) << PCS_SHIFT))
+                                     : (0x60000000u + ((at - PCS_ITCM_BUCKETS - PCS_OCRAM_BUCKETS) << PCS_SHIFT)))),
+               (unsigned)best);
+    }
+
+    PRINTF("\r\n");
+
+    for (uint32_t i = 0; i < PCS_BUCKETS; i++)
+        g_pcs_hist[i] = 0;
+}
+
 psx_io_trace_t __attribute__((section(".bss.$SRAM_DTC"))) g_io_trace[PSX_IO_TRACE_SIZE];
 volatile uint32_t g_io_trace_idx = 0;
 volatile uint32_t g_io_trace_len = 0;
@@ -178,9 +361,25 @@ void psx_prof_tick(void)
 
     uint32_t other = elapsed - g_prof.cpu - g_prof.dev;
 
-    PRINTF("PROF-MDEC idct=%u yuv=%u blocks=%u | PROF-JIT compile=%u retier=%u\r\n",
+    psx_pcs_report();
+
+    {
+        static const char *const ras_name[8] = {"cull", "flat", "flatT", "tex", "texS", "gour", "texG", "rect"};
+
+        PRINTF("PROF-RAS");
+
+        for (uint32_t k = 0; k < 8u; k++)
+            PRINTF(" %s=%u/%u/%u", ras_name[k], (unsigned)g_prof.ras_cyc[k], (unsigned)g_prof.ras_cnt[k],
+                   (unsigned)g_prof.ras_px[k]);
+
+        PRINTF(" (cycles/prims/bbox px)\r\n");
+    }
+
+    PRINTF("PROF-MDEC idct=%u yuv=%u blocks=%u | PROF-JIT compile=%u retier=%u | PROF-GTE cyc=%u cmds=%u moves=%u | PROF-DIRTY flip=%u draw=%u\r\n",
            (unsigned)g_prof.mdec_idct, (unsigned)g_prof.mdec_yuv, (unsigned)g_prof.mdec_blk,
-           (unsigned)g_prof.jit_cmp, (unsigned)g_prof.jit_tier);
+           (unsigned)g_prof.jit_cmp, (unsigned)g_prof.jit_tier,
+           (unsigned)g_prof.gte_cyc, (unsigned)g_prof.gte_cnt, (unsigned)g_prof.gte_mov,
+           (unsigned)g_prof.dirty_flip, (unsigned)g_prof.dirty_draw);
 
     PRINTF("PROF inst=%u ecyc=%u | cpu=%u gp0=%u dma=%u | dev=%u (cd=%u gpu=%u pad=%u tmr=%u dma=%u) blit=%u bwait=%u | other=%u | frames=%u gp0cmds=%u px=%u (f=%u s=%u t4=%u t8=%u t15=%u r=%u fast=%u tr=%u raw=%u) | elapsed=%u\r\n",
            g_prof.instr, g_prof.ecycles,

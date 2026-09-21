@@ -26,11 +26,16 @@
 extern uint8_t g_psx_jit_code_pages[];
 void psx_jit_invalidate(uint32_t addr, uint32_t size);
 
-/* Guest RAM write: only pages a block was compiled from need invalidating,
-   which is a single byte test in the common case. */
+/* One flag per 256 bytes of guest RAM: is there translated code in there? (The
+   same number is in jit/jit_translate.h, for the stores the recompiler emits.) */
+#define PSX_JIT_CODE_FLAG_SHIFT 8u
+
+/* Guest RAM write: only where a block was compiled from needs invalidating,
+   which is a single byte test in the common case. Stores are aligned, so one
+   never reaches into the next 256 bytes. */
 PSX_BUS_FAST void psx_bus_fast_note_write(uint32_t phys, uint32_t size)
 {
-    if (g_psx_jit_code_pages[(phys & 0x1fffffu) >> 10])
+    if (g_psx_jit_code_pages[(phys & 0x1fffffu) >> PSX_JIT_CODE_FLAG_SHIFT])
         psx_jit_invalidate(phys, size);
 }
 

@@ -3,6 +3,7 @@
 #include "bus_init.h"
 #include "bus_fast.h"
 #include "log.h"
+#include "prof.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -2261,7 +2262,9 @@ static inline PSX_GTE_HOT void psx_gte_i_invalid(psx_cpu_t *cpu)
 #define R_LB3 cpu->cop2_cr.lr.m33
 
 /* Optimized inline function for GTE RTP (Rotate, Translate, Perspective) with Depth Queuing */
-static inline void __attribute__((hot, optimize("O3"))) PSX_CPU_HOT gte_rtp_dq_impl(psx_cpu_t *cpu, uint32_t idx)
+/* (only reached with a translation vector too large for gte_rtp_plain() now, so it no longer
+   takes up room in the ITCM) */
+static inline void __attribute__((optimize("O2"))) PSX_GTE_HOT gte_rtp_dq_impl(psx_cpu_t *cpu, uint32_t idx)
 {
     /* Load vertex coordinates */
     const int64_t vx = (int64_t)((int16_t)cpu->cop2_dr.v[idx].p[0]);
@@ -2473,6 +2476,182 @@ static inline void __attribute__((always_inline)) gte_rtp(psx_cpu_t *cpu, uint32
     R_SY2 = gte_clamp_sxy(cpu, 2, (gte_clamp_mac0(cpu, (int64_t)((int32_t)R_OFY) + ((int64_t)R_IR2 * div)) >> 16));
 }
 
+/*
+    RTPS / RTPT the way every real scene runs them.
+
+    The code above checks the 44 bit accumulator for overflow and sign extends it
+    after each of the three products of a row: nine times per vertex, in 64 bit
+    arithmetic on a 32 bit core, and it was most of what a vertex cost. None of
+    it can do anything while the translation vector fits in 31 bits: TR * 4096 is
+    below 2^42 then, a product of two 16 bit numbers is at most 2^30, and the sum
+    cannot reach 2^43. So with such a translation - checked once per command, and
+    anything else takes the code above - a row is one multiply-accumulate chain.
+    The flags are collected in a register and written once.
+
+    The results are the same bit for bit, all of psx_cpu_t compared over some
+    hundred million random and edge case vertices on the host.
+*/
+static inline __attribute__((always_inline)) int gte_rtp_is_plain(const psx_cpu_t *cpu)
+{
+    return ((((uint32_t)R_TRX + 0x40000000u) | ((uint32_t)R_TRY + 0x40000000u) |
+             ((uint32_t)R_TRZ + 0x40000000u)) & 0x80000000u) == 0u;
+}
+
+static inline __attribute__((always_inline)) uint32_t gte_rtp_plain(psx_cpu_t *cpu, uint32_t idx, int dq,
+                                                                    uint32_t flag)
+{
+    const int32_t vx = cpu->cop2_dr.v[idx].p[0];
+    const int32_t vy = cpu->cop2_dr.v[idx].p[1];
+    const int32_t vz = cpu->cop2_dr.v[idx].z;
+
+    const int32_t sf = cpu->gte_sf;
+    const int32_t ir_min = cpu->gte_lm ? 0 : -0x8000;
+
+    const int64_t mac1 = ((int64_t)R_TRX << 12) + (int64_t)((int32_t)R_RT11 * vx) +
+                         (int64_t)((int32_t)R_RT12 * vy) + (int64_t)((int32_t)R_RT13 * vz);
+    const int64_t mac2 = ((int64_t)R_TRY << 12) + (int64_t)((int32_t)R_RT21 * vx) +
+                         (int64_t)((int32_t)R_RT22 * vy) + (int64_t)((int32_t)R_RT23 * vz);
+    const int64_t mac3 = ((int64_t)R_TRZ << 12) + (int64_t)((int32_t)R_RT31 * vx) +
+                         (int64_t)((int32_t)R_RT32 * vy) + (int64_t)((int32_t)R_RT33 * vz);
+
+    cpu->s_mac3 = mac3;
+
+    const int32_t mac3_12 = (int32_t)(mac3 >> 12);
+
+    const int32_t m1 = sf ? (int32_t)(mac1 >> 12) : (int32_t)mac1;
+    const int32_t m2 = sf ? (int32_t)(mac2 >> 12) : (int32_t)mac2;
+    const int32_t m3 = sf ? mac3_12 : (int32_t)mac3;
+
+    R_MAC1 = m1;
+    R_MAC2 = m2;
+    R_MAC3 = m3;
+
+    int32_t ir1 = m1;
+    int32_t ir2 = m2;
+    int32_t ir3 = m3;
+
+    if ((ir1 < ir_min) || (ir1 > 0x7fff))
+    {
+        flag |= 0x1000000u;
+        ir1 = (ir1 < ir_min) ? ir_min : 0x7fff;
+    }
+
+    if ((ir2 < ir_min) || (ir2 > 0x7fff))
+    {
+        flag |= 0x800000u;
+        ir2 = (ir2 < ir_min) ? ir_min : 0x7fff;
+    }
+
+    /* IR3 saturates on the shifted value, but its flag goes by MAC3 >> 12 */
+    if ((mac3_12 < -0x8000) || (mac3_12 > 0x7fff))
+        flag |= 0x400000u;
+
+    if ((ir3 < ir_min) || (ir3 > 0x7fff))
+        ir3 = (ir3 < ir_min) ? ir_min : 0x7fff;
+
+    R_IR1 = ir1;
+    R_IR2 = ir2;
+    R_IR3 = ir3;
+
+    int32_t sz3 = mac3_12;
+
+    if ((sz3 < 0) || (sz3 > 0xffff))
+    {
+        flag |= 0x40000u;
+        sz3 = (sz3 < 0) ? 0 : 0xffff;
+    }
+
+    R_SZ0 = R_SZ1;
+    R_SZ1 = R_SZ2;
+    R_SZ2 = R_SZ3;
+    R_SZ3 = sz3;
+
+    /* H / SZ3, by the reciprocal table */
+    uint32_t div;
+    const uint32_t h = (uint16_t)R_H;
+
+    if (h >= ((uint32_t)sz3 << 1))
+    {
+        flag |= 0x80020000u;
+        div = 0x1ffffu;
+    }
+    else
+    {
+        const int32_t shift = __builtin_clz(sz3) - 16;
+        const int32_t r1 = (sz3 << shift) & 0x7fff;
+        const int32_t r2 = g_psx_gte_unr_table[((r1 + 0x40) >> 7)] + 0x101;
+        const int32_t r3 = ((0x80 - (r2 * (r1 + 0x8000))) >> 8) & 0x1ffff;
+        const uint32_t reciprocal = ((r2 * r3) + 0x80) >> 8;
+
+        div = (uint32_t)((((uint64_t)reciprocal * (h << shift)) + 0x8000u) >> 16);
+
+        if (div > 0x1ffffu)
+            div = 0x1ffffu;
+    }
+
+    R_SXY0 = R_SXY1;
+    R_SXY1 = R_SXY2;
+
+    int64_t mac0 = (int64_t)((int32_t)R_OFX) + ((int64_t)ir1 * (int64_t)div);
+
+    if (mac0 < -0x80000000ll)
+        flag |= 0x8000u;
+    else if (mac0 > 0x7fffffffll)
+        flag |= 0x10000u;
+
+    int32_t sx2 = (int32_t)(mac0 >> 16);
+
+    if ((sx2 < -0x400) || (sx2 > 0x3ff))
+    {
+        flag |= 0x4000u;
+        sx2 = (sx2 < -0x400) ? -0x400 : 0x3ff;
+    }
+
+    mac0 = (int64_t)((int32_t)R_OFY) + ((int64_t)ir2 * (int64_t)div);
+
+    if (mac0 < -0x80000000ll)
+        flag |= 0x8000u;
+    else if (mac0 > 0x7fffffffll)
+        flag |= 0x10000u;
+
+    int32_t sy2 = (int32_t)(mac0 >> 16);
+
+    if ((sy2 < -0x400) || (sy2 > 0x3ff))
+    {
+        flag |= 0x2000u;
+        sy2 = (sy2 < -0x400) ? -0x400 : 0x3ff;
+    }
+
+    R_SX2 = (int16_t)sx2;
+    R_SY2 = (int16_t)sy2;
+
+    if (dq)
+    {
+        mac0 = ((int64_t)R_DQB) + (((int64_t)R_DQA) * (int64_t)div);
+
+        if (mac0 < -0x80000000ll)
+            flag |= 0x8000u;
+        else if (mac0 > 0x7fffffffll)
+            flag |= 0x10000u;
+
+        R_MAC0 = (int32_t)mac0;
+
+        int32_t ir0 = (int32_t)(mac0 >> 12);
+
+        if ((ir0 < 0) || (ir0 > 0x1000))
+        {
+            flag |= 0x1000u;
+            ir0 = (ir0 < 0) ? 0 : 0x1000;
+        }
+
+        R_IR0 = ir0;
+    }
+
+    cpu->s_mac0 = mac0;
+
+    return flag;
+}
+
 #define DPCT1                                                                                                         \
     {                                                                                                                 \
         int64_t mac1 = gte_clamp_mac(cpu, 1, (((int64_t)R_RFC) << 12) - (((int64_t)cpu->cop2_dr.rgb[0].c[0]) << 16)); \
@@ -2590,6 +2769,13 @@ static inline void __attribute__((always_inline)) gte_rtp(psx_cpu_t *cpu, uint32
 
 static inline PSX_GTE_HOT void psx_gte_i_rtps(psx_cpu_t *cpu)
 {
+    if (gte_rtp_is_plain(cpu))
+    {
+        R_FLAG = gte_rtp_plain(cpu, 0, 1, 0);
+
+        return;
+    }
+
     R_FLAG = 0;
     GTE_RTP_DQ(0);
 }
@@ -2960,6 +3146,17 @@ static inline PSX_GTE_HOT void psx_gte_i_avsz4(psx_cpu_t *cpu)
 
 static inline PSX_GTE_HOT void psx_gte_i_rtpt(psx_cpu_t *cpu)
 {
+    if (gte_rtp_is_plain(cpu))
+    {
+        uint32_t flag = gte_rtp_plain(cpu, 0, 0, 0);
+
+        flag = gte_rtp_plain(cpu, 1, 0, flag);
+
+        R_FLAG = gte_rtp_plain(cpu, 2, 1, flag);
+
+        return;
+    }
+
     R_FLAG = 0;
     gte_rtp(cpu, 0);
     gte_rtp(cpu, 1);
@@ -3154,7 +3351,17 @@ int32_t PSX_GTE_HOT psx_cpu_gte_command(psx_cpu_t *cpu, uint32_t opcode)
 {
     cpu->opcode = opcode;
 
+#if PSX_PROFILE
+    const uint32_t t0 = DWT->CYCCNT;
+    const int32_t cycles = psx_cpu_exec_cop2(cpu);
+
+    g_prof.gte_cyc += DWT->CYCCNT - t0;
+    g_prof.gte_cnt++;
+
+    return cycles;
+#else
     return psx_cpu_exec_cop2(cpu);
+#endif
 }
 
 /*
@@ -3176,6 +3383,8 @@ int32_t PSX_GTE_HOT psx_cpu_gte_command(psx_cpu_t *cpu, uint32_t opcode)
 */
 uint32_t PSX_GTE_HOT psx_cpu_gte_transfer(psx_cpu_t *cpu, uint32_t pc, uint32_t opcode)
 {
+    PROF_INC(gte_mov);
+
     cpu->opcode = opcode;
     cpu->saved_pc = pc;
     cpu->pc = pc + 4u;
@@ -3199,11 +3408,15 @@ uint32_t PSX_GTE_HOT psx_cpu_gte_transfer(psx_cpu_t *cpu, uint32_t pc, uint32_t 
 
 uint32_t PSX_GTE_HOT psx_cpu_gte_read(psx_cpu_t *cpu, uint32_t reg)
 {
+    PROF_INC(gte_mov);
+
     return gte_read_register(cpu, reg);
 }
 
 void PSX_GTE_HOT psx_cpu_gte_write(psx_cpu_t *cpu, uint32_t reg, uint32_t value)
 {
+    PROF_INC(gte_mov);
+
     gte_write_register(cpu, reg, value);
 }
 

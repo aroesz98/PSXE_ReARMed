@@ -301,7 +301,24 @@ static void gamepad_autotest(void)
         return;
 
     const uint32_t now = xTaskGetTickCount();
-    const uint32_t want = ((now % 3000u) < 200u) ? order[(now / 3000u) % 2u] : 0u;
+
+    uint32_t want;
+
+    if (now < 200000u)
+    {
+        want = ((now % 3000u) < 200u) ? order[(now / 3000u) % 2u] : 0u;
+    }
+    else
+    {
+        /* the intro is over: walk - a second and a half in one direction, then a
+           tap on circle - so the run gets into the first fight and through it */
+        static const uint32_t way[4] = {PSXI_SW_SDA_PAD_UP, PSXI_SW_SDA_PAD_LEFT,
+                                        PSXI_SW_SDA_PAD_UP | PSXI_SW_SDA_PAD_LEFT, PSXI_SW_SDA_PAD_DOWN};
+
+        const uint32_t t = now % 3000u;
+
+        want = (t < 1500u) ? way[(now / 3000u) % 4u] : (((t >= 2000u) && (t < 2200u)) ? PSXI_SW_SDA_CIRCLE : 0u);
+    }
 
     if (want == held)
         return;

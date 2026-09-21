@@ -35,16 +35,20 @@ extern "C" {
 /* Every translated block, in SDRAM. Sized so that a scene's whole working set
    fits and nothing has to be translated twice; emptied as a whole when full. */
 #ifndef PSX_JIT_MASTER_SIZE
-#define PSX_JIT_MASTER_SIZE (2 * 1024 * 1024)
+#define PSX_JIT_MASTER_SIZE (4 * 1024 * 1024)
 #endif
 
-/* Blocks and links to not yet translated ones. Referred to by 16 bit index. */
+/* Blocks and links to not yet translated ones. Referred to by 16 bit index.
+   Sized by measurement: FF7's battle module alone runs about 5300 different
+   blocks within its first seconds, on top of the kernel's - with 4096 entries
+   the pool overflowed, and everything was translated again, every second or
+   two for as long as a fight lasted. */
 #ifndef PSX_JIT_MAX_BLOCKS
-#define PSX_JIT_MAX_BLOCKS 4096
+#define PSX_JIT_MAX_BLOCKS 8192
 #endif
 
 #ifndef PSX_JIT_HASH_SIZE
-#define PSX_JIT_HASH_SIZE 4096 /* must be a power of two */
+#define PSX_JIT_HASH_SIZE 8192 /* must be a power of two */
 #endif
 
 /* Instructions per block. Bounded so the device update granularity (and the
@@ -67,6 +71,8 @@ typedef struct
     uint32_t hot_used;       /* bytes of the ITCM tier in use    */
     uint32_t hot_blocks;     /* blocks running from ITCM         */
     uint32_t retiers;        /* times the ITCM tier was revised  */
+    uint32_t dispatches;     /* blocks entered from the dispatcher */
+    uint32_t cold_dispatches;/* of those, into a block running from SDRAM */
 } psx_jit_stats_t;
 
 /* Counts the instructions the fallback runs, per opcode class, so the next
@@ -88,6 +94,10 @@ uint32_t psx_jit_step(psx_cpu_t *cpu, uint32_t budget);
 void psx_jit_invalidate(uint32_t addr, uint32_t size);
 
 const psx_jit_stats_t *psx_jit_get_stats(void);
+
+/* Where translated code lives: out[0..1] the fast tier, out[2..3] the master
+   area, as first and one past the last address. For the PC sampler. */
+void psx_jit_code_ranges(uint32_t out[4]);
 
 #if PSX_JIT_HIST
 /* 0..63: primary opcode, 64..127: SPECIAL function code */

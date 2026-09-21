@@ -40,25 +40,37 @@ static uint8_t __attribute__((section(".bss.$SRAM_ITC"), aligned(8))) g_jit_code
    cache line fill now and then - a small fraction of translating it again. */
 static uint8_t __attribute__((section(".bss.$BOARD_SDRAM"), aligned(32))) g_jit_master[PSX_JIT_MASTER_SIZE];
 
-/* Links are read on every jump from one block into the next, so they sit in
-   DTCM: one cycle, and nothing of the data cache is spent on them. */
-static psx_jit_link_t __attribute__((section(".bss.$SRAM_DTC"))) g_jit_link[PSX_JIT_MAX_BLOCKS];
+/*
+    The bookkeeping, split by how often it is touched. Blocks are referred to by
+    index + 1 so that 0 can mean "none".
 
-/* The rest of the bookkeeping is touched once per dispatch at most. Blocks are
-   referred to by index + 1 so that 0 can mean "none". */
+      g_jit_link   the entry points, read on every jump from one block into the
+                   next: DTCM, one cycle, and nothing of the data cache spent
+      g_jit_pc     the guest address of each, read by the lookup on every
+      g_jit_meta   dispatch, and what else a dispatch touches: OCRAM
+      g_jit_cold   what only translating, invalidating and revising the tiers
+                   look at: SDRAM
+*/
+static psx_jit_link_t __attribute__((section(".bss.$SRAM_DTC"))) g_jit_link[PSX_JIT_MAX_BLOCKS];
+static uint32_t __attribute__((section(".bss.$SRAM_OC"))) g_jit_pc[PSX_JIT_MAX_BLOCKS];
+
 typedef struct
 {
-    uint32_t master;    /* offset of the code inside g_jit_master          */
-    uint16_t size;      /* bytes of code; 0: a link only, nothing compiled */
-    uint16_t next;      /* hash chain                                      */
-    uint16_t page_next; /* blocks built from one guest page                */
-    uint16_t heat;      /* dispatches since the tiers were last revised    */
-    uint8_t hot;        /* runs from the ITCM copy                         */
-    uint8_t instr;      /* guest instructions covered                      */
-    uint16_t reserved;
+    uint16_t next; /* hash chain                                          */
+    uint16_t heat; /* dispatches since the tiers were last revised        */
+    uint8_t hot;   /* runs from the ITCM copy                             */
+    uint8_t instr; /* guest instructions covered; 0: a link only, no code */
 } psx_jit_meta_t;
 
+typedef struct
+{
+    uint32_t master;    /* offset of the code inside g_jit_master */
+    uint16_t size;      /* bytes of code                          */
+    uint16_t page_next; /* blocks built from one guest page       */
+} psx_jit_cold_t;
+
 static psx_jit_meta_t __attribute__((section(".bss.$SRAM_OC"))) g_jit_meta[PSX_JIT_MAX_BLOCKS];
+static psx_jit_cold_t __attribute__((section(".bss.$BOARD_SDRAM"))) g_jit_cold[PSX_JIT_MAX_BLOCKS];
 static uint16_t __attribute__((section(".bss.$SRAM_OC"))) g_jit_hash[PSX_JIT_HASH_SIZE];
 
 /* 1 KB page granularity over the 2 MB of guest RAM. Coarser pages caused code
@@ -69,9 +81,62 @@ static uint16_t __attribute__((section(".bss.$SRAM_OC"))) g_jit_hash[PSX_JIT_HAS
 
 static uint16_t __attribute__((section(".bss.$SRAM_OC"))) g_jit_page_head[PSX_JIT_PAGE_COUNT];
 
-/* Shared with the memory write fast path (see bus_fast.h): one byte per page,
-   checked on every guest store, so this one stays in DTCM. */
-uint8_t __attribute__((section(".bss.$SRAM_DTC"))) g_psx_jit_code_pages[PSX_JIT_PAGE_COUNT];
+/*
+    Where inside a page the translated code is: one bit per 32 bytes.
+
+    Games keep data right next to code - FF7's battle module writes variables
+    that share a 1 KB page with its inner loops several hundred times a second -
+    and dropping every block of the page for each of those writes meant
+    translating the same blocks again a thousand times a second, running them
+    cold from SDRAM in between, and breaking the links into them. A store is
+    now checked against this map first, and only a store that lands in a cell
+    that holds code walks the page's blocks - and takes away the ones it really
+    overwrites.
+*/
+static uint32_t __attribute__((section(".bss.$SRAM_OC"))) g_jit_page_cells[PSX_JIT_PAGE_COUNT];
+
+/* The guest bytes a block depends on: its instructions and the one behind them,
+   which the translator looks at to decide how the last load is delivered. */
+static inline uint32_t jit_block_span(uint32_t index, uint32_t *lo)
+{
+    *lo = g_jit_pc[index - 1u] & 0x1fffffu;
+
+    return ((uint32_t)g_jit_meta[index - 1u].instr + 1u) * 4u;
+}
+
+/* bits of the 32 byte cells that [lo, lo + len) touches inside its page */
+static inline uint32_t jit_cell_mask(uint32_t lo, uint32_t len)
+{
+    const uint32_t first = (lo & PSX_JIT_PAGE_MASK) >> 5;
+
+    uint32_t last = ((lo & PSX_JIT_PAGE_MASK) + (len ? (len - 1u) : 0u)) >> 5;
+
+    if (last > 31u)
+        last = 31u;
+
+    return (0xffffffffu >> (31u - last)) & (0xffffffffu << first);
+}
+
+/* Shared with the memory write fast path (see bus_fast.h) and with every store
+   a block does: one byte per 256 bytes of guest RAM, so this one stays in DTCM.
+   It is the cell map above, eight cells to the byte. */
+#define PSX_JIT_FLAGS_PER_PAGE (1u << (PSX_JIT_PAGE_SHIFT - PSX_JIT_CODE_FLAG_SHIFT))
+
+uint8_t __attribute__((section(".bss.$SRAM_DTC"))) g_psx_jit_code_pages[PSX_JIT_PAGE_COUNT * PSX_JIT_FLAGS_PER_PAGE];
+
+_Static_assert((PSX_JIT_PAGE_SHIFT == 10) && (PSX_JIT_CODE_FLAG_SHIFT == 8u), "four flags of eight cells to the page");
+
+static inline void jit_page_set_cells(uint32_t page, uint32_t cells)
+{
+    g_jit_page_cells[page] = cells;
+
+    uint8_t *const f = &g_psx_jit_code_pages[page * PSX_JIT_FLAGS_PER_PAGE];
+
+    f[0] = (cells & 0x000000ffu) ? 1u : 0u;
+    f[1] = (cells & 0x0000ff00u) ? 1u : 0u;
+    f[2] = (cells & 0x00ff0000u) ? 1u : 0u;
+    f[3] = (cells & 0xff000000u) ? 1u : 0u;
+}
 
 /* A block is translated into this much scratch space and copied out once its
    size is known. The longest translation of one instruction is below 100 bytes. */
@@ -116,11 +181,18 @@ static uint32_t g_jit_cycles;
     block stops - out of budget, a register jump, a miss - returns to
     psx_jit_block_exit through r10, and r5 is the emulated cycles of all of them.
 
-    psx_jit_block_exit is also what the link of a block that has no code points
-    at, so "jump into the next block" is safe whether or not there is one.
+    psx_jit_exit_link is the way out for a block that would have jumped into
+    another one but may not (the budget is used up) or cannot (the link has no
+    code): r3 is that link, and since a jump from block to block publishes
+    nothing, the guest pc the link stands for is stored here, on the way out.
 */
 uint32_t psx_jit_enter(psx_cpu_t *cpu, uint32_t code, uint32_t budget, const psx_jit_regs_t *regs);
 void psx_jit_block_exit(void);
+void psx_jit_exit_link(void);
+
+_Static_assert((offsetof(psx_cpu_t, pc) == 132u) && (offsetof(psx_cpu_t, next_pc) == 136u),
+               "psx_jit_exit_link stores pc / next_pc at fixed offsets");
+_Static_assert(PSX_JIT_H_PC_DELTA == 40u, "psx_jit_exit_link reads the delta from [r9, #40]");
 
 __attribute__((naked, noinline, used, section(".ramfunc.$SRAM_ITC")))
 uint32_t psx_jit_enter(psx_cpu_t *cpu, uint32_t code, uint32_t budget, const psx_jit_regs_t *regs)
@@ -136,6 +208,14 @@ uint32_t psx_jit_enter(psx_cpu_t *cpu, uint32_t code, uint32_t budget, const psx
         "add r9, r3, #12\n"
         "bx r1\n"
         ".balign 4\n"
+        ".global psx_jit_exit_link\n"
+        ".thumb_func\n"
+        ".type psx_jit_exit_link, %function\n"
+        "psx_jit_exit_link:\n"
+        "ldr r0, [r9, #40]\n"
+        "ldr r0, [r3, r0]\n"
+        "adds r1, r0, #4\n"
+        "strd r0, r1, [r4, #132]\n"
         ".global psx_jit_block_exit\n"
         ".thumb_func\n"
         ".type psx_jit_block_exit, %function\n"
@@ -320,6 +400,32 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_mem_escape(psx_c
         return 0u;
     }
 
+    /* A store into RAM only gets here because its page holds translated code.
+       Most of those hit the data that lives next to the code: written right
+       here, and whatever code it does overwrite is dropped. (With the cache
+       isolated the dispatcher interprets everything, so that never gets here.) */
+    if ((desc & PSX_JIT_MD_STORE) && !(addr & 0x1fe00000u) && !(addr & (size - 1u)))
+    {
+        const uint32_t phys = addr & 0x1fffffu;
+        uint8_t *const p = cpu->bus->ram->buf + phys;
+        const uint32_t v = cpu->r[PSX_JIT_MD_RT(desc)];
+
+        if (size == 4u)
+            *(uint32_t *)p = v;
+        else if (size == 2u)
+            *(uint16_t *)p = (uint16_t)v;
+        else
+            *p = (uint8_t)v;
+
+        if (g_jit_page_cells[phys >> PSX_JIT_PAGE_SHIFT] & jit_cell_mask(phys, size))
+            psx_jit_invalidate(phys, size);
+
+        g_jit_cycles += 2u;
+        cpu->total_cycles += 2u;
+
+        return 0u;
+    }
+
     if ((desc & PSX_JIT_MD_STORE) || (desc & PSX_JIT_MD_PENDING))
         return psx_jit_interp_op_at(cpu, pc);
 
@@ -375,7 +481,7 @@ static inline uint32_t jit_lookup(uint32_t pc)
 
     while (i)
     {
-        if (g_jit_link[i - 1u].pc == pc)
+        if (g_jit_pc[i - 1u] == pc)
             return i;
 
         i = g_jit_meta[i - 1u].next;
@@ -397,19 +503,19 @@ static uint32_t jit_get_block(uint32_t pc)
 
     i = ++g_jit_block_count;
 
-    psx_jit_link_t *const l = &g_jit_link[i - 1u];
     psx_jit_meta_t *const m = &g_jit_meta[i - 1u];
 
-    l->pc = pc;
-    l->code = g_jit_regs.exit;
+    g_jit_pc[i - 1u] = pc;
+    g_jit_link[i - 1u].code = g_jit_regs.helpers[PSX_JIT_H_EXIT_LINK / 4u];
 
-    m->master = 0;
-    m->size = 0;
-    m->page_next = 0;
     m->heat = 0;
     m->hot = 0;
     m->instr = 0;
     m->next = g_jit_hash[jit_hash(pc)];
+
+    g_jit_cold[i - 1u].master = 0;
+    g_jit_cold[i - 1u].size = 0;
+    g_jit_cold[i - 1u].page_next = 0;
 
     g_jit_hash[jit_hash(pc)] = (uint16_t)i;
     g_jit_stats.blocks = g_jit_block_count;
@@ -421,6 +527,7 @@ void psx_jit_reset(void)
 {
     memset(g_jit_hash, 0, sizeof(g_jit_hash));
     memset(g_jit_page_head, 0, sizeof(g_jit_page_head));
+    memset(g_jit_page_cells, 0, sizeof(g_jit_page_cells));
     memset(g_psx_jit_code_pages, 0, sizeof(g_psx_jit_code_pages));
 
     g_jit_block_count = 0;
@@ -455,6 +562,8 @@ void psx_jit_init(void)
     g_jit_regs.helpers[PSX_JIT_H_GTE_WRITE / 4u] = (uint32_t)(uintptr_t)&psx_cpu_gte_write;
     g_jit_regs.helpers[PSX_JIT_H_GTE_MEM / 4u] = (uint32_t)(uintptr_t)&psx_jit_gte_transfer;
     g_jit_regs.helpers[PSX_JIT_H_MEM / 4u] = (uint32_t)(uintptr_t)&psx_jit_mem_escape;
+    g_jit_regs.helpers[PSX_JIT_H_EXIT_LINK / 4u] = (uint32_t)(uintptr_t)&psx_jit_exit_link | 1u;
+    g_jit_regs.helpers[PSX_JIT_H_PC_DELTA / 4u] = (uint32_t)(uintptr_t)g_jit_pc - (uint32_t)(uintptr_t)g_jit_link;
 
     psx_jit_reset();
 
@@ -469,15 +578,17 @@ static void jit_kill_block(uint32_t i)
 {
     psx_jit_meta_t *const m = &g_jit_meta[i - 1u];
 
-    g_jit_link[i - 1u].code = g_jit_regs.exit;
+    g_jit_link[i - 1u].code = g_jit_regs.helpers[PSX_JIT_H_EXIT_LINK / 4u];
 
-    if (m->size)
+    if (m->instr)
         g_jit_stats.killed++;
 
-    m->size = 0;
+    m->instr = 0;
     m->hot = 0;
     m->heat = 0;
-    m->page_next = 0;
+
+    g_jit_cold[i - 1u].size = 0;
+    g_jit_cold[i - 1u].page_next = 0;
 }
 
 void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_invalidate(uint32_t addr, uint32_t size)
@@ -485,30 +596,59 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_invalidate(uint32_t 
     if ((addr & 0x1fffffffu) >= 0x200000u)
         return; /* not guest RAM: nothing can have been compiled from it */
 
-    const uint32_t masked = addr & 0x1fffffu;
-    const uint32_t first = masked >> PSX_JIT_PAGE_SHIFT;
-    const uint32_t last = (masked + (size ? (size - 1u) : 0u)) >> PSX_JIT_PAGE_SHIFT;
+    const uint32_t lo = addr & 0x1fffffu;
+    const uint32_t hi = lo + (size ? size : 1u); /* exclusive */
+    const uint32_t first = lo >> PSX_JIT_PAGE_SHIFT;
+    const uint32_t last = (hi - 1u) >> PSX_JIT_PAGE_SHIFT;
 
     for (uint32_t p = first; (p <= last) && (p < PSX_JIT_PAGE_COUNT); p++)
     {
-        if (!g_psx_jit_code_pages[p])
+        if (!g_jit_page_head[p])
             continue;
 
-        g_jit_stats.invalidations++;
+        /* the part of the write that falls into this page, against the map */
+        const uint32_t page_lo = p << PSX_JIT_PAGE_SHIFT;
+        const uint32_t w_lo = (lo > page_lo) ? lo : page_lo;
+        const uint32_t w_hi = (hi < (page_lo + PSX_JIT_PAGE_MASK + 1u)) ? hi : (page_lo + PSX_JIT_PAGE_MASK + 1u);
 
-        uint32_t i = g_jit_page_head[p];
+        if (!(g_jit_page_cells[p] & jit_cell_mask(w_lo, w_hi - w_lo)))
+            continue; /* data that shares the page with code */
+
+        uint16_t *link_to_me = &g_jit_page_head[p];
+        uint32_t i = *link_to_me;
+        uint32_t cells = 0;
+        uint32_t killed = 0;
 
         while (i)
         {
-            const uint32_t next = g_jit_meta[i - 1u].page_next;
+            psx_jit_cold_t *const m = &g_jit_cold[i - 1u];
+            const uint32_t next = m->page_next;
 
-            jit_kill_block(i);
+            uint32_t b_lo;
+            const uint32_t b_len = jit_block_span(i, &b_lo);
+
+            if ((b_lo < hi) && ((b_lo + b_len) > lo))
+            {
+                *link_to_me = (uint16_t)next;
+
+                jit_kill_block(i);
+
+                killed++;
+            }
+            else
+            {
+                cells |= jit_cell_mask(b_lo, b_len);
+                link_to_me = &m->page_next;
+            }
 
             i = next;
         }
 
-        g_jit_page_head[p] = 0;
-        g_psx_jit_code_pages[p] = 0;
+        if (killed)
+            g_jit_stats.invalidations++;
+
+        /* what is left of the page */
+        jit_page_set_cells(p, cells);
     }
 }
 
@@ -546,8 +686,8 @@ static void jit_retier(void)
     {
         const psx_jit_meta_t *const m = &g_jit_meta[i];
 
-        if (m->size)
-            bytes[jit_heat_class(m->heat)] += m->size;
+        if (m->instr)
+            bytes[jit_heat_class(m->heat)] += g_jit_cold[i].size;
     }
 
     /* classes `full` and above go in entirely, class `part` as far as it fits */
@@ -575,26 +715,28 @@ static void jit_retier(void)
     {
         psx_jit_meta_t *const m = &g_jit_meta[i];
 
-        if (!m->size)
+        if (!m->instr)
             continue;
 
+        const uint32_t size = g_jit_cold[i].size;
+        const uint32_t master = g_jit_cold[i].master;
         const uint32_t k = jit_heat_class(m->heat);
 
         int want = (k >= full);
 
-        if (!want && part && (k == part) && (m->size <= room))
+        if (!want && part && (k == part) && (size <= room))
         {
             want = 1;
-            room -= m->size;
+            room -= size;
         }
 
-        if (want && ((used + m->size) <= PSX_JIT_CODE_SIZE))
+        if (want && ((used + size) <= PSX_JIT_CODE_SIZE))
         {
-            memcpy(&g_jit_code[used], &g_jit_master[m->master], m->size);
+            memcpy(&g_jit_code[used], &g_jit_master[master], size);
 
             g_jit_link[i].code = (uint32_t)(uintptr_t)&g_jit_code[used] | 1u;
 
-            used += m->size;
+            used += size;
             hot_blocks++;
 
             if (!m->hot)
@@ -604,7 +746,7 @@ static void jit_retier(void)
         }
         else
         {
-            g_jit_link[i].code = (uint32_t)(uintptr_t)&g_jit_master[m->master] | 1u;
+            g_jit_link[i].code = (uint32_t)(uintptr_t)&g_jit_master[master] | 1u;
 
             m->hot = 0;
         }
@@ -658,6 +800,18 @@ static uint32_t jit_link_of(void *ud, uint32_t pc)
 /* Translates the block at pc; returns its index + 1, 0 when that failed */
 static uint32_t jit_compile(psx_cpu_t *cpu, uint32_t pc)
 {
+    /* Code is only taken from RAM and the BIOS. Anything else can change
+       without psx_jit_invalidate() hearing of it, which would leave a stale
+       block behind - and a pc out there is a program that has crashed anyway,
+       so it is left to the interpreter. (Found by the differential test: a
+       random program that jumped into the I/O window.) */
+    {
+        const uint32_t phys = pc & 0x1fffffffu;
+
+        if ((phys >= 0x00200000u) && ((phys < 0x1fc00000u) || (phys >= 0x1fc80000u)))
+            return 0;
+    }
+
     PROF_T0(t_cmp);
 
     /* A block needs a link for itself and one for each way out of it, and the
@@ -693,6 +847,7 @@ static uint32_t jit_compile(psx_cpu_t *cpu, uint32_t pc)
         ctx.e = &e;
         ctx.read32 = jit_read32;
         ctx.get_link = jit_link_of;
+        ctx.link_pc_delta = g_jit_regs.helpers[PSX_JIT_H_PC_DELTA / 4u];
         ctx.ud = cpu;
 
         ok = psx_jit_build_block(&ctx, pc, max_instr, PSX_JIT_PAGE_MASK, &info);
@@ -717,9 +872,11 @@ static uint32_t jit_compile(psx_cpu_t *cpu, uint32_t pc)
     SCB_InvalidateICache_by_Addr((void *)code, (int32_t)size);
 
     psx_jit_meta_t *const m = &g_jit_meta[index - 1u];
+    psx_jit_cold_t *const cold = &g_jit_cold[index - 1u];
 
-    m->master = g_jit_master_used;
-    m->size = (uint16_t)size;
+    cold->master = g_jit_master_used;
+    cold->size = (uint16_t)size;
+
     m->instr = (uint8_t)info.instr;
     m->heat = 0;
     m->hot = 0;
@@ -741,10 +898,14 @@ static uint32_t jit_compile(psx_cpu_t *cpu, uint32_t pc)
     {
         const uint32_t page = phys >> PSX_JIT_PAGE_SHIFT;
 
-        m->page_next = g_jit_page_head[page];
+        cold->page_next = g_jit_page_head[page];
 
         g_jit_page_head[page] = (uint16_t)index;
-        g_psx_jit_code_pages[page] = 1;
+
+        uint32_t b_lo;
+        const uint32_t b_len = jit_block_span(index, &b_lo);
+
+        jit_page_set_cells(page, g_jit_page_cells[page] | jit_cell_mask(b_lo, b_len));
     }
 
     PROF_ADD(jit_cmp, t_cmp);
@@ -885,7 +1046,7 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_step(psx_cpu_t *
 
     uint32_t index = jit_lookup(pc);
 
-    if (!index || !g_jit_meta[index - 1u].size)
+    if (!index || !g_jit_meta[index - 1u].instr)
     {
         index = jit_compile(cpu, pc);
 
@@ -903,8 +1064,15 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_step(psx_cpu_t *
     if (m->heat != 0xffffu)
         m->heat++;
 
-    if (!m->hot && (++g_jit_cold_runs >= g_jit_retier_at))
-        jit_retier();
+    g_jit_stats.dispatches++;
+
+    if (!m->hot)
+    {
+        g_jit_stats.cold_dispatches++;
+
+        if (++g_jit_cold_runs >= g_jit_retier_at)
+            jit_retier();
+    }
 
 #if PSX_JIT_TRAP
     if (!g_jit_trapped)
@@ -936,6 +1104,14 @@ const psx_jit_stats_t *psx_jit_get_stats(void)
     return &g_jit_stats;
 }
 
+void psx_jit_code_ranges(uint32_t out[4])
+{
+    out[0] = (uint32_t)(uintptr_t)&g_jit_code[0];
+    out[1] = out[0] + PSX_JIT_CODE_SIZE;
+    out[2] = (uint32_t)(uintptr_t)&g_jit_master[0];
+    out[3] = out[2] + PSX_JIT_MASTER_SIZE;
+}
+
 #else /* !PSX_JIT_ENABLE */
 
 uint8_t g_psx_jit_code_pages[1];
@@ -943,6 +1119,7 @@ uint8_t g_psx_jit_code_pages[1];
 void psx_jit_init(void) {}
 void psx_jit_reset(void) {}
 void psx_jit_invalidate(uint32_t addr, uint32_t size) { (void)addr; (void)size; }
+void psx_jit_code_ranges(uint32_t out[4]) { out[0] = out[1] = out[2] = out[3] = 0; }
 
 uint32_t psx_jit_step(psx_cpu_t *cpu, uint32_t budget)
 {

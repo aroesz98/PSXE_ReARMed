@@ -654,6 +654,23 @@ static inline void psx_emit_strh_reg(psx_emit_t *e, uint32_t rt, uint32_t rn, ui
     psx_emit32(e, 0xf820u | rn, (rt << 12) | rm);
 }
 
+/* LDRH / LDRSH / STRH Rt, [Rn, #imm12]: the 16 bit GTE registers, which sit too
+   far into psx_cpu_t for the narrow forms */
+static inline void psx_emit_ldrh_imm(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t imm12)
+{
+    psx_emit32(e, 0xf8b0u | rn, (rt << 12) | (imm12 & 0xfffu));
+}
+
+static inline void psx_emit_ldrsh_imm(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t imm12)
+{
+    psx_emit32(e, 0xf9b0u | rn, (rt << 12) | (imm12 & 0xfffu));
+}
+
+static inline void psx_emit_strh_imm(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t imm12)
+{
+    psx_emit32(e, 0xf8a0u | rn, (rt << 12) | (imm12 & 0xfffu));
+}
+
 /* LDRB Rt, [Rn, #imm12] (used for the code page table) */
 static inline void psx_emit_ldrb_imm(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t imm12)
 {

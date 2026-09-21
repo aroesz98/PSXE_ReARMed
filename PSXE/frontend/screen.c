@@ -110,15 +110,53 @@ int32_t screen_get_base_width(psxe_screen_t *screen)
 static uint16_t __attribute__((section(".bss.$BOARD_SDRAM"), aligned(32)))
     g_rgb24_stage[SCREEN_STAGE_MAX_PIXELS];
 
+/*
+    Both repacks are SDRAM to SDRAM copies, and what they cost is memory latency,
+    not arithmetic. Measured on this board:
+
+      - a source line that is not in the cache stalls the core for about a
+        hundred cycles, unless it was preloaded a few lines ahead - the core
+        fetches a preloaded line in the background;
+      - whole destination lines written one after the other need no line fill
+        at all, but only as long as no load gets in between.
+
+    So a row is converted into a buffer in DTCM first, with the source preloaded
+    ahead of the loop, and then written out in one run of nothing but stores.
+    That is about a third cheaper than converting straight across.
+*/
+static uint16_t __attribute__((section(".bss.$SRAM_DTC"), aligned(4))) g_repack_row[640];
+
+#define SCREEN_PRELOAD_AHEAD 128 /* bytes, four cache lines */
+
+static inline void screen_row_out(uint16_t *d, int32_t width)
+{
+    const uint16_t *r = g_repack_row;
+    int32_t x = 0;
+
+    for (; (x + 1) < width; x += 2)
+    {
+        uint32_t o;
+
+        __builtin_memcpy(&o, &r[x], 4);
+        __builtin_memcpy(&d[x], &o, 4);
+    }
+
+    if (x < width)
+        d[x] = r[x];
+}
+
 /* Native PSX pixel (mask, blue, green, red) to the RGB565 the panel wants.
    `height` rows come out; every `row_step`-th source row goes in. */
 static void screen_repack_bgr555(const uint16_t *src, int32_t width, int32_t height, int32_t row_step,
                                  uint16_t *dst)
 {
+    if (width > 640)
+        width = 640;
+
     for (int32_t y = 0; y < height; y++)
     {
         const uint16_t *s = src + (uint32_t)(y * row_step) * (PSX_GPU_FB_STRIDE / 2u);
-        uint16_t *d = dst + (uint32_t)y * (uint32_t)width;
+        uint16_t *const row = g_repack_row;
 
         int32_t x = 0;
 
@@ -128,20 +166,25 @@ static void screen_repack_bgr555(const uint16_t *src, int32_t width, int32_t hei
         {
             uint32_t p;
 
+            if (!(x & 14))
+                __builtin_prefetch((const uint8_t *)&s[x] + SCREEN_PRELOAD_AHEAD);
+
             __builtin_memcpy(&p, &s[x], 4);
 
             const uint32_t o = ((p & 0x001f001fu) << 11) | ((p & 0x03e003e0u) << 1) |
                                ((p >> 10) & 0x001f001fu);
 
-            __builtin_memcpy(&d[x], &o, 4);
+            __builtin_memcpy(&row[x], &o, 4);
         }
 
         for (; x < width; x++)
         {
             const uint32_t p = s[x];
 
-            d[x] = (uint16_t)(((p & 0x1fu) << 11) | (((p >> 5) & 0x1fu) << 6) | ((p >> 10) & 0x1fu));
+            row[x] = (uint16_t)(((p & 0x1fu) << 11) | (((p >> 5) & 0x1fu) << 6) | ((p >> 10) & 0x1fu));
         }
+
+        screen_row_out(dst + (uint32_t)y * (uint32_t)width, width);
     }
 }
 
@@ -208,10 +251,13 @@ static void screen_test_pattern(int32_t width, int32_t height, uint16_t *dst)
 static void screen_repack_rgb24(const uint8_t *src, int32_t width, int32_t height, int32_t row_step,
                                 uint16_t *dst)
 {
+    if (width > 640)
+        width = 640;
+
     for (int32_t y = 0; y < height; y++)
     {
         const uint8_t *s = src + (uint32_t)(y * row_step) * PSX_GPU_FB_STRIDE;
-        uint16_t *d = dst + (uint32_t)y * (uint32_t)width;
+        uint16_t *const d = g_repack_row;
 
         int32_t x = 0;
 
@@ -221,6 +267,9 @@ static void screen_repack_rgb24(const uint8_t *src, int32_t width, int32_t heigh
         {
             uint32_t p;
 
+            if (!(x & 7))
+                __builtin_prefetch(s + SCREEN_PRELOAD_AHEAD);
+
             __builtin_memcpy(&p, s, 4);
 
             d[x] = (uint16_t)(((p & 0xf8u) << 8) | ((p & 0xfc00u) >> 5) | ((p & 0xf80000u) >> 19));
@@ -229,6 +278,8 @@ static void screen_repack_rgb24(const uint8_t *src, int32_t width, int32_t heigh
         for (; x < width; x++, s += 3)
             d[x] = (uint16_t)(((uint32_t)(s[0] & 0xf8u) << 8) | ((uint32_t)(s[1] & 0xfcu) << 3) |
                               ((uint32_t)s[2] >> 3));
+
+        screen_row_out(dst + (uint32_t)y * (uint32_t)width, width);
     }
 }
 
@@ -379,13 +430,14 @@ void psxe_screen_toggle_debug_mode(psxe_screen_t *screen)
 
 volatile uint32_t log = 0;
 
-static void psxe_screen_update_impl(psxe_screen_t *screen);
+static void psxe_screen_update_impl(psxe_screen_t *screen, uint32_t dirty_y0, uint32_t dirty_y1);
 static void psxe_screen_poll_pxp(void);
 
 static uint32_t g_presented_frames = 0;
 static int32_t s_pxp_busy = 0;
 
 #if PSXE_AUTOTEST
+static uint32_t g_diag_stage_rows, g_diag_stage_full, g_diag_stage_checks, g_diag_stage_bad;
 static uint32_t g_diag_pxp_start, g_diag_pxp_last, g_diag_pxp_jobs, g_diag_pxp_stillbusy;
 #endif
 
@@ -422,13 +474,25 @@ static inline uint32_t psxe_screen_cycles(void)
     return DWT->CYCCNT;
 }
 
-#if PSXE_FRAME_LIMIT
-
 /* 263 lines of 3413 GPU cycles at 53.693175 MHz: what the GPU model counts out */
 #define PSXE_FRAME_MICROSECONDS 16718u
 
+/*
+    How the emulation is doing against real time, 0 (keeping up) to 8 (behind on
+    every recent frame). A single late frame means nothing - a game that renders
+    every other vblank is late after each long frame and early after each short
+    one - so this goes up by one for a late vblank and down by one for one that
+    was on time.
+*/
+static int32_t s_behind = 0;
+static uint32_t s_vblank_no = 0; /* emulated vblanks so far */
+
+#define PSXE_BEHIND (s_behind >= 4)
+
 static void psxe_screen_pace(void)
 {
+    s_vblank_no++;
+
     static uint32_t due = 0; /* when this vblank should happen, in core cycles */
     static int32_t primed = 0;
 
@@ -453,6 +517,9 @@ static void psxe_screen_pace(void)
 
     if (late >= 0)
     {
+        if (s_behind < 8)
+            s_behind++;
+
         /*
             Behind schedule: nothing to wait for. The schedule is kept, though,
             so that the shorter frames that follow make the time up again. A game
@@ -471,6 +538,10 @@ static void psxe_screen_pace(void)
         return;
     }
 
+    if (s_behind > 0)
+        s_behind--;
+
+#if PSXE_FRAME_LIMIT
     /* ahead: sleep through the whole ticks, spin through the rest */
     for (;;)
     {
@@ -482,9 +553,15 @@ static void psxe_screen_pace(void)
         if ((uint32_t)left > (2u * tick))
             vTaskDelay(1);
     }
-}
+#else
+    /* running unthrottled (a measurement build): the schedule is only kept to
+       know when the emulation falls behind it */
+    (void)tick;
 
+    if ((uint32_t)(-late) > period)
+        due = now;
 #endif
+}
 
 #if PSXE_AUTOTEST
 /* What is on screen, as 64 x 24 characters on the console: an unattended run
@@ -592,12 +669,20 @@ void psxe_screen_update(psxe_screen_t *screen)
             }
 #endif
 
-            PRINTF("emu: %u kcyc/s (%u%% of PS1) | vbl/s: %u | fps: %u | jit blk=%u cmp=%u flush=%u inv=%u code=%uB hot=%uB/%u tier=%u int=%u\r\n",
+#if PSX_PROFILE || PSXE_AUTOTEST
+            PRINTF("emu: %u kcyc/s (%u%% of PS1) | vbl/s: %u | fps: %u | jit blk=%u cmp=%u flush=%u inv=%u code=%uB hot=%uB/%u tier=%u int=%u disp=%u cold=%u\r\n",
                    kcyc, (unsigned)((kcyc * 100u) / 33869u), vblanks, g_presented_frames,
                    (unsigned)jit->blocks, (unsigned)jit->compiles, (unsigned)jit->flushes,
                    (unsigned)jit->invalidations, (unsigned)jit->code_used,
                    (unsigned)jit->hot_used, (unsigned)jit->hot_blocks, (unsigned)jit->retiers,
-                   (unsigned)jit->interp_steps);
+                   (unsigned)jit->interp_steps, (unsigned)jit->dispatches, (unsigned)jit->cold_dispatches);
+#else
+            /* a character is 87 microseconds of blocking UART: the long line is 1.7%
+               of the machine, so the build that is meant to be played prints a short one */
+            PRINTF("emu: %u%% of PS1 | vbl/s: %u | fps: %u | jit blk=%u flush=%u\r\n",
+                   (unsigned)((kcyc * 100u) / 33869u), vblanks, g_presented_frames,
+                   (unsigned)jit->blocks, (unsigned)jit->flushes);
+#endif
 
 /* Display mode and pad link counters: for chasing display problems, so they
    come with the profiler rather than costing UART time in a build that is
@@ -639,8 +724,15 @@ void psxe_screen_update(psxe_screen_t *screen)
 
                 const uint32_t t1 = DWT->CYCCNT;
 
-                PRINTF("DIAG ccr=%08x sdramcr0=%08x sdram64k=%u cyc (sum %u) | pxp last=%u cyc jobs=%u stillbusy=%u" "\r\n",
-                       (unsigned)SCB->CCR, (unsigned)SEMC->SDRAMCR0, (unsigned)(t1 - t0), (unsigned)sum,
+                PRINTF("STAGE rows=%u of %u checks=%u badrows=%u" "\r\n",
+                       (unsigned)g_diag_stage_rows, (unsigned)g_diag_stage_full, (unsigned)g_diag_stage_checks,
+                       (unsigned)g_diag_stage_bad);
+
+                g_diag_stage_rows = 0;
+                g_diag_stage_full = 0;
+
+                PRINTF("DIAG stackfree=%u ccr=%08x sdramcr0=%08x sdram64k=%u cyc (sum %u) | pxp last=%u cyc jobs=%u stillbusy=%u" "\r\n",
+                       (unsigned)(uxTaskGetStackHighWaterMark(NULL) * 4u), (unsigned)SCB->CCR, (unsigned)SEMC->SDRAMCR0, (unsigned)(t1 - t0), (unsigned)sum,
                        (unsigned)g_diag_pxp_last, (unsigned)g_diag_pxp_jobs, (unsigned)g_diag_pxp_stillbusy);
 
                 PRINTF("DIAG-HW lcdif ctrl=%08x ctrl1=%08x stat=%08x cur=%08x next=%08x | pllv=%08x cscdr2=%08x cbcmr=%08x | pxp ctrl=%08x stat=%08x | semc sts0=%08x intr=%08x\r\n",
@@ -678,9 +770,7 @@ void psxe_screen_update(psxe_screen_t *screen)
         }
     }
 
-#if PSXE_FRAME_LIMIT
     psxe_screen_pace();
-#endif
 
     /* The frame the scaler was given at the last vblank goes to the panel now.
        This must not wait for the next changed picture: there may not be one for
@@ -701,20 +791,37 @@ void psxe_screen_update(psxe_screen_t *screen)
        game running at exactly the panel's rate is never made to skip.) */
     {
         static uint32_t last_start = 0;
+        static uint32_t last_vblank = 0;
 
         const uint32_t now_cyc = psxe_screen_cycles();
 
         if (s_pxp_busy || ((now_cyc - last_start) < ((SystemCoreClock / 1000u) * 15u)))
             return;
 
+        /* A present is over a million cycles, and while the emulation cannot
+           keep up with real time those are better spent on the game itself:
+           then never on two vblanks in a row. Nothing is lost that way - the
+           picture stays marked as changed, so it is shown one vblank later, and
+           what needs a frame every vblank is not reaching full speed anyway. */
+        if (PSXE_BEHIND && ((s_vblank_no - last_vblank) < 2u))
+            return;
+
         last_start = now_cyc;
+        last_vblank = s_vblank_no;
     }
 
     gpu->vram_dirty = 0;
 
+    /* the rows of VRAM that changed on screen; from here on the GPU collects anew */
+    const uint32_t dirty_y0 = gpu->dirty_y0;
+    const uint32_t dirty_y1 = gpu->dirty_y1;
+
+    gpu->dirty_y0 = 0xffffu;
+    gpu->dirty_y1 = 0;
+
     PROF_T0(t_blit);
     PROF_INC(frames);
-    psxe_screen_update_impl(screen);
+    psxe_screen_update_impl(screen, dirty_y0, dirty_y1);
     PROF_ADD(blit, t_blit);
 }
 
@@ -763,7 +870,7 @@ static void psxe_screen_finish_pxp(void)
     DEMO_SwapBuffers();
 }
 
-static void psxe_screen_update_impl(psxe_screen_t *screen)
+static void psxe_screen_update_impl(psxe_screen_t *screen, uint32_t dirty_y0, uint32_t dirty_y1)
 {
     static int32_t last_scaled_w = -1, last_scaled_h = -1;
     static int32_t clear_pending = 3; /* one per frame buffer */
@@ -905,10 +1012,94 @@ static void psxe_screen_update_impl(psxe_screen_t *screen)
 
         src_height /= row_step;
 
-        if (is_24bpp)
-            screen_repack_rgb24((const uint8_t *)src, src_width, src_height, row_step, g_rgb24_stage);
-        else
-            screen_repack_bgr555(src, src_width, src_height, row_step, g_rgb24_stage);
+        /*
+            The repacked picture stays in g_rgb24_stage between frames, so when
+            the window into VRAM is the one it was made from, only the rows that
+            were drawn into since have to be read again: FF7 draws its battle
+            menus over the visible buffer twice between two flips, and that is
+            a quarter of the picture, not all of it. Anything else about the
+            window having changed - position, size, depth - is a new picture.
+        */
+        static uint32_t staged_x = ~0u, staged_y = ~0u;
+        static int32_t staged_w = -1, staged_h = -1, staged_24 = -1, staged_step = -1;
+
+        int32_t row0 = 0;
+        int32_t row1 = src_height;
+
+        const uint32_t win_x = screen->psx->gpu->disp_x;
+        const uint32_t win_y = screen->psx->gpu->disp_y;
+
+        if (!screen->debug_mode && (staged_x == win_x) && (staged_y == win_y) && (staged_w == src_width) &&
+            (staged_h == src_height) && (staged_24 == is_24bpp) && (staged_step == row_step) &&
+            (dirty_y0 < dirty_y1))
+        {
+            const int32_t first = ((int32_t)dirty_y0 - (int32_t)win_y) / row_step;
+            const int32_t last = ((int32_t)dirty_y1 - (int32_t)win_y + row_step - 1) / row_step;
+
+            if (dirty_y0 > win_y)
+                row0 = (first < src_height) ? first : src_height;
+
+            if (last < src_height)
+                row1 = (last > row0) ? last : row0;
+        }
+
+        staged_x = screen->debug_mode ? ~0u : win_x;
+        staged_y = win_y;
+        staged_w = src_width;
+        staged_h = src_height;
+        staged_24 = is_24bpp;
+        staged_step = row_step;
+
+#if PSXE_AUTOTEST
+        g_diag_stage_rows += (uint32_t)(row1 - row0);
+        g_diag_stage_full += (uint32_t)src_height;
+#endif
+
+        if (row1 > row0)
+        {
+            uint16_t *const out = g_rgb24_stage + (uint32_t)row0 * (uint32_t)src_width;
+
+            if (is_24bpp)
+                screen_repack_rgb24((const uint8_t *)src + (uint32_t)(row0 * row_step) * PSX_GPU_FB_STRIDE,
+                                    src_width, row1 - row0, row_step, out);
+            else
+                screen_repack_bgr555(src + (uint32_t)(row0 * row_step) * (PSX_GPU_FB_STRIDE / 2u), src_width,
+                                     row1 - row0, row_step, out);
+        }
+#if PSXE_AUTOTEST
+        /* Self check of the partial repack: now and then, is the staged picture
+           what a full repack would have made? Rows that are not count. */
+        {
+            static uint32_t presents = 0;
+
+            if (!is_24bpp && ((++presents & 31u) == 0u))
+            {
+                for (int32_t y = 0; y < src_height; y++)
+                {
+                    const uint16_t *const s = src + (uint32_t)(y * row_step) * (PSX_GPU_FB_STRIDE / 2u);
+                    const uint16_t *const d = g_rgb24_stage + (uint32_t)y * (uint32_t)src_width;
+
+                    for (int32_t x = 0; x < src_width; x++)
+                    {
+                        const uint32_t v = s[x];
+                        const uint16_t want = (uint16_t)(((v & 0x1fu) << 11) | (((v >> 5) & 0x1fu) << 6) | ((v >> 10) & 0x1fu));
+
+                        if (d[x] != want)
+                        {
+                            if (g_diag_stage_bad++ < 6u)
+                                PRINTF("STAGE-BAD row=%d x=%d repacked=[%d,%d) dirty=[%u,%u) win=(%u,%u) %dx%d step=%d" "\r\n",
+                                       (int)y, (int)x, (int)row0, (int)row1, (unsigned)dirty_y0, (unsigned)dirty_y1,
+                                       (unsigned)win_x, (unsigned)win_y, (int)src_width, (int)src_height, (int)row_step);
+
+                            break;
+                        }
+                    }
+                }
+
+                g_diag_stage_checks++;
+            }
+        }
+#endif
 #endif
 
         ps_buffer = g_rgb24_stage;

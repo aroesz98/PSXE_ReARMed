@@ -56,7 +56,9 @@ extern "C" {
 #define PSX_JIT_H_GTE_WRITE 24u /* void f(cpu, reg, value)      MTC2 / CTC2               */
 #define PSX_JIT_H_GTE_MEM 28u   /* uint32_t f(cpu, pc, opcode)  LWC2 / SWC2               */
 #define PSX_JIT_H_MEM 32u       /* uint32_t f(cpu, pc, addr, d) access that is not RAM    */
-#define PSX_JIT_H_COUNT 9u
+#define PSX_JIT_H_EXIT_LINK 36u /* not called: jumped to, with a link in r3, to leave      */
+#define PSX_JIT_H_PC_DELTA 40u  /* not a function: from a link to its guest address        */
+#define PSX_JIT_H_COUNT 11u
 
 /*
     What PSX_JIT_H_MEM is told about the access, so it does not have to fetch and
@@ -71,20 +73,21 @@ extern "C" {
 
 /*
     A link is how blocks refer to each other: the entry point of the block at a
-    guest address. It exists from the moment some block branches to that address,
-    before anything has been compiled for it - until then (and again after the
-    block has been invalidated) the entry point is the dispatcher's, so jumping
-    through a link is always safe. Moving a block between the code tiers only has
-    to update its one link.
+    guest address, one word. It exists from the moment some block branches to
+    that address, before anything has been compiled for it - until then (and
+    again after the block has been invalidated) it points at the dispatcher's
+    "leave through a link" stub, so jumping through a link is always safe. Moving
+    a block between the code tiers only has to update its one link.
+
+    The guest address of a link is kept in a table of its own, the same index
+    away (PSX_JIT_H_PC_DELTA bytes from the link): only leaving needs it.
 */
 typedef struct
 {
     uint32_t code; /* host entry point (Thumb) */
-    uint32_t pc;   /* guest address           */
 } psx_jit_link_t;
 
 #define PSX_JIT_LINK_CODE 0u
-#define PSX_JIT_LINK_PC 4u
 
 /* what a block ending branch leaves in r3 */
 #define PSX_JIT_EXIT_PC 0   /* the guest pc: the block returns to the dispatcher */
@@ -112,6 +115,12 @@ typedef struct
 #define PSX_IMM(op) ((op) & 0xffffu)
 #define PSX_SIMM(op) ((uint32_t)(int32_t)(int16_t)((op) & 0xffffu))
 
+/* One flag per 256 bytes of guest RAM says whether translated code came from
+   there (g_psx_jit_code_pages; the same number is in bus_fast.h). It used to be
+   one per 1 KB page, and in an FF7 battle some 100 000 stores a second went the
+   long way round only because their variables share a page with code. */
+#define PSX_JIT_CODE_FLAG_SHIFT 8u
+
 /* Translation context for one instruction */
 typedef struct
 {
@@ -130,6 +139,9 @@ typedef struct
 
     /* address of the link for the block at pc, 0 when none can be had */
     uint32_t (*get_link)(void *ud, uint32_t pc);
+
+    /* from the address of a link to where its guest pc is kept */
+    uint32_t link_pc_delta;
 
     void *ud;
 } psx_jit_ctx_t;
@@ -210,19 +222,19 @@ static inline void psx_jit_commit_pc_reg(psx_emit_t *e)
     }
 }
 
-/* The end of a block whose r3 holds the link of the next one: publish the pc
-   that block starts at - whatever happens next finds the guest state complete -
-   and, while the slice still has cycles left, run it without going back to the
-   dispatcher. Falls through when the budget is used up. */
+/* The end of a block whose r3 holds the link of the next one. While the slice
+   has cycles left that block is run right away, without a word being stored:
+   the guest pc only matters to whoever leaves translated code, so it is the
+   leaving that publishes it - the stub behind PSX_JIT_H_EXIT_LINK, which takes
+   the link in r3 and looks its pc up. A link without code points at that same
+   stub, so a jump to a block that does not exist (any more) ends up there too. */
 static inline void psx_jit_emit_chain(psx_emit_t *e)
 {
-    psx_emit_ldr_imm(e, PSX_R0, PSX_R3, PSX_JIT_LINK_PC);
-    psx_emit_add_imm12(e, PSX_R1, PSX_R0, 4);
-    psx_emit_strd_imm(e, PSX_R0, PSX_R1, PSX_JIT_CPU, PSX_JIT_OFF_PC);
-
     psx_emit_cmp_reg(e, PSX_JIT_CYC, PSX_JIT_BUDGET);
     psx_emit_it(e, PSX_CC_CC); /* unsigned lower */
     psx_emit_ldr_pc(e, PSX_R3, PSX_JIT_LINK_CODE);
+
+    psx_emit_ldr_pc(e, PSX_JIT_HELPERS, PSX_JIT_H_EXIT_LINK);
 }
 
 /* Loads a constant into r3 with a fixed two instruction sequence, so it can sit
@@ -288,9 +300,14 @@ static inline void psx_jit_emit_delay_escape(psx_jit_ctx_t *c)
     psx_emit_imm32(e, PSX_R1, c->guest);
 
     if (c->exit_mode == PSX_JIT_EXIT_LINK)
-        psx_emit_ldr_imm(e, PSX_R2, PSX_R3, PSX_JIT_LINK_PC);
+    {
+        psx_emit_imm32(e, PSX_R2, c->link_pc_delta);
+        psx_emit_ldr_reg(e, PSX_R2, PSX_R3, PSX_R2);
+    }
     else
+    {
         psx_emit_mov(e, PSX_R2, PSX_R3);
+    }
 
     psx_jit_emit_call(e, PSX_JIT_H_DELAY);
 
@@ -753,12 +770,117 @@ static inline int psx_jit_translate_trap_alu(psx_jit_ctx_t *c, uint32_t op)
     why the block adds r0 to the cycle counter instead of carrying a copy of the
     timing table.
 
-    The register moves are a call each as well. MTC2 / CTC2 are plain writes.
-    MFC2 / CFC2 are loads, with the load delay of one: like a memory load, the
-    value goes straight into the guest register when the next instruction does
-    not touch it, and into the load delay slot - with the next instruction
-    interpreted, which applies it - when it does.
+    The register moves are not: 3D code does several of them around every
+    command (some 600 000 a second in an FF7 battle), and all but a handful of
+    the registers are a plain field of psx_cpu_t, so a move is one load or store
+    here. The table below says how each register is kept - it has to match
+    gte_read_register() and gte_write_register() in cpu.c, which stay the
+    reference and still serve the registers with side effects (SXYP, IRGB,
+    LZCS, FLAG).
+
+    MTC2 / CTC2 are plain writes. MFC2 / CFC2 are loads, with the load delay of
+    one: like a memory load, the value goes straight into the guest register
+    when the next instruction does not touch it, and into the load delay slot -
+    with the next instruction interpreted, which applies it - when it does.
 */
+enum
+{
+    PSX_GTE_RD_32,   /* the whole word                        */
+    PSX_GTE_RD_S16,  /* 16 bit field, read back sign extended */
+    PSX_GTE_RD_U16,  /* 16 bit field, read back zero extended */
+    PSX_GTE_RD_CALL, /* psx_cpu_gte_read()                    */
+};
+
+enum
+{
+    PSX_GTE_WR_32,
+    PSX_GTE_WR_16,
+    PSX_GTE_WR_NONE, /* read only: the write is dropped */
+    PSX_GTE_WR_CALL, /* psx_cpu_gte_write()             */
+};
+
+typedef struct
+{
+    uint16_t off; /* of the field in psx_cpu_t */
+    uint8_t rd, wr;
+} psx_jit_gte_reg_t;
+
+#define PSX_GTE_D(field, rd, wr) {(uint16_t)offsetof(psx_cpu_t, cop2_dr.field), (rd), (wr)}
+#define PSX_GTE_C(field, rd, wr) {(uint16_t)offsetof(psx_cpu_t, cop2_cr.field), (rd), (wr)}
+
+static const psx_jit_gte_reg_t g_psx_jit_gte_regs[64] = {
+    /* data registers */
+    PSX_GTE_D(v[0].xy, PSX_GTE_RD_32, PSX_GTE_WR_32),     /*  0 VXY0 */
+    PSX_GTE_D(v[0].z, PSX_GTE_RD_S16, PSX_GTE_WR_16),     /*  1 VZ0  */
+    PSX_GTE_D(v[1].xy, PSX_GTE_RD_32, PSX_GTE_WR_32),     /*  2 VXY1 */
+    PSX_GTE_D(v[1].z, PSX_GTE_RD_S16, PSX_GTE_WR_16),     /*  3 VZ1  */
+    PSX_GTE_D(v[2].xy, PSX_GTE_RD_32, PSX_GTE_WR_32),     /*  4 VXY2 */
+    PSX_GTE_D(v[2].z, PSX_GTE_RD_S16, PSX_GTE_WR_16),     /*  5 VZ2  */
+    PSX_GTE_D(rgbc.rgbc, PSX_GTE_RD_32, PSX_GTE_WR_32),   /*  6 RGBC */
+    PSX_GTE_D(otz, PSX_GTE_RD_U16, PSX_GTE_WR_16),        /*  7 OTZ  */
+    PSX_GTE_D(ir[0], PSX_GTE_RD_S16, PSX_GTE_WR_16),      /*  8 IR0  */
+    PSX_GTE_D(ir[1], PSX_GTE_RD_S16, PSX_GTE_WR_16),      /*  9 IR1  */
+    PSX_GTE_D(ir[2], PSX_GTE_RD_S16, PSX_GTE_WR_16),      /* 10 IR2  */
+    PSX_GTE_D(ir[3], PSX_GTE_RD_S16, PSX_GTE_WR_16),      /* 11 IR3  */
+    PSX_GTE_D(sxy[0].xy, PSX_GTE_RD_32, PSX_GTE_WR_32),   /* 12 SXY0 */
+    PSX_GTE_D(sxy[1].xy, PSX_GTE_RD_32, PSX_GTE_WR_32),   /* 13 SXY1 */
+    PSX_GTE_D(sxy[2].xy, PSX_GTE_RD_32, PSX_GTE_WR_32),   /* 14 SXY2 */
+    PSX_GTE_D(sxy[2].xy, PSX_GTE_RD_32, PSX_GTE_WR_CALL), /* 15 SXYP: reads SXY2, a write pushes */
+    PSX_GTE_D(sz[0], PSX_GTE_RD_U16, PSX_GTE_WR_16),      /* 16 SZ0  */
+    PSX_GTE_D(sz[1], PSX_GTE_RD_U16, PSX_GTE_WR_16),      /* 17 SZ1  */
+    PSX_GTE_D(sz[2], PSX_GTE_RD_U16, PSX_GTE_WR_16),      /* 18 SZ2  */
+    PSX_GTE_D(sz[3], PSX_GTE_RD_U16, PSX_GTE_WR_16),      /* 19 SZ3  */
+    PSX_GTE_D(rgb[0].rgbc, PSX_GTE_RD_32, PSX_GTE_WR_32), /* 20 RGB0 */
+    PSX_GTE_D(rgb[1].rgbc, PSX_GTE_RD_32, PSX_GTE_WR_32), /* 21 RGB1 */
+    PSX_GTE_D(rgb[2].rgbc, PSX_GTE_RD_32, PSX_GTE_WR_32), /* 22 RGB2 */
+    PSX_GTE_D(res1, PSX_GTE_RD_32, PSX_GTE_WR_32),        /* 23      */
+    PSX_GTE_D(mac[0], PSX_GTE_RD_32, PSX_GTE_WR_32),      /* 24 MAC0 */
+    PSX_GTE_D(mac[1], PSX_GTE_RD_32, PSX_GTE_WR_32),      /* 25 MAC1 */
+    PSX_GTE_D(mac[2], PSX_GTE_RD_32, PSX_GTE_WR_32),      /* 26 MAC2 */
+    PSX_GTE_D(mac[3], PSX_GTE_RD_32, PSX_GTE_WR_32),      /* 27 MAC3 */
+    PSX_GTE_D(irgb, PSX_GTE_RD_CALL, PSX_GTE_WR_CALL),    /* 28 IRGB: both ways go through IR1-3 */
+    PSX_GTE_D(irgb, PSX_GTE_RD_U16, PSX_GTE_WR_NONE),     /* 29 ORGB: IRGB as it stands */
+    PSX_GTE_D(lzcs, PSX_GTE_RD_32, PSX_GTE_WR_CALL),      /* 30 LZCS: a write counts into LZCR */
+    PSX_GTE_D(lzcr, PSX_GTE_RD_32, PSX_GTE_WR_NONE),      /* 31 LZCR */
+
+    /* control registers */
+    PSX_GTE_C(rt.m[0].u32, PSX_GTE_RD_32, PSX_GTE_WR_32), /* 32 */
+    PSX_GTE_C(rt.m[1].u32, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(rt.m[2].u32, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(rt.m[3].u32, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(rt.m33, PSX_GTE_RD_S16, PSX_GTE_WR_16),
+    PSX_GTE_C(tr.x, PSX_GTE_RD_32, PSX_GTE_WR_32),        /* 37 */
+    PSX_GTE_C(tr.y, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(tr.z, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(l.m[0].u32, PSX_GTE_RD_32, PSX_GTE_WR_32),  /* 40 */
+    PSX_GTE_C(l.m[1].u32, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(l.m[2].u32, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(l.m[3].u32, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(l.m33, PSX_GTE_RD_S16, PSX_GTE_WR_16),
+    PSX_GTE_C(bk.x, PSX_GTE_RD_32, PSX_GTE_WR_32),        /* 45 */
+    PSX_GTE_C(bk.y, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(bk.z, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(lr.m[0].u32, PSX_GTE_RD_32, PSX_GTE_WR_32), /* 48 */
+    PSX_GTE_C(lr.m[1].u32, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(lr.m[2].u32, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(lr.m[3].u32, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(lr.m33, PSX_GTE_RD_S16, PSX_GTE_WR_16),
+    PSX_GTE_C(fc.x, PSX_GTE_RD_32, PSX_GTE_WR_32),        /* 53 */
+    PSX_GTE_C(fc.y, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(fc.z, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(ofx, PSX_GTE_RD_32, PSX_GTE_WR_32),         /* 56 */
+    PSX_GTE_C(ofy, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(h, PSX_GTE_RD_S16, PSX_GTE_WR_32),          /* 58 H: kept whole, read back as int16 */
+    PSX_GTE_C(dqa, PSX_GTE_RD_S16, PSX_GTE_WR_16),
+    PSX_GTE_C(dqb, PSX_GTE_RD_32, PSX_GTE_WR_32),
+    PSX_GTE_C(zsf3, PSX_GTE_RD_S16, PSX_GTE_WR_16),
+    PSX_GTE_C(zsf4, PSX_GTE_RD_S16, PSX_GTE_WR_16),
+    PSX_GTE_C(flag, PSX_GTE_RD_CALL, PSX_GTE_WR_CALL),    /* 63 FLAG: masked, bit 31 made up on read */
+};
+
+#undef PSX_GTE_D
+#undef PSX_GTE_C
+
 static inline int psx_jit_translate_cop2(psx_jit_ctx_t *c, uint32_t op)
 {
     if (PSX_OP(op) != 0x12)
@@ -776,10 +898,31 @@ static inline int psx_jit_translate_cop2(psx_jit_ctx_t *c, uint32_t op)
         case 0x04: /* MTC2 */
         case 0x06: /* CTC2 */
         {
-            psx_emit_mov(e, PSX_R0, PSX_JIT_CPU);
-            psx_emit_mov_imm8(e, PSX_R1, rd + ((PSX_RS(op) == 0x06) ? 32u : 0u));
-            psx_jit_ld_reg(e, PSX_R2, rt);
-            psx_jit_emit_call(e, PSX_JIT_H_GTE_WRITE);
+            const uint32_t reg = rd + ((PSX_RS(op) == 0x06) ? 32u : 0u);
+            const psx_jit_gte_reg_t *const g = &g_psx_jit_gte_regs[reg];
+
+            switch (g->wr)
+            {
+            case PSX_GTE_WR_32:
+                psx_jit_ld_reg(e, PSX_R0, rt);
+                psx_emit_str_imm(e, PSX_R0, PSX_JIT_CPU, g->off);
+                break;
+
+            case PSX_GTE_WR_16:
+                psx_jit_ld_reg(e, PSX_R0, rt);
+                psx_emit_strh_imm(e, PSX_R0, PSX_JIT_CPU, g->off);
+                break;
+
+            case PSX_GTE_WR_NONE:
+                break;
+
+            default:
+                psx_emit_mov(e, PSX_R0, PSX_JIT_CPU);
+                psx_emit_mov_imm8(e, PSX_R1, reg);
+                psx_jit_ld_reg(e, PSX_R2, rt);
+                psx_jit_emit_call(e, PSX_JIT_H_GTE_WRITE);
+                break;
+            }
 
             return 1;
         }
@@ -787,12 +930,27 @@ static inline int psx_jit_translate_cop2(psx_jit_ctx_t *c, uint32_t op)
         case 0x00: /* MFC2 */
         case 0x02: /* CFC2 */
         {
-            psx_emit_mov(e, PSX_R0, PSX_JIT_CPU);
-            psx_emit_mov_imm8(e, PSX_R1, rd + ((PSX_RS(op) == 0x02) ? 32u : 0u));
-            psx_jit_emit_call(e, PSX_JIT_H_GTE_READ);
+            const uint32_t reg = rd + ((PSX_RS(op) == 0x02) ? 32u : 0u);
+            const psx_jit_gte_reg_t *const g = &g_psx_jit_gte_regs[reg];
+
+            if (g->rd == PSX_GTE_RD_CALL)
+            {
+                /* called even when the value goes nowhere: reading IRGB
+                   rebuilds it from IR1-3, which ORGB shows afterwards */
+                psx_emit_mov(e, PSX_R0, PSX_JIT_CPU);
+                psx_emit_mov_imm8(e, PSX_R1, reg);
+                psx_jit_emit_call(e, PSX_JIT_H_GTE_READ);
+            }
 
             if (rt == 0)
-                return 1; /* the read has no side effects and nowhere to go */
+                return 1; /* nowhere to go */
+
+            if (g->rd == PSX_GTE_RD_32)
+                psx_emit_ldr_imm(e, PSX_R0, PSX_JIT_CPU, g->off);
+            else if (g->rd == PSX_GTE_RD_S16)
+                psx_emit_ldrsh_imm(e, PSX_R0, PSX_JIT_CPU, g->off);
+            else if (g->rd == PSX_GTE_RD_U16)
+                psx_emit_ldrh_imm(e, PSX_R0, PSX_JIT_CPU, g->off);
 
             if (psx_jit_reads_reg(c->next_op, rt) || psx_jit_writes_reg(c->next_op, rt))
             {
@@ -834,14 +992,80 @@ static inline int psx_jit_translate_cop2(psx_jit_ctx_t *c, uint32_t op)
     return 1;
 }
 
-/* LWC2 / SWC2: one call into the interpreter's handlers, see psx_cpu_gte_transfer.
-   The helper accounts for the cycles itself. */
+static inline void psx_jit_emit_addr(psx_emit_t *e, uint32_t rs, uint32_t simm, uint32_t align_mask,
+                                     uint16_t **slots, uint32_t *slot_count);
+
+/*
+    LWC2 / SWC2. Vertices go into the GTE and screen coordinates come out of it
+    this way, three of each for a triangle, so these are as frequent as the
+    register moves. Against guest RAM, and for a register that is a plain field
+    (see the table above), the transfer is done here: the address test of an
+    ordinary load or store, then a load and a store. Everything else - another
+    address, a misaligned one, a store into a page code was translated from, a
+    register with side effects - takes the call into the interpreter handlers,
+    see psx_cpu_gte_transfer. That helper accounts for the cycles itself, so the
+    native path adds its own two.
+*/
 static inline int psx_jit_translate_gte_mem(psx_jit_ctx_t *c, uint32_t op)
 {
     if ((PSX_OP(op) != 0x32u) && (PSX_OP(op) != 0x3au))
         return 0;
 
     psx_emit_t *const e = c->e;
+
+    const psx_jit_gte_reg_t *const g = &g_psx_jit_gte_regs[PSX_RT(op)]; /* data registers only */
+    const int is_load = (PSX_OP(op) == 0x32u);
+
+    uint16_t *done = NULL;
+
+    if (is_load ? (g->wr != PSX_GTE_WR_CALL) : (g->rd != PSX_GTE_RD_CALL))
+    {
+        uint16_t *escapes[3];
+        uint32_t escape_count = 0;
+
+        psx_jit_emit_addr(e, PSX_RS(op), PSX_SIMM(op), 3u, escapes, &escape_count);
+
+        if (is_load)
+        {
+            if (g->wr != PSX_GTE_WR_NONE)
+            {
+                psx_emit_ldr_reg(e, PSX_R2, PSX_JIT_RAM, PSX_R1);
+
+                if (g->wr == PSX_GTE_WR_32)
+                    psx_emit_str_imm(e, PSX_R2, PSX_JIT_CPU, g->off);
+                else
+                    psx_emit_strh_imm(e, PSX_R2, PSX_JIT_CPU, g->off);
+            }
+        }
+        else
+        {
+            /* a page with translated code in it goes the long way, which is
+               what invalidates */
+            psx_emit_shift_imm(e, 1, PSX_R3, PSX_R1, PSX_JIT_CODE_FLAG_SHIFT);
+            psx_emit_ldrb_reg(e, PSX_R3, PSX_JIT_PAGES, PSX_R3);
+            psx_emit_cmp_imm8(e, PSX_R3, 0);
+
+            escapes[escape_count++] = psx_emit_bcond_short_fwd(e, PSX_CC_NE);
+
+            if (g->rd == PSX_GTE_RD_32)
+                psx_emit_ldr_imm(e, PSX_R2, PSX_JIT_CPU, g->off);
+            else if (g->rd == PSX_GTE_RD_S16)
+                psx_emit_ldrsh_imm(e, PSX_R2, PSX_JIT_CPU, g->off);
+            else
+                psx_emit_ldrh_imm(e, PSX_R2, PSX_JIT_CPU, g->off);
+
+            psx_emit_str_reg(e, PSX_R2, PSX_JIT_RAM, PSX_R1);
+        }
+
+        psx_emit_add_imm12(e, PSX_JIT_CYC, PSX_JIT_CYC, 2u);
+
+        done = psx_emit_b_short_fwd(e);
+
+        const uint32_t escape_here = psx_emit_here(e);
+
+        for (uint32_t i = 0; i < escape_count; i++)
+            psx_emit_patch_bcond_short(e, escapes[i], PSX_CC_NE, escape_here);
+    }
 
     psx_emit_mov(e, PSX_R0, PSX_JIT_CPU);
     psx_emit_imm32(e, PSX_R1, c->guest);
@@ -851,6 +1075,9 @@ static inline int psx_jit_translate_gte_mem(psx_jit_ctx_t *c, uint32_t op)
     psx_emit_cmp_imm8(e, PSX_R0, 0);
 
     psx_jit_add_exit(c, psx_emit_bcond_fwd(e, PSX_CC_NE));
+
+    if (done)
+        psx_emit_patch_b_short(e, done, psx_emit_here(e));
 
     c->cycles_done = 1;
 
@@ -1068,7 +1295,7 @@ static inline int psx_jit_translate_mem_ex(psx_jit_ctx_t *c, uint32_t op, uint32
            costs the wide encodings; everywhere else r3 is free. */
         const uint32_t tmp = (flags & PSX_JIT_MEM_DELAY) ? PSX_R12 : PSX_R3;
 
-        psx_emit_shift_imm(e, 1, tmp, PSX_R1, 10); /* 1 KB page index */
+        psx_emit_shift_imm(e, 1, tmp, PSX_R1, PSX_JIT_CODE_FLAG_SHIFT);
         psx_emit_ldrb_reg(e, tmp, PSX_JIT_PAGES, tmp);
 
         if (PSX_EMIT_LOW(tmp))

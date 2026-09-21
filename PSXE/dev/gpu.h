@@ -112,6 +112,12 @@ struct psx_gpu_t
        lets the frontend skip re-scaling a frame that did not change. */
     int32_t vram_dirty;
     int32_t draw_visible; /* the drawing area overlaps the display window */
+
+    /* Rows of VRAM the display window covers (overscan margin included), and
+       the rows written on screen since the last presented frame, both as
+       [y0, y1). See vram_dirty in gpu.c. */
+    uint16_t vis_y0, vis_y1;
+    uint16_t dirty_y0, dirty_y1;
     int display_enable;
 
     // State data

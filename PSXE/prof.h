@@ -4,9 +4,7 @@
 /* Lightweight DWT-based profiler for the PSX emulator hot loop.
    Set PSX_PROFILE to 0 to compile out completely. */
 
-#ifndef PSX_PROFILE
-#define PSX_PROFILE 0
-#endif
+#include "prof_switch.h"
 
 #include <stdint.h>
 
@@ -46,6 +44,19 @@ typedef struct
     uint32_t px_fast;  /* pixels through the specialised paletted span loop */
     uint32_t px_transp;/* pixels of primitives with semi transparency enabled */
     uint32_t px_raw;   /* pixels of primitives with raw texture mode */
+
+    /* rasterizer by primitive class: core cycles, primitives, bounding box
+       pixels. 0 culled, 1 flat, 2 flat blended, 3 textured (paletted, fast
+       loop), 4 textured (15 bit or raw), 5 gouraud, 6 textured gouraud,
+       7 rectangle */
+    uint32_t gte_cyc;  /* core cycles in GTE commands (part of cpu) */
+    uint32_t gte_cnt;  /* GTE commands */
+    uint32_t gte_mov;  /* GTE register moves and LWC2 / SWC2 */
+    uint32_t dirty_flip; /* the picture went out of date: display window moved   */
+    uint32_t dirty_draw; /* ... something was drawn or copied into it            */
+    uint32_t ras_cyc[8];
+    uint32_t ras_cnt[8];
+    uint32_t ras_px[8];
     uint32_t t_start;  /* CYCCNT at window start */
 } psx_prof_t;
 

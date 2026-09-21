@@ -131,8 +131,10 @@ static PSX_GPU_HOT void psx_gpu_update_cmd_impl(psx_gpu_t *gpu);
 */
 #define GPU_DIRTY_MARGIN 8u
 
-/* Is any of [x0, x1) x [y0, y1), in VRAM coordinates, on screen? */
-static inline int gpu_rect_visible(const psx_gpu_t *gpu, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+/* Is any of [x0, x1) x [y0, y1), in VRAM coordinates, inside the display window
+   less `margin` rows at its top and bottom? */
+static inline int gpu_rect_in_window(const psx_gpu_t *gpu, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+                                     uint32_t margin)
 {
     /* empty, or wrapping around VRAM: not worth working out */
     if ((x1 > 1024u) || (y1 > 512u) || (x1 <= x0) || (y1 <= y0))
@@ -151,41 +153,129 @@ static inline int gpu_rect_visible(const psx_gpu_t *gpu, uint32_t x0, uint32_t y
 
     const uint32_t wx0 = gpu->disp_x;
     const uint32_t wx1 = gpu->disp_x + w;
-    const uint32_t wy0 = gpu->disp_y + GPU_DIRTY_MARGIN;
-    const uint32_t wy1 = gpu->disp_y + h - GPU_DIRTY_MARGIN;
+    const uint32_t wy0 = gpu->disp_y + margin;
+    const uint32_t wy1 = gpu->disp_y + h - margin;
 
     return (x0 < wx1) && (x1 > wx0) && (y0 < wy1) && (y1 > wy0);
+}
+
+/* ... on screen, as far as a new frame is concerned? */
+static inline int gpu_rect_visible(const psx_gpu_t *gpu, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+{
+    return gpu_rect_in_window(gpu, x0, y0, x1, y1, GPU_DIRTY_MARGIN);
+}
+
+/*
+    Which rows went out of date is kept as well (dirty_y0 .. dirty_y1). A game
+    can draw into the buffer that is on screen: FF7 renders a battle into the
+    back buffer at 15 frames a second and flips, but draws its menus and gauges
+    over the visible one twice in between. Those are changes the panel has to
+    show, only there is no need to read the whole picture out of SDRAM again for
+    a few dozen rows of menu: the frontend repacks just the rows named here when
+    the display window is still where it was.
+
+    The rows are those of the whole window: a write into the overscan margin is
+    no reason for a new frame, but when the next one is made those rows have to
+    be read again like any other, or the copy the frontend keeps goes stale.
+*/
+static inline void gpu_dirty_rows(psx_gpu_t *gpu, uint32_t y0, uint32_t y1)
+{
+    if (y1 > 512u)
+        y1 = 512u;
+
+    if (y0 < gpu->dirty_y0)
+        gpu->dirty_y0 = (uint16_t)y0;
+
+    if (y1 > gpu->dirty_y1)
+        gpu->dirty_y1 = (uint16_t)y1;
+}
+
+/* the whole picture: the window moved, changed shape, or nobody knows */
+static inline void gpu_dirty_all(psx_gpu_t *gpu)
+{
+    gpu->vram_dirty = 1;
+    gpu->dirty_y0 = 0;
+    gpu->dirty_y1 = 512;
 }
 
 /* [x0, x1) x [y0, y1) was written */
 static inline void gpu_touch(psx_gpu_t *gpu, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
 {
-    if (!gpu->vram_dirty && gpu_rect_visible(gpu, x0, y0, x1, y1))
+    /* called with every word of an upload: one test while nothing new comes of it */
+    if (gpu->vram_dirty && (y0 >= gpu->dirty_y0) && (y1 <= gpu->dirty_y1))
+        return;
+
+    if (!gpu_rect_in_window(gpu, x0, y0, x1, y1, 0))
+        return;
+
+    const int visible = gpu_rect_visible(gpu, x0, y0, x1, y1);
+
+    if (visible && !gpu->vram_dirty)
+        PROF_INC(dirty_draw);
+
+    if ((y1 > 512u) || (y1 <= y0))
+    {
+        gpu_dirty_all(gpu); /* wraps around VRAM */
+
+        return;
+    }
+
+    if (visible)
         gpu->vram_dirty = 1;
+
+    gpu_dirty_rows(gpu, y0, y1);
 }
 
 /* Polygons, lines and rectangles are clipped to the drawing area, so whether
    they can show is a property of that area and of the display window - worked
-   out when either changes instead of once per primitive. */
+   out when either changes instead of once per primitive. The rows of the window
+   are kept too: a drawing area that spans both of a game's frame buffers is
+   "visible", the primitives that go into the hidden one are not. */
 static inline void gpu_update_draw_visible(psx_gpu_t *gpu)
 {
     gpu->draw_visible = gpu_rect_visible(gpu, gpu->draw_x1, gpu->draw_y1, gpu->draw_x2 + 1u, gpu->draw_y2 + 1u);
+
+    const uint32_t h = ((gpu->display_mode & 0x24u) == 0x24u) ? 480u : 240u;
+
+    gpu->vis_y0 = (uint16_t)gpu->disp_y;
+    gpu->vis_y1 = (uint16_t)(gpu->disp_y + h);
+}
+
+/* A polygon or a rectangle is about to draw into rows [y0, y1) of VRAM, which
+   are inside the drawing area already */
+static inline void gpu_prim_rows(psx_gpu_t *gpu, int32_t y0, int32_t y1)
+{
+    /* vis_y0 .. vis_y1 are the rows of the window, margin included */
+    if ((y0 >= (int32_t)gpu->vis_y1) || (y1 <= (int32_t)gpu->vis_y0))
+        return;
+
+    gpu_dirty_rows(gpu, (uint32_t)y0, (uint32_t)y1);
+
+    if (!gpu->vram_dirty && gpu->draw_visible && (y0 < ((int32_t)gpu->vis_y1 - (int32_t)GPU_DIRTY_MARGIN)) &&
+        (y1 > ((int32_t)gpu->vis_y0 + (int32_t)GPU_DIRTY_MARGIN)))
+    {
+        gpu->vram_dirty = 1;
+        PROF_INC(dirty_draw);
+    }
 }
 
 /* A GP0 word arrived for the command in buf[0]: note what it can change.
    Called for every word, so the common case has to be the first test. */
 static inline void gpu_note_cmd(psx_gpu_t *gpu)
 {
-    if (gpu->vram_dirty)
-        return;
-
     const uint32_t cmd = gpu->buf[0] >> 24;
 
-    /* polygons, lines, rectangles */
+    /* polygons and rectangles say which rows they draw when they are drawn
+       (gpu_prim_rows); lines are rare enough to count as the whole picture */
     if ((cmd >= 0x20u) && (cmd < 0x80u))
     {
-        if (gpu->draw_visible)
-            gpu->vram_dirty = 1;
+        if ((cmd >= 0x40u) && (cmd < 0x60u) && gpu->draw_visible)
+        {
+            if (!gpu->vram_dirty)
+                PROF_INC(dirty_draw);
+
+            gpu_dirty_all(gpu);
+        }
 
         return;
     }
@@ -481,6 +571,13 @@ static inline unsigned int fast_saturate_u8(int val)
     return (unsigned int)val;
 }
 
+/*
+    Semi transparency: B is what is in VRAM, F what is drawn. The channels are
+    held as 8.8 here (5 bits << 3 << 8), so the halves and quarters are shifts of
+    that. (Modes 0 and 3 used to multiply by 128 and 64 without taking the 8.8
+    scale back out, which came to 128 * (B + F) and B + 64 * F: every blended
+    pixel that was not black turned white.)
+*/
 __attribute__((always_inline)) static inline uint16_t gpu_blend_bgr555(uint16_t src, uint16_t dst, int transp_mode)
 {
     int cr = (((src >> 0) & 0x1f) << 3) << 8;
@@ -493,9 +590,9 @@ __attribute__((always_inline)) static inline uint16_t gpu_blend_bgr555(uint16_t 
     switch (transp_mode)
     {
     case 0:  // 0.5*B + 0.5*F
-        cr = (br * 128 + cr * 128) >> 8;
-        cg = (bg * 128 + cg * 128) >> 8;
-        cb = (bb * 128 + cb * 128) >> 8;
+        cr = (br + cr) >> 9;
+        cg = (bg + cg) >> 9;
+        cb = (bb + cb) >> 9;
         break;
     case 1:  // 1.0*B + 1.0*F
         cr = (br + cr) >> 8;
@@ -508,9 +605,9 @@ __attribute__((always_inline)) static inline uint16_t gpu_blend_bgr555(uint16_t 
         cb = (bb - cb) >> 8;
         break;
     case 3:  // 1.0*B + 0.25*F
-        cr = (br + (cr * 64)) >> 8;
-        cg = (bg + (cg * 64)) >> 8;
-        cb = (bb + (cb * 64)) >> 8;
+        cr = (br + (cr >> 2)) >> 8;
+        cg = (bg + (cg >> 2)) >> 8;
+        cb = (bb + (cb >> 2)) >> 8;
         break;
     }
 
@@ -592,6 +689,26 @@ static inline int32_t edge_eval(const edge_func_t *edge, int32_t x, int32_t y)
     return (edge->a * x) + (edge->b * y) + edge->c;
 }
 
+/*
+    (num << frac_bits) / area, truncated towards zero.
+
+    This used to be a 64 bit division - a library call of a few hundred cycles on
+    this core, up to ten of them per triangle, which for the small triangles a
+    character model is made of cost more than filling them. The shifted
+    numerator only needs more than 32 bits for a triangle that is both very
+    large and very steeply shaded, so nearly every division is a single
+    hardware SDIV; the quotient is the same either way.
+*/
+static inline int32_t gpu_plane_div(int32_t num, int32_t area, int32_t frac_bits)
+{
+    const int32_t lim = (int32_t)1 << (31 - frac_bits);
+
+    if ((num > -lim) && (num < lim))
+        return (num * ((int32_t)1 << frac_bits)) / area;
+
+    return (int32_t)(((int64_t)num * ((int64_t)1 << frac_bits)) / area);
+}
+
 static inline plane_attr_t plane_setup(const vertex_t *va,
                                        const vertex_t *vb,
                                        const vertex_t *vc,
@@ -604,16 +721,19 @@ static inline plane_attr_t plane_setup(const vertex_t *va,
                                        int32_t ymin)
 {
     plane_attr_t plane;
-    int64_t num_dx = (int64_t)attr_a * (vb->y - vc->y) +
-                     (int64_t)attr_b * (vc->y - va->y) +
-                     (int64_t)attr_c * (va->y - vb->y);
 
-    int64_t num_dy = (int64_t)attr_a * (vc->x - vb->x) +
-                     (int64_t)attr_b * (va->x - vc->x) +
-                     (int64_t)attr_c * (vb->x - va->x);
+    /* Attributes are 8 bit and coordinates 16, so the numerators fit 32 bits
+       with room to spare. */
+    const int32_t num_dx = attr_a * (vb->y - vc->y) +
+                           attr_b * (vc->y - va->y) +
+                           attr_c * (va->y - vb->y);
 
-    plane.dx = (int32_t)((num_dx << frac_bits) / area);
-    plane.dy = (int32_t)((num_dy << frac_bits) / area);
+    const int32_t num_dy = attr_a * (vc->x - vb->x) +
+                           attr_b * (va->x - vc->x) +
+                           attr_c * (vb->x - va->x);
+
+    plane.dx = gpu_plane_div(num_dx, area, frac_bits);
+    plane.dy = gpu_plane_div(num_dy, area, frac_bits);
 
     int32_t base = attr_a << frac_bits;
     int32_t x_off = xmin - va->x;
@@ -1200,7 +1320,12 @@ __attribute__((always_inline)) static inline uint16_t modulate_bgr555(uint16_t t
     return (uint16_t)((pr >> 3) | ((pg >> 3) << 5) | ((pb >> 3) << 10) | (texel & 0x8000u));
 }
 
-PSX_GPU_HOT void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, poly_data_t data, int edge)
+#if PSX_PROFILE
+static uint32_t g_ras_last_bbox;
+#endif
+
+/* Returns the class of the primitive (see psx_prof_t), for the profiler */
+static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, poly_data_t data, int edge)
 {
     // OPTIMIZATION: Compute only essential flags first, defer expensive computations
     const int is_textured = (data.attrib & PA_TEXTURED) != 0;
@@ -1233,7 +1358,7 @@ PSX_GPU_HOT void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, v
     // OPTIMIZATION: Early exit for degenerate triangles (zero/negative area)
     int64_t area64 = (int64_t)(b.x - a.x) * (int64_t)(c.y - a.y) - (int64_t)(b.y - a.y) * (int64_t)(c.x - a.x);
     if (area64 <= 0)
-        return;
+        return 0;
     int32_t area = (int32_t)area64;
 
     int xmin = max(min3(a.x, b.x, c.x), gpu->draw_x1);
@@ -1242,12 +1367,16 @@ PSX_GPU_HOT void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, v
     int ymax = min(max3(a.y, b.y, c.y), min(gpu->draw_y2, 511));
 
     if (xmin > xmax || ymin > ymax)
-        return;
+        return 0;
+
+    gpu_prim_rows(gpu, ymin, ymax + 1);
 
 #if PSX_PROFILE
     {
         const uint32_t bbox = (uint32_t)(xmax - xmin + 1) * (uint32_t)(ymax - ymin + 1);
         const int prof_depth = (data.texp >> 7) & 3;
+
+        g_ras_last_bbox = bbox;
 
         g_prof.pixels += bbox;
 
@@ -1312,7 +1441,7 @@ PSX_GPU_HOT void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, v
             e1_row += edge1_b;
             e2_row += edge2_b;
         }
-        return;
+        return 1;
     }
 
     // ==== FAST PATH: Flat untextured (transparent or needs blending) ====
@@ -1355,9 +1484,9 @@ PSX_GPU_HOT void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, v
 
                 int cr, cg, cb;
                 if (transp_mode == 0) {
-                    cr = (br * 128 + cr_base * 128) >> 8;
-                    cg = (bg * 128 + cg_base * 128) >> 8;
-                    cb = (bb * 128 + cb_base * 128) >> 8;
+                    cr = (br + cr_base) >> 9;
+                    cg = (bg + cg_base) >> 9;
+                    cb = (bb + cb_base) >> 9;
                 } else if (transp_mode == 1) {
                     cr = (br + cr_base) >> 8;
                     cg = (bg + cg_base) >> 8;
@@ -1367,9 +1496,9 @@ PSX_GPU_HOT void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, v
                     cg = (bg - cg_base) >> 8;
                     cb = (bb - cb_base) >> 8;
                 } else {
-                    cr = (br + cr_base * 64) >> 8;
-                    cg = (bg + cg_base * 64) >> 8;
-                    cb = (bb + cb_base * 64) >> 8;
+                    cr = (br + (cr_base >> 2)) >> 8;
+                    cg = (bg + (cg_base >> 2)) >> 8;
+                    cb = (bb + (cb_base >> 2)) >> 8;
                 }
 
                 if (cr < 0) cr = 0; else if (cr > 255) cr = 255;
@@ -1386,7 +1515,7 @@ PSX_GPU_HOT void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, v
             e1_row += edge1_b;
             e2_row += edge2_b;
         }
-        return;
+        return 2;
     }
 
     plane_attr_t r_plane = {0}, g_plane = {0}, b_plane = {0};
@@ -1412,515 +1541,282 @@ PSX_GPU_HOT void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, v
         ty_row = ty_plane.row;
     }
 
-    // ==== OPTIMIZED PATH: Textured flat-shaded (most common case) ====
-    if (is_textured && !is_shaded)
+    /*
+        Everything from here on interpolates something across the triangle, and
+        all of it works the same way:
+
+          - the span of a scanline is solved from the edge functions
+            (gpu_span_clip) instead of walked pixel by pixel from the left edge
+            of the bounding box. The old loops evaluated three edge functions
+            for every pixel of the box, inside the triangle or not - for the
+            thin triangles of a character model most of the box is outside;
+          - what does not change along a span is decided outside the loop: how
+            the texel is fetched (4 / 8 / 15 bit), how it is shaded (as is,
+            modulated by one colour, modulated by the interpolated colour) and
+            whether it is blended. Each combination gets a loop of its own with
+            only the per pixel work left in it.
+
+        The pixels are the same as before, bit for bit; checked on the host
+        against the loops this replaces.
+    */
+    const int row_px = xmax - xmin + 1;
+    int vram_row = ymin * 1024;
+
+    const int32_t r_dx = r_plane.dx, g_dx = g_plane.dx, b_dx = b_plane.dx;
+    const int32_t r_dy = r_plane.dy, g_dy = g_plane.dy, b_dy = b_plane.dy;
+
+/* a colour channel: 8.12 fixed point plus the dither offset, clamped to 8 bits */
+#define PSXE_CH(v, d) ((uint32_t)fast_saturate_u8(((v) >> ATTR_FRAC_BITS) + (d)))
+
+    // ==== Gouraud shading without texture ====
+    if (!is_textured)
     {
-        // Compute texture parameters only when needed
-        const int tpx = (data.texp & 0xf) << 6;
-        const int tpy = (data.texp & 0x10) << 4;
-        const int clutx = (data.clut & 0x3f) << 4;
-        const int cluty = (data.clut >> 6) & 0x1ff;
-        const int depth = (data.texp >> 7) & 3;
-        const int transp_mode = (data.texp >> 5) & 3;
+        const int transp_mode = (gpu->gpustat >> 5) & 3;
 
-        // Pre-compute modulation factors in 8-bit
-        const uint8_t mod_r = flat_color & 0xff;
-        const uint8_t mod_g = (flat_color >> 8) & 0xff;
-        const uint8_t mod_b = (flat_color >> 16) & 0xff;
-
-        // Hoist texture window masking (rarely changes per triangle).
-        // Folded into a single and/or pair so the inner loop only pays 2 ops.
-        const uint32_t texw_and_x = (uint32_t)(uint16_t)(~gpu->texw_mx) & 0xffu;
-        const uint32_t texw_or_x = (uint32_t)(gpu->texw_ox & gpu->texw_mx) & 0xffu;
-        const uint32_t texw_and_y = (uint32_t)(uint16_t)(~gpu->texw_my) & 0xffu;
-        const uint32_t texw_or_y = (uint32_t)(gpu->texw_oy & gpu->texw_my) & 0xffu;
-
-        // Palette staged in DTCM when the primitive is big enough to profit
-        const uint16_t *const clut = gpu_clut_ptr(gpu, depth, clutx, cluty,
-                                                  (uint32_t)(xmax - xmin + 1) * (uint32_t)(ymax - ymin + 1));
-
-        int vram_row = ymin * 1024;
-
-        /* ---------------------------------------------------------------
-           Specialised span loop for the case games spend most of their time
-           in: paletted texture (4/8 bpp), flat shading, opaque, not raw.
-           Every loop invariant (depth, modulation, raw/transparency) is
-           resolved at compile time here, so the inner loop is only the work
-           that actually differs per pixel.
-           --------------------------------------------------------------- */
-#if PSX_PROFILE
-        {
-            const uint32_t bbox = (uint32_t)(xmax - xmin + 1) * (uint32_t)(ymax - ymin + 1);
-
-            if (transparency_enabled)
-                g_prof.px_transp += bbox;
-
-            if (is_raw)
-                g_prof.px_raw += bbox;
-
-            if ((depth != 2) && !is_raw)
-                g_prof.px_fast += bbox;
-        }
-#endif
-
-        if ((depth != 2) && !is_raw)
-        {
-            const int32_t tx_dx = tx_plane.dx;
-            const int32_t ty_dx = ty_plane.dx;
-            const int32_t tx_dy = tx_plane.dy;
-            const int32_t ty_dy = ty_plane.dy;
-            const int neutral = (mod_r == 0x80) && (mod_g == 0x80) && (mod_b == 0x80);
-            const int row_px = xmax - xmin + 1;
-
-#define PSXE_SPAN_TEXEL(IS4)                                                                  \
-            ((IS4)                                                                             \
-                 ? clut[(vram[(tpx + (tx >> 2)) + ((tpy + ty) << 10)] >> ((tx & 3u) << 2)) & 0xfu]  \
-                 : clut[(vram[(tpx + (tx >> 1)) + ((tpy + ty) << 10)] >> ((tx & 1u) << 3)) & 0xffu])
-
-#define PSXE_SPAN_LOOP(IS4, NEUT, TRANSP)                                                          \
-            for (int y = ymin; y <= ymax; ++y, vram_row += 1024)                                       \
+#define PSXE_GOURAUD_LOOP(TRANSP)                                                                      \
+        for (int y = ymin; y <= ymax; ++y, vram_row += 1024)                                           \
+        {                                                                                              \
+            int start = 0;                                                                             \
+            int end = row_px - 1;                                                                      \
+                                                                                                       \
+            gpu_span_clip(e0_row, edge0_a, &start, &end);                                              \
+            gpu_span_clip(e1_row, edge1_a, &start, &end);                                              \
+            gpu_span_clip(e2_row, edge2_a, &start, &end);                                              \
+                                                                                                       \
+            if (start <= end)                                                                          \
             {                                                                                          \
-                /* solved span, so the loop carries only the texture coordinates */                    \
-                int start = 0;                                                                         \
-                int end = row_px - 1;                                                                  \
+                /* the dither pattern is anchored at the corner of the bounding box */                 \
+                const int *const drow = &g_psx_gpu_dither_kernel[((y - ymin) & 3) << 2];               \
                                                                                                        \
-                gpu_span_clip(e0_row, edge0_a, &start, &end);                                          \
-                gpu_span_clip(e1_row, edge1_a, &start, &end);                                          \
-                gpu_span_clip(e2_row, edge2_a, &start, &end);                                          \
-                                                                                                       \
-                int32_t txv = (int32_t)((uint32_t)tx_row + (uint32_t)tx_dx * (uint32_t)start);         \
-                int32_t tyv = (int32_t)((uint32_t)ty_row + (uint32_t)ty_dx * (uint32_t)start);         \
+                int32_t rv = (int32_t)((uint32_t)r_row + (uint32_t)r_dx * (uint32_t)start);            \
+                int32_t gv = (int32_t)((uint32_t)g_row + (uint32_t)g_dx * (uint32_t)start);            \
+                int32_t bv = (int32_t)((uint32_t)b_row + (uint32_t)b_dx * (uint32_t)start);            \
                 uint16_t *__restrict dst = &vram[vram_row + xmin + start];                             \
                                                                                                        \
                 for (int x = start; x <= end; ++x, ++dst)                                              \
                 {                                                                                      \
-                    const uint32_t tx = (((uint32_t)txv >> ATTR_FRAC_BITS) & texw_and_x) | texw_or_x;   \
-                    const uint32_t ty = (((uint32_t)tyv >> ATTR_FRAC_BITS) & texw_and_y) | texw_or_y;   \
-                    const uint16_t texel = PSXE_SPAN_TEXEL(IS4);                                       \
+                    const int d = drow[x & 3];                                                         \
+                    const uint16_t out = (uint16_t)((PSXE_CH(rv, d) >> 3) | ((PSXE_CH(gv, d) >> 3) << 5) | \
+                                                    ((PSXE_CH(bv, d) >> 3) << 10));                     \
                                                                                                        \
-                    if (texel)                                                                         \
-                    {                                                                                  \
-                        const uint16_t out = (NEUT) ? texel                                            \
-                                                    : modulate_bgr555(texel, mod_r, mod_g, mod_b);     \
+                    *dst = (TRANSP) ? gpu_blend_bgr555(out, *dst, transp_mode) : out;                   \
                                                                                                        \
-                        *dst = ((TRANSP) && (texel & 0x8000u))                                         \
-                                   ? gpu_blend_bgr555(out, *dst, transp_mode)                          \
-                                   : out;                                                              \
-                    }                                                                                  \
-                                                                                                       \
-                    txv += tx_dx; tyv += ty_dx;                                                        \
+                    rv += r_dx; gv += g_dx; bv += b_dx;                                                \
                 }                                                                                      \
+            }                                                                                          \
                                                                                                        \
-                e0_row += edge0_b; e1_row += edge1_b; e2_row += edge2_b;                               \
-                tx_row += tx_dy; ty_row += ty_dy;                                                      \
-            }
-
-            if (transparency_enabled)
-            {
-                if (depth == 0)
-                {
-                    if (neutral)
-                    {
-                        PSXE_SPAN_LOOP(1, 1, 1)
-                    }
-                    else
-                    {
-                        PSXE_SPAN_LOOP(1, 0, 1)
-                    }
-                }
-                else
-                {
-                    if (neutral)
-                    {
-                        PSXE_SPAN_LOOP(0, 1, 1)
-                    }
-                    else
-                    {
-                        PSXE_SPAN_LOOP(0, 0, 1)
-                    }
-                }
-            }
-            else
-            {
-                if (depth == 0)
-                {
-                    if (neutral)
-                    {
-                        PSXE_SPAN_LOOP(1, 1, 0)
-                    }
-                    else
-                    {
-                        PSXE_SPAN_LOOP(1, 0, 0)
-                    }
-                }
-                else
-                {
-                    if (neutral)
-                    {
-                        PSXE_SPAN_LOOP(0, 1, 0)
-                    }
-                    else
-                    {
-                        PSXE_SPAN_LOOP(0, 0, 0)
-                    }
-                }
-            }
-
-#undef PSXE_SPAN_LOOP
-#undef PSXE_SPAN_TEXEL
-
-            return;
+            e0_row += edge0_b; e1_row += edge1_b; e2_row += edge2_b;                                   \
+            r_row += r_dy; g_row += g_dy; b_row += b_dy;                                               \
         }
 
-        for (int y = ymin; y <= ymax; ++y, vram_row += 1024)
+        if (transparency_enabled)
         {
-            int32_t e0 = e0_row;
-            int32_t e1 = e1_row;
-            int32_t e2 = e2_row;
-            int32_t tx_val = tx_row;
-            int32_t ty_val = ty_row;
-            uint16_t *__restrict dst = &vram[vram_row + xmin];
-            int x = xmin;
-
-            while (x <= xmax && (e0 | e1 | e2) < 0)
-            {
-                e0 += edge0_a;
-                e1 += edge1_a;
-                e2 += edge2_a;
-                tx_val += tx_plane.dx;
-                ty_val += ty_plane.dx;
-                ++x;
-                ++dst;
-            }
-
-            while (x <= xmax && (e0 | e1 | e2) >= 0)
-            {
-                // AGGRESSIVE OPTIMIZATION: Unroll loop for 15-bit textured non-transparent case
-                // This is the most common path in games
-                if (depth == 2 && !transparency_enabled && !is_raw && (xmax - x + 1) >= 2)
-                {
-                    // Fast path: Process 2 pixels at once with manual unrolling
-                    // We only unroll by 2 to avoid edge test complications
-
-                    // Check both pixels will be inside triangle
-                    int32_t e0_next = e0 + edge0_a;
-                    int32_t e1_next = e1 + edge1_a;
-                    int32_t e2_next = e2 + edge2_a;
-
-                    if ((e0_next | e1_next | e2_next) >= 0 && x + 1 <= xmax)
-                    {
-                        // Pixel 0
-                        int tx0 = tx_val >> ATTR_FRAC_BITS;
-                        int ty0 = ty_val >> ATTR_FRAC_BITS;
-                        tx0 = (tx0 & texw_and_x) | texw_or_x;
-                        ty0 = (ty0 & texw_and_y) | texw_or_y;
-                        uint16_t texel0 = vram[(tpx + tx0) + ((tpy + ty0) << 10)];
-
-                        // Pixel 1
-                        int32_t tx_val1 = tx_val + tx_plane.dx;
-                        int32_t ty_val1 = ty_val + ty_plane.dx;
-                        int tx1 = tx_val1 >> ATTR_FRAC_BITS;
-                        int ty1 = ty_val1 >> ATTR_FRAC_BITS;
-                        tx1 = (tx1 & texw_and_x) | texw_or_x;
-                        ty1 = (ty1 & texw_and_y) | texw_or_y;
-                        uint16_t texel1 = vram[(tpx + tx1) + ((tpy + ty1) << 10)];
-
-                        // Modulate both (compiler can pipeline these)
-                        if (texel0 != 0) {
-                            dst[0] = modulate_bgr555(texel0, mod_r, mod_g, mod_b);
-                        }
-                        if (texel1 != 0) {
-                            dst[1] = modulate_bgr555(texel1, mod_r, mod_g, mod_b);
-                        }
-
-                        // Update for 2 pixels
-                        e0 = e0_next + edge0_a;
-                        e1 = e1_next + edge1_a;
-                        e2 = e2_next + edge2_a;
-                        tx_val = tx_val1 + tx_plane.dx;
-                        ty_val = ty_val1 + ty_plane.dx;
-                        dst += 2;
-                        x += 2;
-                        continue;
-                    }
-                }
-
-                // Standard single-pixel processing
-                int tx = tx_val >> ATTR_FRAC_BITS;
-                int ty = ty_val >> ATTR_FRAC_BITS;
-
-                // OPTIMIZED: Inline texture fetch for 15-bit mode
-                uint16_t texel;
-                if (depth == 2)  // 15-bit direct (most common)
-                {
-                    // Apply texture window using bitwise ops (branchless)
-                    tx = (tx & texw_and_x) | texw_or_x;
-                    ty = (ty & texw_and_y) | texw_or_y;
-
-                    // OPTIMIZED: Combined calculation with masking and shifting
-                    texel = vram[tpx + tx + ((tpy + ty) << 10)];
-                }
-                else if (depth == 1)  // 8-bit
-                {
-                    tx = (tx & texw_and_x) | texw_or_x;
-                    ty = (ty & texw_and_y) | texw_or_y;
-
-                    uint16_t packed = vram[(tpx + (tx >> 1)) + ((tpy + ty) << 10)];
-                    int index = (packed >> ((tx & 0x1) << 3)) & 0xff;
-                    texel = clut[index];
-                }
-                else  // 4-bit
-                {
-                    tx = (tx & texw_and_x) | texw_or_x;
-                    ty = (ty & texw_and_y) | texw_or_y;
-
-                    uint16_t packed = vram[(tpx + (tx >> 2)) + ((tpy + ty) << 10)];
-                    int index = (packed >> ((tx & 0x3) << 2)) & 0xf;
-                    texel = clut[index];
-                }
-
-                // Branchless transparency check using conditional selection
-                const int is_transparent = transparency_enabled & ((texel >> 15) & 1);
-
-                if (__builtin_expect(texel != 0, 1))
-                {
-                    uint16_t out_color;
-                    if (is_raw)
-                    {
-                        out_color = texel;
-                    }
-                    else
-                    {
-                        // OPTIMIZED: SIMD modulation with DSP instructions
-                        out_color = modulate_bgr555(texel, mod_r, mod_g, mod_b);
-                    }
-
-                    if (is_transparent)
-                    {
-                        *dst = gpu_blend_bgr555(out_color, *dst, transp_mode);
-                    }
-                    else
-                    {
-                        *dst = out_color;
-                    }
-                }
-
-                // Use SIMD ADD for parallel edge/coordinate updates
-                e0 += edge0_a;
-                e1 += edge1_a;
-                e2 += edge2_a;
-                tx_val += tx_plane.dx;
-                ty_val += ty_plane.dx;
-                ++x;
-                ++dst;
-            }
-
-            e0_row += edge0_b;
-            e1_row += edge1_b;
-            e2_row += edge2_b;
-            tx_row += tx_plane.dy;
-            ty_row += ty_plane.dy;
+            PSXE_GOURAUD_LOOP(1)
         }
-        return;
+        else
+        {
+            PSXE_GOURAUD_LOOP(0)
+        }
+
+#undef PSXE_GOURAUD_LOOP
+
+        return 5;
     }
 
-    // ==== OPTIMIZED PATH: Gouraud shading without texture ====
-    if (!is_textured)
-    {
-        const int transp_mode = (gpu->gpustat >> 5) & 3;
-        int vram_row = ymin * 1024;
-
-        for (int y = ymin; y <= ymax; ++y, vram_row += 1024)
-        {
-            int32_t e0 = e0_row;
-            int32_t e1 = e1_row;
-            int32_t e2 = e2_row;
-            int32_t r_val = r_row;
-            int32_t g_val = g_row;
-            int32_t b_val = b_row;
-            uint16_t *dst = &vram[vram_row + xmin];
-            int x = xmin;
-            const int kernel_row = ((y - ymin) & 3) << 2;
-            int dx_dither = 0;
-
-            // Skip pixels outside triangle
-            while (x <= xmax && (e0 | e1 | e2) < 0)
-            {
-                e0 += edge0_a;
-                e1 += edge1_a;
-                e2 += edge2_a;
-                r_val += r_plane.dx;
-                g_val += g_plane.dx;
-                b_val += b_plane.dx;
-                ++x;
-                ++dst;
-                dx_dither = (dx_dither + 1) & 3;
-            }
-
-            // Render pixels inside triangle - OPTIMIZED with reduced overhead
-            while (x <= xmax && (e0 | e1 | e2) >= 0)
-            {
-                // Extract and dither colors
-                const int dither = g_psx_gpu_dither_kernel[dx_dither | kernel_row];
-
-                // OPTIMIZED: Combine shift, add, and saturate - compiler friendly
-                int cr = (r_val >> ATTR_FRAC_BITS) + dither;
-                int cg = (g_val >> ATTR_FRAC_BITS) + dither;
-                int cb = (b_val >> ATTR_FRAC_BITS) + dither;
-
-                // Saturate to 8-bit
-                if (cr < 0) cr = 0; else if (cr > 255) cr = 255;
-                if (cg < 0) cg = 0; else if (cg > 255) cg = 255;
-                if (cb < 0) cb = 0; else if (cb > 255) cb = 255;
-
-                const uint16_t out_color = (uint16_t)((cr >> 3) | ((cg >> 3) << 5) | ((cb >> 3) << 10));
-
-                if (transparency_enabled)
-                {
-                    *dst = gpu_blend_bgr555(out_color, *dst, transp_mode);
-                }
-                else
-                {
-                    *dst = out_color;
-                }
-
-                e0 += edge0_a;
-                e1 += edge1_a;
-                e2 += edge2_a;
-                r_val += r_plane.dx;
-                g_val += g_plane.dx;
-                b_val += b_plane.dx;
-                ++x;
-                ++dst;
-                dx_dither = (dx_dither + 1) & 3;
-            }
-
-            e0_row += edge0_b;
-            e1_row += edge1_b;
-            e2_row += edge2_b;
-            r_row += r_plane.dy;
-            g_row += g_plane.dy;
-            b_row += b_plane.dy;
-        }
-        return;
-    }
-
-    // ==== Fallback path for textured+Gouraud ====
-    // Compute texture parameters only when needed
+    // ==== Textured, flat or Gouraud shaded ====
     const int tpx = (data.texp & 0xf) << 6;
     const int tpy = (data.texp & 0x10) << 4;
     const int clutx = (data.clut & 0x3f) << 4;
     const int cluty = (data.clut >> 6) & 0x1ff;
     const int depth = (data.texp >> 7) & 3;
     const int transp_mode = (data.texp >> 5) & 3;
+
+    const uint8_t mod_r = flat_color & 0xff;
+    const uint8_t mod_g = (flat_color >> 8) & 0xff;
+    const uint8_t mod_b = (flat_color >> 16) & 0xff;
+
+    /* texture window, folded into one and / or pair per coordinate */
+    const uint32_t texw_and_x = (uint32_t)(uint16_t)(~gpu->texw_mx) & 0xffu;
+    const uint32_t texw_or_x = (uint32_t)(gpu->texw_ox & gpu->texw_mx) & 0xffu;
+    const uint32_t texw_and_y = (uint32_t)(uint16_t)(~gpu->texw_my) & 0xffu;
+    const uint32_t texw_or_y = (uint32_t)(gpu->texw_oy & gpu->texw_my) & 0xffu;
+
+    /* palette staged in DTCM when the primitive is big enough to profit */
     const uint16_t *const clut = gpu_clut_ptr(gpu, depth, clutx, cluty,
-                                              (uint32_t)(xmax - xmin + 1) * (uint32_t)(ymax - ymin + 1));
+                                              (uint32_t)row_px * (uint32_t)(ymax - ymin + 1));
 
-    int32_t r_val_row = r_row;
-    int32_t g_val_row = g_row;
-    int32_t b_val_row = b_row;
-    int vram_row = ymin * 1024;
+    const int32_t tx_dx = tx_plane.dx, ty_dx = ty_plane.dx;
+    const int32_t tx_dy = tx_plane.dy, ty_dy = ty_plane.dy;
 
-    for (int y = ymin; y <= ymax; ++y, vram_row += 1024)
+    /*
+        How the texel is fetched: 0 four bit, 1 eight bit, 2 fifteen bit. The
+        reserved depth 3 was read differently by each of the old loops - eight
+        bit by the fast flat one, four bit by the raw one, fifteen bit under
+        Gouraud shading - and that is kept, odd as it is: nothing should use it,
+        and if something does it looks the way it did.
+    */
+    int fetch;
+
+    if (depth != 3)
+        fetch = depth;
+    else if (is_shaded)
+        fetch = 2;
+    else
+        fetch = is_raw ? 0 : 1;
+
+    /* How it is shaded: 0 as it is (raw, or modulated by the neutral 0x808080,
+       which leaves every five bit channel alone), 1 one colour, 2 interpolated */
+    int shade;
+
+    if (is_raw)
+        shade = 0;
+    else if (is_shaded)
+        shade = 2;
+    else
+        shade = ((mod_r == 0x80) && (mod_g == 0x80) && (mod_b == 0x80)) ? 0 : 1;
+
+#if PSX_PROFILE
     {
-        int32_t e0 = e0_row;
-        int32_t e1 = e1_row;
-        int32_t e2 = e2_row;
-        int32_t r_val = r_val_row;
-        int32_t g_val = g_val_row;
-        int32_t b_val = b_val_row;
-        int32_t tx_val = tx_row;
-        int32_t ty_val = ty_row;
-        uint16_t *dst = &vram[vram_row + xmin];
-        int x = xmin;
-        const int kernel_row = ((y - ymin) & 3) << 2;
-        int dx_dither = 0;
+        const uint32_t bbox = (uint32_t)row_px * (uint32_t)(ymax - ymin + 1);
 
-        while (x <= xmax && (e0 | e1 | e2) < 0)
-        {
-            e0 += edge0_a;
-            e1 += edge1_a;
-            e2 += edge2_a;
-            r_val += r_plane.dx;
-            g_val += g_plane.dx;
-            b_val += b_plane.dx;
-            tx_val += tx_plane.dx;
-            ty_val += ty_plane.dx;
-            ++x;
-            ++dst;
-            dx_dither = (dx_dither + 1) & 3;
-        }
+        if (transparency_enabled)
+            g_prof.px_transp += bbox;
 
-        while (x <= xmax && (e0 | e1 | e2) >= 0)
-        {
-            const int cr = r_val >> ATTR_FRAC_BITS;
-            const int cg = g_val >> ATTR_FRAC_BITS;
-            const int cb = b_val >> ATTR_FRAC_BITS;
-            const int dither = g_psx_gpu_dither_kernel[dx_dither | kernel_row];
-            const int dr = fast_saturate_u8(cr + dither);
-            const int dg = fast_saturate_u8(cg + dither);
-            const int db = fast_saturate_u8(cb + dither);
+        if (is_raw)
+            g_prof.px_raw += bbox;
 
-            const int tx = tx_val >> ATTR_FRAC_BITS;
-            const int ty = ty_val >> ATTR_FRAC_BITS;
-            const uint16_t texel = gpu_fetch_texel(gpu, tx, ty, tpx, tpy, clut, depth);
-
-            if (__builtin_expect(texel != 0, 1))
-            {
-                uint16_t out_color;
-                if (is_raw)
-                {
-                    out_color = texel;
-                }
-                else
-                {
-                    const int tr = ((texel >> 0) & 0x1f) << 3;
-                    const int tg = ((texel >> 5) & 0x1f) << 3;
-                    const int tb = ((texel >> 10) & 0x1f) << 3;
-                    const int pr = (tr * dr) >> 7;
-                    const int pg = (tg * dg) >> 7;
-                    const int pb = (tb * db) >> 7;
-                    const unsigned int upr = fast_saturate_u8(pr);
-                    const unsigned int upg = fast_saturate_u8(pg);
-                    const unsigned int upb = fast_saturate_u8(pb);
-                    out_color = (uint16_t)((upr >> 3) | ((upg >> 3) << 5) | ((upb >> 3) << 10) |
-                                           (texel & 0x8000u));
-                }
-
-                if (transparency_enabled && (texel & 0x8000))
-                {
-                    *dst = gpu_blend_bgr555(out_color, *dst, transp_mode);
-                }
-                else
-                {
-                    *dst = out_color;
-                }
-            }
-
-            e0 += edge0_a;
-            e1 += edge1_a;
-            e2 += edge2_a;
-            r_val += r_plane.dx;
-            g_val += g_plane.dx;
-            b_val += b_plane.dx;
-            tx_val += tx_plane.dx;
-            ty_val += ty_plane.dx;
-            ++x;
-            ++dst;
-            dx_dither = (dx_dither + 1) & 3;
-        }
-
-        e0_row += edge0_b;
-        e1_row += edge1_b;
-        e2_row += edge2_b;
-        r_val_row += r_plane.dy;
-        g_val_row += g_plane.dy;
-        b_val_row += b_plane.dy;
-        tx_row += tx_plane.dy;
-        ty_row += ty_plane.dy;
+        g_prof.px_fast += bbox;
     }
+#endif
+
+#define PSXE_FETCH(F, tx, ty)                                                                          \
+    (((F) == 0)   ? clut[(vram[(tpx + ((tx) >> 2)) + ((tpy + (ty)) << 10)] >> (((tx) & 3u) << 2)) & 0xfu]  \
+     : ((F) == 1) ? clut[(vram[(tpx + ((tx) >> 1)) + ((tpy + (ty)) << 10)] >> (((tx) & 1u) << 3)) & 0xffu] \
+                  : vram[(tpx + (tx)) + ((tpy + (ty)) << 10)])
+
+#define PSXE_TEX_LOOP(F, SH, TRANSP)                                                                   \
+    for (int y = ymin; y <= ymax; ++y, vram_row += 1024)                                               \
+    {                                                                                                  \
+        int start = 0;                                                                                 \
+        int end = row_px - 1;                                                                          \
+                                                                                                       \
+        gpu_span_clip(e0_row, edge0_a, &start, &end);                                                  \
+        gpu_span_clip(e1_row, edge1_a, &start, &end);                                                  \
+        gpu_span_clip(e2_row, edge2_a, &start, &end);                                                  \
+                                                                                                       \
+        if (start <= end)                                                                              \
+        {                                                                                              \
+            const int *const drow = &g_psx_gpu_dither_kernel[((y - ymin) & 3) << 2];                   \
+                                                                                                       \
+            int32_t txv = (int32_t)((uint32_t)tx_row + (uint32_t)tx_dx * (uint32_t)start);             \
+            int32_t tyv = (int32_t)((uint32_t)ty_row + (uint32_t)ty_dx * (uint32_t)start);             \
+            int32_t rv = (int32_t)((uint32_t)r_row + (uint32_t)r_dx * (uint32_t)start);                \
+            int32_t gv = (int32_t)((uint32_t)g_row + (uint32_t)g_dx * (uint32_t)start);                \
+            int32_t bv = (int32_t)((uint32_t)b_row + (uint32_t)b_dx * (uint32_t)start);                \
+            uint16_t *__restrict dst = &vram[vram_row + xmin + start];                                 \
+                                                                                                       \
+            /* the texels the next scanline starts with, fetched while this one is drawn: a            \
+               texture line that is not in the cache costs about as much as a short span */            \
+            {                                                                                          \
+                const uint32_t ntx = ((((uint32_t)txv + (uint32_t)tx_dy) >> ATTR_FRAC_BITS) & texw_and_x) | texw_or_x;\
+                const uint32_t nty = ((((uint32_t)tyv + (uint32_t)ty_dy) >> ATTR_FRAC_BITS) & texw_and_y) | texw_or_y;\
+                                                                                                       \
+                __builtin_prefetch(&vram[(tpx + (ntx >> (((F) == 0) ? 2 : (((F) == 1) ? 1 : 0)))) + ((tpy + nty) << 10)]);\
+            }                                                                                          \
+                                                                                                       \
+            for (int x = start; x <= end; ++x, ++dst)                                                  \
+            {                                                                                          \
+                const uint32_t tx = (((uint32_t)txv >> ATTR_FRAC_BITS) & texw_and_x) | texw_or_x;       \
+                const uint32_t ty = (((uint32_t)tyv >> ATTR_FRAC_BITS) & texw_and_y) | texw_or_y;       \
+                const uint16_t texel = PSXE_FETCH(F, tx, ty);                                          \
+                                                                                                       \
+                if (texel)                                                                             \
+                {                                                                                      \
+                    uint16_t out;                                                                      \
+                                                                                                       \
+                    if ((SH) == 0)                                                                     \
+                    {                                                                                  \
+                        out = texel;                                                                   \
+                    }                                                                                  \
+                    else if ((SH) == 1)                                                                \
+                    {                                                                                  \
+                        out = modulate_bgr555(texel, mod_r, mod_g, mod_b);                             \
+                    }                                                                                  \
+                    else                                                                               \
+                    {                                                                                  \
+                        const int d = drow[x & 3];                                                     \
+                                                                                                       \
+                        out = modulate_bgr555(texel, (uint8_t)PSXE_CH(rv, d), (uint8_t)PSXE_CH(gv, d), \
+                                              (uint8_t)PSXE_CH(bv, d));                                \
+                    }                                                                                  \
+                                                                                                       \
+                    *dst = ((TRANSP) && (texel & 0x8000u)) ? gpu_blend_bgr555(out, *dst, transp_mode)  \
+                                                           : out;                                      \
+                }                                                                                      \
+                                                                                                       \
+                txv += tx_dx; tyv += ty_dx;                                                            \
+                                                                                                       \
+                if ((SH) == 2)                                                                         \
+                {                                                                                      \
+                    rv += r_dx; gv += g_dx; bv += b_dx;                                                \
+                }                                                                                      \
+            }                                                                                          \
+        }                                                                                              \
+                                                                                                       \
+        e0_row += edge0_b; e1_row += edge1_b; e2_row += edge2_b;                                       \
+        tx_row += tx_dy; ty_row += ty_dy;                                                              \
+        r_row += r_dy; g_row += g_dy; b_row += b_dy;                                                   \
+    }
+
+#define PSXE_TEX_CASE(F, SH)                     \
+    case ((F) * 6 + (SH) * 2 + 0):               \
+        PSXE_TEX_LOOP(F, SH, 0)                  \
+        break;                                   \
+    case ((F) * 6 + (SH) * 2 + 1):               \
+        PSXE_TEX_LOOP(F, SH, 1)                  \
+        break;
+
+    switch ((fetch * 6) + (shade * 2) + (transparency_enabled ? 1 : 0))
+    {
+        PSXE_TEX_CASE(0, 0)
+        PSXE_TEX_CASE(0, 1)
+        PSXE_TEX_CASE(0, 2)
+        PSXE_TEX_CASE(1, 0)
+        PSXE_TEX_CASE(1, 1)
+        PSXE_TEX_CASE(1, 2)
+        PSXE_TEX_CASE(2, 0)
+        PSXE_TEX_CASE(2, 1)
+        PSXE_TEX_CASE(2, 2)
+    }
+
+#undef PSXE_TEX_CASE
+#undef PSXE_TEX_LOOP
+#undef PSXE_FETCH
+#undef PSXE_CH
+
+    if (!is_shaded)
+        return ((depth != 2) && !is_raw) ? 3 : 4;
+
+    return 6;
 }
 
+
+PSX_GPU_HOT void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, poly_data_t data, int edge)
+{
+#if PSX_PROFILE
+    const uint32_t t0 = DWT->CYCCNT;
+
+    g_ras_last_bbox = 0;
+
+    const int k = gpu_render_triangle_impl(gpu, v0, v1, v2, data, edge);
+
+    g_prof.ras_cyc[k] += DWT->CYCCNT - t0;
+    g_prof.ras_cnt[k]++;
+    g_prof.ras_px[k] += g_ras_last_bbox;
+#else
+    (void)gpu_render_triangle_impl(gpu, v0, v1, v2, data, edge);
+#endif
+}
 
 PSX_GPU_HOT void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
 {
@@ -1954,6 +1850,8 @@ PSX_GPU_HOT void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
 
     if (x0 >= x1 || y0 >= y1)
         return;
+
+    gpu_prim_rows(gpu, y0, y1);
 
 #if PSX_PROFILE
     g_prof.pixels += (uint32_t)(x1 - x0) * (uint32_t)(y1 - y0);
@@ -2020,10 +1918,25 @@ PSX_GPU_HOT void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
         g_prof.px_fast += (uint32_t)rect_w * (uint32_t)(y1 - y0);
 #endif
 
+        /* which halfword of a texture row a texel sits in */
+        const int tshift = (depth == 0) ? 2 : ((depth == 1) ? 1 : 0);
+
         for (int32_t y = y0; y < y1; ++y, ++tex_y)
         {
             uint16_t *dst = &gpu->vram[x0 + y * 1024];
             const uint16_t *const trow = &gpu->vram[tpx + ((tpy + tex_y) * 1024)];
+
+            /* Textures live in SDRAM, and a row that is not in the cache costs
+               a line fill of some hundred cycles - about as much as drawing a
+               16 pixel row. The core fetches a preloaded line in the background,
+               so asking for the next row now hides that wait behind this row's
+               work. (Not for the frame buffer: whole line writes do not wait
+               for a fill, and a preload only gets in their way - measured.) */
+            if ((y + 1) < y1)
+            {
+                __builtin_prefetch(trow + 1024 + (tex_start_x >> tshift));
+                __builtin_prefetch(trow + 1024 + ((tex_start_x + rect_w - 1) >> tshift));
+            }
 
             int32_t tx = tex_start_x;
 
@@ -2525,6 +2438,19 @@ PSX_GPU_HOT void gpu_render_textured_triangle(psx_gpu_t *gpu, vertex_t v0, verte
 }
 
 #define I32(v, b) (((int32_t)((v) << (31 - b))) >> (31 - b))
+
+#if PSX_PROFILE
+#define gpu_render_rect(g, r)                                   \
+    do                                                          \
+    {                                                           \
+        const uint32_t t0_ = DWT->CYCCNT;                       \
+        const uint32_t px_ = g_prof.px_rect;                    \
+        gpu_render_rect((g), (r));                              \
+        g_prof.ras_cyc[7] += DWT->CYCCNT - t0_;                 \
+        g_prof.ras_cnt[7]++;                                    \
+        g_prof.ras_px[7] += g_prof.px_rect - px_;               \
+    } while (0)
+#endif
 
 PSX_GPU_HOT void gpu_rect(psx_gpu_t *gpu)
 {
@@ -3791,7 +3717,7 @@ PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value
         // Reset
         case 0x00:
         {
-            gpu->vram_dirty = 1;
+            gpu_dirty_all(gpu);
         }
         break;
 
@@ -3804,7 +3730,7 @@ PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value
             gpu->gpustat |= (value << 23) & 0x00800000;
 
             if (gpu->gpustat != before)
-                gpu->vram_dirty = 1;
+                gpu_dirty_all(gpu);
         }
         break;
         case 0x04:
@@ -3817,7 +3743,10 @@ PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value
             const uint32_t y = (value >> 10) & 0x1ff;
 
             if ((x != gpu->disp_x) || (y != gpu->disp_y))
-                gpu->vram_dirty = 1;
+            {
+                gpu_dirty_all(gpu);
+                PROF_INC(dirty_flip);
+            }
 
             gpu->disp_x = x;
             gpu->disp_y = y;
@@ -3831,7 +3760,7 @@ PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value
             const uint32_t x2 = (value >> 12) & 0xfff;
 
             if ((x1 != gpu->disp_x1) || (x2 != gpu->disp_x2))
-                gpu->vram_dirty = 1;
+                gpu_dirty_all(gpu);
 
             gpu->disp_x1 = x1;
             gpu->disp_x2 = x2;
@@ -3843,7 +3772,7 @@ PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value
             const uint32_t y2 = (value >> 10) & 0x1ff;
 
             if ((y1 != gpu->disp_y1) || (y2 != gpu->disp_y2))
-                gpu->vram_dirty = 1;
+                gpu_dirty_all(gpu);
 
             gpu->disp_y1 = y1;
             gpu->disp_y2 = y2;
@@ -3851,7 +3780,7 @@ PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value
         break;
         case 0x08:
             if (gpu->display_mode != (value & 0xffffff))
-                gpu->vram_dirty = 1;
+                gpu_dirty_all(gpu);
 
             gpu->display_mode = value & 0xffffff;
 

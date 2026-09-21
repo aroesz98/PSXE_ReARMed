@@ -66,8 +66,12 @@ static inline int psx_jit_build_block(psx_jit_ctx_t *c, uint32_t pc, uint32_t ma
        care. */
     int force_interp = 0;
 
-    /* Natively translated instructions do not advance pc / next_pc */
-    int state_stale = 0;
+    /* Natively translated instructions do not advance pc / next_pc - and a block
+       that was jumped into from another one starts without them as well: a
+       chained jump publishes nothing. So an interpreted first instruction is
+       handed its pc like any other; at the start of a block that is always
+       right, since a block is never entered with a branch pending. */
+    int state_stale = 1;
 
     int ended = 0;
 
