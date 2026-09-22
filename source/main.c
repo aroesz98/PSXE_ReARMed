@@ -5,6 +5,10 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#include "gpu_switch.h"
+#include "enet_link.h"
+#include "psxe_link.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -355,6 +359,16 @@ static void psx_emulator_task(void *pvParameters)
     /* Set PSX emulator log level to reduce verbosity */
     log_set_level(g_psxConfig.log_level);
     PRINTF("PSX log level set to: %d (ERROR and FATAL only)\r\n", g_psxConfig.log_level);
+
+#if PSXE_GPU_REMOTE
+    /* the Ethernet link to the GPU board; the game starts even without it */
+    {
+        static const uint8_t mac_cpu[6] = PSXE_LINK_MAC_CPU;
+
+        if (enet_link_init(mac_cpu) != 0)
+            PRINTF("GPU link: Ethernet init failed, nothing will be drawn\r\n");
+    }
+#endif
 
     /* Initialize PSX emulator */
     PRINTF("Creating PSX emulator instance...\r\n");

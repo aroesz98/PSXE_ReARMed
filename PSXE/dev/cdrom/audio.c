@@ -5,6 +5,9 @@
 #include "../spu.h"
 #include "fsl_debug_console.h"
 
+/* XA and CD audio made into samples: only when sound is made (sound_switch.h) */
+#if PSXE_SOUND >= 2
+
 #define ITOB(b) itob_table[b]
 
 static const uint8_t itob_table[] = {
@@ -682,3 +685,4 @@ void psx_cdrom_get_audio_samples(psx_cdrom_t *cdrom, void *buf, uint32_t size)
         cdrom->cdda_remaining_samples -= 2;
     }
 }
+#endif

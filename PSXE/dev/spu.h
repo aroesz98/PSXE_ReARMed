@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "ic.h"
+#include "../sound_switch.h"
 
 #define PSX_SPU_BEGIN 0x1f801c00
 #define PSX_SPU_SIZE 0x400
@@ -185,11 +186,16 @@ void psx_spu_write32(psx_spu_t *, uint32_t, uint32_t);
 void psx_spu_write16(psx_spu_t *, uint32_t, uint16_t);
 void psx_spu_write8(psx_spu_t *, uint32_t, uint8_t);
 void psx_spu_destroy(psx_spu_t *);
+
+#if PSXE_SOUND >= 2
 void psx_spu_update_cdda_buffer(psx_spu_t *, void *);
 uint32_t psx_spu_get_sample(psx_spu_t *);
+#endif
 
+#if PSXE_SOUND >= 1
 /* Runs the voices for `cycles` more CPU cycles without making any sound: see
-   spu.c. Called with every device update round. */
+   spu.c. Called with every device update round when PSXE_SOUND is 1. */
 void psx_spu_update(psx_spu_t *, uint32_t cycles);
+#endif
 
 #endif

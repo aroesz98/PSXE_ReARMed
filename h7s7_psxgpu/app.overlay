@@ -1,0 +1,42 @@
+/*
+ * NeoChrom GPU2D (Think Silicon NEMA|P): not in the SoC devicetree yet, so the
+ * application adds it (as h7s7_neochrom does). RM0477 / stm32h7s7xx.h:
+ *   GPU2D_BASE = 0x52014000, IRQs 149 (gpu2d) and 150 (gpu2d_er),
+ *   clock: RCC_AHB5ENR bit 20
+ */
+
+/ {
+	chosen {
+		zephyr,itcm = &itcm;
+	};
+
+	soc {
+		gpu2d: gpu@52014000 {
+			compatible = "st,stm32-gpu2d";
+			reg = <0x52014000 0x1000>;
+			interrupts = <149 1>, <150 1>;
+			interrupt-names = "gpu2d", "gpu2d_er";
+			clocks = <&rcc STM32_CLOCK(AHB5, 20)>;
+			status = "okay";
+		};
+	};
+};
+
+/* an MPU region for the DTCM: the GPU state lives there (psx_gpu_platform.h) */
+&dtcm {
+	zephyr,memory-attr = <DT_MEM_ARM_MPU_RAM>;
+};
+
+/* the innermost rasterizer runs from the ITCM: an executable MPU region (Zephyr's RAM
+   attribute is execute-never in an XIP image; the flash one is read-only and executable,
+   and the code is copied in at boot, before the MPU is set up) */
+&itcm {
+	zephyr,memory-attr = <DT_MEM_ARM_MPU_FLASH>;
+};
+
+/* the PSRAM (VRAM, frame buffers) write-through: a span written by the rasterizer
+   neither fills a cache line first (a 189 cycle read of what it overwrites) nor
+   evicts the texture lines it needs next; the write buffer merges the stores */
+&psram {
+	zephyr,memory-attr = <DT_MEM_ARM_MPU_RAM_WT>;
+};

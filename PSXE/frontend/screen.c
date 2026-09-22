@@ -3,6 +3,12 @@
  * Compatible with NXP MIMXRT1052 microcontroller
  */
 
+#include "../gpu_switch.h"
+
+#if PSXE_GPU_REMOTE
+#include "../link/gpu_remote.h"
+#endif
+
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -628,6 +634,19 @@ void psxe_screen_update(psxe_screen_t *screen)
 
             const psx_jit_stats_t *jit = psx_jit_get_stats();
 
+#if PSXE_GPU_REMOTE
+            {
+                /* the frames the GPU board shows, since the last report */
+                static uint32_t last_presented = 0;
+                const uint32_t presented = gpu_remote_presented();
+
+                g_presented_frames = presented - last_presented;
+                last_presented = presented;
+
+                gpu_remote_report();
+            }
+#endif
+
 #if PSX_JIT_HIST
             {
                 /* the five opcode classes the fallback spends most time on */
@@ -771,6 +790,13 @@ void psxe_screen_update(psxe_screen_t *screen)
     }
 
     psxe_screen_pace();
+
+#if PSXE_GPU_REMOTE
+    /* the picture is made and shown by the GPU board */
+    gpu->vram_dirty = 0;
+
+    return;
+#endif
 
     /* The frame the scaler was given at the last vblank goes to the panel now.
        This must not wait for the next changed picture: there may not be one for

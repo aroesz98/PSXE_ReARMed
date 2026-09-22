@@ -7,6 +7,7 @@
 #include "disc.h"
 #include "../ic.h"
 #include "queue.h"
+#include "../../sound_switch.h"
 
 #define PSX_CDROM_BEGIN 0x1f801800
 #define PSX_CDROM_END 0x1f801803
@@ -313,7 +314,9 @@ void psx_cdrom_write32(psx_cdrom_t *cdrom, uint32_t addr, uint32_t value);
 void psx_cdrom_write16(psx_cdrom_t *cdrom, uint32_t addr, uint32_t value);
 void psx_cdrom_write8(psx_cdrom_t *cdrom, uint32_t addr, uint32_t value);
 void psx_cdrom_update(psx_cdrom_t *cdrom, int32_t cycles);
+#if PSXE_SOUND >= 2
 void psx_cdrom_get_audio_samples(psx_cdrom_t *cdrom, void *buf, uint32_t size);
+#endif
 void psx_cdrom_destroy(psx_cdrom_t *cdrom);
 
 #endif

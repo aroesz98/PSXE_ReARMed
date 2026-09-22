@@ -8,6 +8,20 @@
 #include "fixed_math.h"
 #include "fsl_debug_console.h"
 #include "../prof.h"
+#include "../gpu_switch.h"
+
+#if PSXE_GPU_REMOTE
+#include "../link/gpu_remote.h"
+#endif
+
+/*
+    Where things go and what they are made of is the platform's business: the
+    same file is the rasterizer of the RT1050 build and of the GPU board. The
+    defaults are the RT1050's; a standalone build defines them first.
+*/
+#ifdef PSX_GPU_STANDALONE
+#include "psx_gpu_platform.h"
+#endif
 
 /* Hot GPU code runs from OCRAM instead of XIP flash (ITCM is reserved for
    the CPU interpreter). */
@@ -37,7 +51,33 @@
 
 #define GPU_FP_RATIO ((uint32_t)((GPU_HW_CLOCK_NTSC / CPU_HW_CLOCK) * 65536.0f))
 
+#ifndef PSX_GPU_HOT
 #define PSX_GPU_HOT __attribute__((section(".ramfunc.$SRAM_OC")))
+#endif
+
+/* what the periodic timing update needs: zero wait states */
+/* the span level of the rasterizer: the innermost code, where a platform with a
+   small zero wait state memory (ITCM) puts it; elsewhere the same as PSX_GPU_HOT */
+#ifndef PSX_GPU_RAS
+#define PSX_GPU_RAS PSX_GPU_HOT
+#endif
+#ifndef PSX_GPU_ITC
+#define PSX_GPU_ITC __attribute__((section(".ramfunc.$SRAM_ITC")))
+#endif
+
+/* state touched by every command: DTCM, out of the way of the VRAM traffic */
+#ifndef PSX_GPU_DTCM_BSS
+#define PSX_GPU_DTCM_BSS __attribute__((section(".bss.$SRAM_DTC")))
+#endif
+
+#ifndef psx_gpu_alloc
+#define psx_gpu_alloc(size) malloc(size)
+#define psx_gpu_free(p) free(p)
+#endif
+#ifndef psx_gpu_alloc_empty
+/* the buffer shown while the display is off; a platform without one returns NULL */
+#define psx_gpu_alloc_empty(size) psx_gpu_alloc(size)
+#endif
 
 #define SE10(v) ((int16_t)((v) << 5) >> 5)
 #define swap_coord(a, b)    \
@@ -97,7 +137,7 @@ PSX_GPU_HOT int max3(int a, int b, int c)
 /* The GPU state is touched by every device update round and by every GP0
    command, so it belongs in DTCM - out of the D-cache the rasterizer keeps
    thrashing with VRAM traffic. */
-static psx_gpu_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) g_gpu_instance;
+static psx_gpu_t PSX_GPU_DTCM_BSS __attribute__((aligned(8))) g_gpu_instance;
 
 psx_gpu_t *psx_gpu_create(void)
 {
@@ -335,11 +375,14 @@ void psx_gpu_init(psx_gpu_t *gpu, psx_ic_t *ic)
     gpu->io_base = PSX_GPU_BEGIN;
     gpu->io_size = PSX_GPU_SIZE;
 
-    gpu->vram = (uint16_t *)malloc(PSX_GPU_VRAM_SIZE);
-    gpu->empty = malloc(PSX_GPU_VRAM_SIZE);
+    gpu->vram = (uint16_t *)psx_gpu_alloc(PSX_GPU_VRAM_SIZE);
+    gpu->empty = psx_gpu_alloc_empty(PSX_GPU_VRAM_SIZE);
 
-    memset(gpu->vram, 0, PSX_GPU_VRAM_SIZE);
-    memset(gpu->empty, 0, PSX_GPU_VRAM_SIZE);
+    if (gpu->vram)
+        memset(gpu->vram, 0, PSX_GPU_VRAM_SIZE);
+
+    if (gpu->empty)
+        memset(gpu->empty, 0, PSX_GPU_VRAM_SIZE);
 
     gpu->state = GPU_STATE_RECV_CMD;
     gpu->gpustat |= 0x800000;
@@ -353,6 +396,10 @@ void psx_gpu_init(psx_gpu_t *gpu, psx_ic_t *ic)
     gpu->skip_rows = -1;
 
     gpu->ic = ic;
+
+#if PSXE_GPU_REMOTE
+    gpu_remote_reset(gpu);
+#endif
 }
 
 PSX_GPU_HOT uint32_t psx_gpu_read32(psx_gpu_t *gpu, uint32_t offset)
@@ -363,6 +410,12 @@ PSX_GPU_HOT uint32_t psx_gpu_read32(psx_gpu_t *gpu, uint32_t offset)
     {
         uint32_t data = 0x0;
 
+#if PSXE_GPU_REMOTE
+        if (gpu_remote_reading())
+        {
+            data = gpu_remote_read_vram(gpu);
+        }
+#else
         if (gpu->c0_tsiz)
         {
             data |= gpu->vram[gpu->c0_addr + (gpu->c0_xcnt + (gpu->c0_ycnt * 1024))];
@@ -387,6 +440,7 @@ PSX_GPU_HOT uint32_t psx_gpu_read32(psx_gpu_t *gpu, uint32_t offset)
 
             gpu->c0_tsiz -= 2;
         }
+#endif
 
         if (gpu->gp1_10h_req)
         {
@@ -462,7 +516,7 @@ PSX_GPU_HOT int max(int x0, int x1)
 /* Paletted textures need one VRAM lookup per pixel just for the palette entry.
    VRAM sits in SDRAM, where a cache line refill costs ~150 core cycles, so for
    anything bigger than a few pixels it pays to stage the palette in DTCM. */
-static uint16_t __attribute__((section(".bss.$SRAM_DTC"), aligned(4))) g_clut_stage[256];
+static uint16_t PSX_GPU_DTCM_BSS __attribute__((aligned(4))) g_clut_stage[256];
 
 static inline const uint16_t *gpu_clut_ptr(psx_gpu_t *gpu, int depth, int clutx, int cluty, uint32_t area)
 {
@@ -539,7 +593,7 @@ static inline __attribute__((always_inline)) uint16_t gpu_fetch_texel(psx_gpu_t 
     }
 }
 
-PSX_GPU_HOT uint16_t gpu_fetch_texel_bilinear(psx_gpu_t *gpu, float tx, float ty, uint32_t tpx, uint32_t tpy, const uint16_t *clut, int depth)
+PSX_GPU_RAS uint16_t gpu_fetch_texel_bilinear(psx_gpu_t *gpu, float tx, float ty, uint32_t tpx, uint32_t tpy, const uint16_t *clut, int depth)
 {
     float txf = floorf(tx);
     float tyf = floorf(ty);
@@ -1833,7 +1887,7 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
 }
 
 
-PSX_GPU_HOT void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, poly_data_t data, int edge)
+PSX_GPU_RAS void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, poly_data_t data, int edge)
 {
 #if PSX_PROFILE
     const uint32_t t0 = DWT->CYCCNT;
@@ -1850,7 +1904,7 @@ PSX_GPU_HOT void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, v
 #endif
 }
 
-PSX_GPU_HOT void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
+PSX_GPU_RAS void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
 {
     if ((data.v0.x >= 1024) || (data.v0.y >= 512) ||
         (data.v0.x <= -1024) || (data.v0.y <= -512))
@@ -2158,7 +2212,7 @@ PSX_GPU_HOT void gpu_render_flat_line(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, 
     plotLine(gpu, v0.x, v0.y, v1.x, v1.y, color);
 }
 
-PSX_GPU_HOT void gpu_render_flat_rectangle(psx_gpu_t *gpu, vertex_t v, uint32_t w, uint32_t h, uint32_t color)
+PSX_GPU_RAS void gpu_render_flat_rectangle(psx_gpu_t *gpu, vertex_t v, uint32_t w, uint32_t h, uint32_t color)
 {
     /* Offset coordinates */
     v.x += gpu->off_x;
@@ -2245,7 +2299,7 @@ PSX_GPU_HOT void gpu_render_flat_rectangle(psx_gpu_t *gpu, vertex_t v, uint32_t 
     }
 }
 
-PSX_GPU_HOT void gpu_render_textured_rectangle(psx_gpu_t *gpu, vertex_t v, uint32_t w, uint32_t h, uint16_t clutx, uint16_t cluty, uint32_t color)
+PSX_GPU_RAS void gpu_render_textured_rectangle(psx_gpu_t *gpu, vertex_t v, uint32_t w, uint32_t h, uint16_t clutx, uint16_t cluty, uint32_t color)
 {
     vertex_t a = v;
 
@@ -2284,7 +2338,7 @@ PSX_GPU_HOT void gpu_render_textured_rectangle(psx_gpu_t *gpu, vertex_t v, uint3
     }
 }
 
-PSX_GPU_HOT void gpu_render_flat_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, uint32_t color)
+PSX_GPU_RAS void gpu_render_flat_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, uint32_t color)
 {
     vertex_t a, b, c;
     uint16_t rgb = color & 0xFFFF;
@@ -2331,7 +2385,7 @@ PSX_GPU_HOT void gpu_render_flat_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t 
     }
 }
 
-PSX_GPU_HOT void gpu_render_shaded_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2)
+PSX_GPU_RAS void gpu_render_shaded_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2)
 {
     vertex_t a, b, c, p;
 
@@ -2411,7 +2465,7 @@ PSX_GPU_HOT void gpu_render_shaded_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_
     }
 }
 
-PSX_GPU_HOT void gpu_render_textured_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, uint32_t tpx, uint32_t tpy, uint16_t clutx, uint16_t cluty, int depth)
+PSX_GPU_RAS void gpu_render_textured_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, uint32_t tpx, uint32_t tpy, uint16_t clutx, uint16_t cluty, int depth)
 {
     vertex_t a, b, c;
 
@@ -2600,6 +2654,17 @@ PSX_GPU_HOT void gpu_poly(psx_gpu_t *gpu)
             // Fixes Mortal Kombat II, Bubble Bobble, Driver 1 & 2
             if (textured)
             {
+#if PSX_PROFILE
+                {
+                    static uint32_t last_texp = 0xffffffffu;
+
+                    if ((poly.texp & 0x1ffu) != last_texp)
+                    {
+                        last_texp = poly.texp & 0x1ffu;
+                        g_prof.tex_switch++;
+                    }
+                }
+#endif
                 gpu->texp_x = (poly.texp & 0xf) << 6;
                 gpu->texp_y = (poly.texp & 0x10) << 4;
                 gpu->texp_d = (poly.texp >> 7) & 0x3;
@@ -2806,6 +2871,10 @@ PSX_GPU_HOT void gpu_cmd_a0(psx_gpu_t *gpu)
 */
 uint32_t PSX_GPU_HOT psx_gpu_write_bulk(psx_gpu_t *gpu, const uint32_t *src, uint32_t words)
 {
+#if PSXE_GPU_REMOTE
+    return gpu_remote_gp0_bulk(gpu, src, words);
+#endif
+
     if (gpu->state != GPU_STATE_RECV_DATA)
         return 0;
 
@@ -3521,6 +3590,64 @@ PSX_GPU_HOT void gpu_cmd_80(psx_gpu_t *gpu)
     }
 }
 
+/* GP0(E1h..E6h): the drawing environment. One word each, and the only GP0
+   commands whose effect the game can read back (GPUSTAT, GP1(10h)), so they
+   are applied here even when the drawing itself is done on the other board. */
+static void gpu_env_cmd(psx_gpu_t *gpu, uint32_t w)
+{
+    switch (w >> 24)
+    {
+    case 0xe1:
+    {
+        gpu->gpustat &= 0xfffff800;
+        gpu->gpustat |= w & 0x7ff;
+        gpu->texp_x = (gpu->gpustat & 0xf) << 6;
+        gpu->texp_y = (gpu->gpustat & 0x10) << 4;
+        gpu->texp_d = (gpu->gpustat >> 7) & 0x3;
+
+        gpu_update_field(gpu);
+    }
+    break;
+    case 0xe2:
+    {
+        gpu->texw_mx = ((w >> 0) & 0x1f) << 3;
+        gpu->texw_my = ((w >> 5) & 0x1f) << 3;
+        gpu->texw_ox = ((w >> 10) & 0x1f) << 3;
+        gpu->texw_oy = ((w >> 15) & 0x1f) << 3;
+    }
+    break;
+    case 0xe3:
+    {
+        gpu->draw_x1 = (w >> 0) & 0x3ff;
+        gpu->draw_y1 = (w >> 10) & 0x1ff;
+
+        gpu_update_draw_visible(gpu);
+    }
+    break;
+    case 0xe4:
+    {
+        gpu->draw_x2 = (w >> 0) & 0x3ff;
+        gpu->draw_y2 = (w >> 10) & 0x1ff;
+
+        gpu_update_draw_visible(gpu);
+    }
+    break;
+    case 0xe5:
+    {
+        gpu->off_x = ((int32_t)(((w >> 0) & 0x7ff) << 21)) >> 21;
+        gpu->off_y = ((int32_t)(((w >> 11) & 0x7ff) << 21)) >> 21;
+    }
+    break;
+    case 0xe6:
+    {
+        /* To-do: Implement mask bit thing */
+    }
+    break;
+    default:
+        break;
+    }
+}
+
 PSX_GPU_HOT void psx_gpu_update_cmd(psx_gpu_t *gpu)
 {
     PROF_T0(t_gp0);
@@ -3659,51 +3786,13 @@ static PSX_GPU_HOT void psx_gpu_update_cmd_impl(psx_gpu_t *gpu)
         gpu_cmd_c0(gpu);
         break;
     case 0xe1:
-    {
-        gpu->gpustat &= 0xfffff800;
-        gpu->gpustat |= gpu->buf[0] & 0x7ff;
-        gpu->texp_x = (gpu->gpustat & 0xf) << 6;
-        gpu->texp_y = (gpu->gpustat & 0x10) << 4;
-        gpu->texp_d = (gpu->gpustat >> 7) & 0x3;
-
-        gpu_update_field(gpu);
-    }
-    break;
     case 0xe2:
-    {
-        gpu->texw_mx = ((gpu->buf[0] >> 0) & 0x1f) << 3;
-        gpu->texw_my = ((gpu->buf[0] >> 5) & 0x1f) << 3;
-        gpu->texw_ox = ((gpu->buf[0] >> 10) & 0x1f) << 3;
-        gpu->texw_oy = ((gpu->buf[0] >> 15) & 0x1f) << 3;
-    }
-    break;
     case 0xe3:
-    {
-        gpu->draw_x1 = (gpu->buf[0] >> 0) & 0x3ff;
-        gpu->draw_y1 = (gpu->buf[0] >> 10) & 0x1ff;
-
-        gpu_update_draw_visible(gpu);
-    }
-    break;
     case 0xe4:
-    {
-        gpu->draw_x2 = (gpu->buf[0] >> 0) & 0x3ff;
-        gpu->draw_y2 = (gpu->buf[0] >> 10) & 0x1ff;
-
-        gpu_update_draw_visible(gpu);
-    }
-    break;
     case 0xe5:
-    {
-        gpu->off_x = ((int32_t)(((gpu->buf[0] >> 0) & 0x7ff) << 21)) >> 21;
-        gpu->off_y = ((int32_t)(((gpu->buf[0] >> 11) & 0x7ff) << 21)) >> 21;
-    }
-    break;
     case 0xe6:
-    {
-        /* To-do: Implement mask bit thing */
-    }
-    break;
+        gpu_env_cmd(gpu, gpu->buf[0]);
+        break;
     default:
     {
     }
@@ -3718,6 +3807,18 @@ PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value
     // GP0
     case 0x00:
     {
+#if PSXE_GPU_REMOTE
+        /* the word goes to the GPU board; the environment commands are kept here too */
+        {
+            const uint32_t env = gpu_remote_gp0(gpu, value);
+
+            if (env)
+                gpu_env_cmd(gpu, value);
+        }
+
+        return;
+#endif
+
         switch (gpu->state)
         {
         case GPU_STATE_RECV_CMD:
@@ -3755,6 +3856,10 @@ PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value
     case 0x04:
     {
         uint8_t cmd = value >> 24;
+
+#if PSXE_GPU_REMOTE
+        gpu_remote_gp1(gpu, value);
+#endif
 
         switch (cmd)
         {
@@ -3880,6 +3985,15 @@ void psx_gpu_set_udata(psx_gpu_t *gpu, int index, void *udata)
 
 
 
+void psx_gpu_set_field(psx_gpu_t *gpu, uint32_t field)
+{
+    const int interlaced_480 = (gpu->display_mode & 0x24u) == 0x24u;
+
+    gpu->field = interlaced_480 ? (int32_t)(field & 1u) : 0;
+
+    gpu_update_field(gpu);
+}
+
 PSX_GPU_HOT void gpu_hblank_event(psx_gpu_t *gpu)
 {
     const int interlaced_480 = (gpu->display_mode & 0x24u) == 0x24u;
@@ -3904,6 +4018,10 @@ PSX_GPU_HOT void gpu_hblank_event(psx_gpu_t *gpu)
 
         gpu_update_field(gpu);
 
+#if PSXE_GPU_REMOTE
+        gpu_remote_vblank(gpu, (uint32_t)gpu->field);
+#endif
+
         if (gpu->event_cb_table[GPU_EVENT_VBLANK])
             gpu->event_cb_table[GPU_EVENT_VBLANK](gpu);
 
@@ -3918,7 +4036,7 @@ PSX_GPU_HOT void gpu_hblank_event(psx_gpu_t *gpu)
     }
 }
 
-void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_gpu_update(psx_gpu_t *gpu, int cyc)
+void PSX_GPU_ITC psx_gpu_update(psx_gpu_t *gpu, int cyc)
 {
     const uint32_t curr = gpu->cycles_fp + (uint32_t)cyc * GPU_FP_RATIO;
 
@@ -3951,7 +4069,7 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_gpu_update(psx_gpu_t *gp
 }
 
 /* CPU cycles until psx_gpu_update has something to do: the next hblank edge */
-uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_gpu_cycles_to_edge(const psx_gpu_t *gpu)
+uint32_t PSX_GPU_ITC psx_gpu_cycles_to_edge(const psx_gpu_t *gpu)
 {
     if (gpu->cycles_fp >= gpu->next_edge_fp)
         return 0;
@@ -3969,7 +4087,6 @@ void *psx_gpu_get_display_buffer(psx_gpu_t *gpu)
 
 void psx_gpu_destroy(psx_gpu_t *gpu)
 {
-    free(gpu->vram);
-    free(gpu->empty); // Missing free for the empty buffer!
-    free(gpu);
+    psx_gpu_free(gpu->vram);
+    psx_gpu_free(gpu->empty);
 }

@@ -128,6 +128,9 @@ static psx_cdrom_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) g_cdro
 
 #define PSX_SDRAM_BSS __attribute__((section(".bss.$BOARD_SDRAM"), aligned(4)))
 
+/* where XA and CD audio sectors are decoded - only when sound is made
+   (sound_switch.h); otherwise the pointers stay NULL and nothing uses them */
+#if PSXE_SOUND >= 2
 static int16_t PSX_SDRAM_BSS s_cdda_buf[CD_SECTOR_SIZE >> 1];
 static uint8_t PSX_SDRAM_BSS s_xa_buf[CD_SECTOR_SIZE];
 static int16_t PSX_SDRAM_BSS s_xa_left_buf[XA_STEREO_SAMPLES];
@@ -150,6 +153,7 @@ static void cdrom_bind_audio_buffers(psx_cdrom_t *cdrom)
     cdrom->xa_right_resample_buf = s_xa_right_resample_buf;
     cdrom->xa_mono_resample_buf = s_xa_mono_resample_buf;
 }
+#endif
 
 psx_cdrom_t *psx_cdrom_create(void)
 {
@@ -171,8 +175,10 @@ void psx_cdrom_init(psx_cdrom_t *cdrom, psx_ic_t *ic)
     PRINTF("[CDROM] Initializing CDROM...\r\n");
     memset(cdrom, 0, sizeof(psx_cdrom_t));
 
+#if PSXE_SOUND >= 2
     /* the audio work buffers live outside the struct */
     cdrom_bind_audio_buffers(cdrom);
+#endif
 
     cdrom->io_base = PSX_CDROM_BEGIN;
     cdrom->io_size = PSX_CDROM_SIZE;

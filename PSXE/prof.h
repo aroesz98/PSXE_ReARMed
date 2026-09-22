@@ -58,6 +58,7 @@ typedef struct
     uint32_t ras_cyc[8];
     uint32_t ras_cnt[8];
     uint32_t ras_px[8];
+    uint32_t tex_switch; /* textured polygons whose texture page differs from the previous one's */
     uint32_t t_start;  /* CYCCNT at window start */
 } psx_prof_t;
 

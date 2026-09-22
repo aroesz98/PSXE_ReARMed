@@ -616,10 +616,12 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_update(psx_t *psx)
     psx_dma_update(psx->dma, (int32_t)((acc + 20u) / 21u));
     PROF_ADD(d_dma, t_d5);
 
+#if PSXE_SOUND == 1
     PROF_T0(t_d6);
     /* the voices run although nothing plays them: games wait on them */
     psx_spu_update(psx->spu, acc);
     PROF_ADD(d_spu, t_d6);
+#endif
 
     PROF_ADD(dev, t_dev);
 

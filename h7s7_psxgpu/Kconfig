@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "PSX GPU board"
+
+menu "PSX GPU board"
+
+config PSXGPU_ETH
+	bool "Raw Ethernet through the STM32 HAL"
+	default y
+	select USE_STM32_HAL_ETH
+	select NOCACHE_MEMORY
+	help
+	  The link to the CPU board: raw Ethernet frames through the HAL ETH
+	  driver, without the Zephyr network stack (src/eth_raw.c).
+
+# the NemaGFX platform layer shared with the showcase (h7s7_neochrom/src/nema_hal_zephyr.c)
+config NEOCHROM_NEMA_POOL_SIZE
+	int "NemaGFX graphics memory pool in non-cacheable SRAM [bytes]"
+	default 16384
+	help
+	  The NemaGFX allocator's pool: its ring buffer and little else here.
+	  Non-cacheable, so the GPU always sees what the CPU wrote.
+
+config NEOCHROM_GPU2D_ICACHE
+	bool "Enable the GPU2D read cache"
+	default y
+	help
+	  The GPU2D's own read cache. Not coherent: the presenter asks for an
+	  invalidation (ext-hold) before the GPU reads what the CPU repacked.
+
+endmenu
+
+source "Kconfig.zephyr"

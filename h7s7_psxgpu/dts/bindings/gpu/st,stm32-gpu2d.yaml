@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  STM32 NeoChrom graphics accelerator (GPU2D, Think Silicon NEMA|P core).
+  The first interrupt signals command-list completion, the second one is the
+  "error" line that on AXI-attached instances also carries the GPU cache
+  maintenance (external hold) handshakes.
+
+compatible: "st,stm32-gpu2d"
+
+include: base.yaml
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  interrupt-names:
+    required: true
+
+  clocks:
+    required: true

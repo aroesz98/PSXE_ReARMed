@@ -10,6 +10,7 @@
 
 #define VOICE_COUNT 24
 
+#if PSXE_SOUND >= 2
 static const int32_t g_spu_pos_adpcm_table[] = {
     0, +60, +115, +98, +122};
 
@@ -81,6 +82,8 @@ static const int16_t g_spu_gauss_table[] = {
     0x589E, 0x58B5, 0x58CB, 0x58E0, 0x58F4, 0x5907, 0x5919, 0x592A,
     0x593A, 0x5949, 0x5958, 0x5965, 0x5971, 0x597C, 0x5986, 0x598F,
     0x5997, 0x599E, 0x59A4, 0x59A9, 0x59AD, 0x59B0, 0x59B2, 0x59B3};
+
+#endif
 
 static psx_spu_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) g_spu_instance;
 
@@ -177,6 +180,13 @@ static inline void spu_irq_check(psx_spu_t *spu, uint32_t addr)
     }
 }
 
+/* the part of spu_read_block the voice's course depends on */
+static inline void spu_read_block_flags(psx_spu_t *spu, int32_t v)
+{
+    spu->data[v].block_flags = spu->ram[(spu->data[v].current_addr + 1u) & SPU_RAM_MASK];
+}
+
+#if PSXE_SOUND >= 2
 void spu_read_block(psx_spu_t *spu, int32_t v)
 {
     uint32_t addr = spu->data[v].current_addr & SPU_RAM_MASK;
@@ -223,6 +233,7 @@ void spu_read_block(psx_spu_t *spu, int32_t v)
         spu->data[v].buf[j] = s;
     }
 }
+#endif
 
 #define PHASE spu->data[v].adsr_phase
 #define CYCLES spu->data[v].adsr_cycles
@@ -421,7 +432,11 @@ void spu_kon(psx_spu_t *spu, uint32_t value)
                                   (uint32_t)spu->voice[i].envctl1;
 
             adsr_load_attack(spu, i);
+#if PSXE_SOUND >= 2
             spu_read_block(spu, i);
+#else
+            spu_read_block_flags(spu, i);
+#endif
             spu_irq_check(spu, spu->data[i].current_addr);
         }
     }
@@ -568,6 +583,7 @@ void psx_spu_destroy(psx_spu_t *spu)
     free(spu);
 }
 
+#if PSXE_SOUND >= 2
 // To-do: Optimize reverb
 
 int16_t spu_read_reverb(psx_spu_t *spu, uint32_t addr)
@@ -836,10 +852,13 @@ uint32_t psx_spu_get_sample(psx_spu_t *spu)
 
     return clampl | (((uint32_t)clampr) << 16);
 }
+#endif
 
+#if PSXE_SOUND >= 1
 /*
     Nothing plays the sound on this board - psx_spu_get_sample, which decodes and
-    mixes the voices, has no caller - but games watch the voices all the same. A
+    mixes the voices, is not even built (sound_switch.h) - but games watch the
+    voices all the same. A
     sound driver keys a voice on, waits for its envelope to rise and takes the
     sound as finished when the envelope is back at zero (libspu's SpuGetKeyStatus
     reads the current envelope volume, 1F801C0Ch + 10h * N); others wait for ENDX
@@ -854,18 +873,12 @@ uint32_t psx_spu_get_sample(psx_spu_t *spu)
     changes nothing, as no voice depends on another here.
 
     (Should the board ever play the sound, psx_spu_get_sample does all of this
-    itself, and this has to go.)
+    itself - PSXE_SOUND 2 - and this is not called.)
 */
 #define SPU_CYCLES_PER_SAMPLE 768u /* 33.8688 MHz / 44100 */
 #define SPU_BATCH_SAMPLES 16u
 
 static uint32_t g_spu_cycles;
-
-/* the part of spu_read_block the voice's course depends on */
-static inline void spu_read_block_flags(psx_spu_t *spu, int32_t v)
-{
-    spu->data[v].block_flags = spu->ram[(spu->data[v].current_addr + 1u) & SPU_RAM_MASK];
-}
 
 static void spu_run_voice(psx_spu_t *spu, int32_t v, uint32_t samples)
 {
@@ -954,6 +967,9 @@ void psx_spu_update(psx_spu_t *spu, uint32_t cycles)
     }
 }
 
+#endif
+
+#if PSXE_SOUND >= 2
 int32_t counter = 0;
 
 void psx_spu_update_cdda_buffer(psx_spu_t *spu, void *buf)
@@ -997,6 +1013,8 @@ void psx_spu_update_cdda_buffer(psx_spu_t *spu, void *buf)
         }
     }
 }
+
+#endif
 
 #undef CLAMP
 #undef MAX

@@ -5,7 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* On its own - the GPU board builds this file without the rest of the
+   emulator - the interrupt controller is just a type name. */
+#ifdef PSX_GPU_STANDALONE
+typedef struct psx_ic_t psx_ic_t;
+#else
 #include "ic.h"
+#endif
 
 #define PSX_GPU_BEGIN 0x1f801810
 #define PSX_GPU_SIZE 0x8
@@ -210,6 +216,11 @@ void psx_gpu_set_event_callback(psx_gpu_t *, int, psx_gpu_event_callback_t);
 void *psx_gpu_get_display_buffer(psx_gpu_t *);
 void psx_gpu_update(psx_gpu_t *, int);
 uint32_t psx_gpu_cycles_to_edge(const psx_gpu_t *);
+
+/* The vertical blank as another board's GPU timing saw it: the field that
+   goes on screen now. What gpu_hblank_event does at the blank, without the
+   interrupt and the callbacks. */
+void psx_gpu_set_field(psx_gpu_t *, uint32_t field);
 
 /* Copies whole rows of a CPU -> VRAM transfer straight into VRAM, bypassing the
    per word command path. Returns the 32 bit words consumed (possibly zero, in
