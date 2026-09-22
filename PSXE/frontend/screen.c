@@ -783,6 +783,15 @@ void psxe_screen_update(psxe_screen_t *screen)
     if (!gpu->vram_dirty && !screen->debug_mode)
         return;
 
+    /* A game that draws one field per frame (480 line interlaced, gpu.c has it
+       under gpu_update_field) has just put one of the two on screen and draws
+       into the other next. The picture made here is every other row from
+       disp_y on (psxe_screen_update_impl): when those are the rows about to be
+       drawn into, they still hold what was presented two blanks ago, and the
+       picture waits for the next blank. */
+    if (!screen->debug_mode && (gpu->skip_rows >= 0) && ((uint32_t)gpu->skip_rows != (gpu->disp_y & 1u)))
+        return;
+
     /* The panel takes one frame per refresh, so frames started closer together
        than that only replace one another unseen: an emulation running above
        real time was paying a full repack and scale for pictures nobody saw. The
@@ -1006,7 +1015,9 @@ static void psxe_screen_update_impl(psxe_screen_t *screen, uint32_t dirty_y0, ui
             A 480 line picture is scaled down to the panel's 272, so every other
             source row is enough to fill it - and the repack, which is bound by
             reading the picture out of SDRAM, costs half as much. (An interlaced
-            display shows one such field per refresh anyway.)
+            display shows one such field per refresh anyway. A game that draws
+            only one field per frame is presented on the blanks that put these
+            rows on screen, see psxe_screen_update.)
         */
         const int32_t row_step = (src_height > 272) ? 2 : 1;
 

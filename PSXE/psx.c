@@ -381,10 +381,10 @@ void psx_prof_tick(void)
            (unsigned)g_prof.gte_cyc, (unsigned)g_prof.gte_cnt, (unsigned)g_prof.gte_mov,
            (unsigned)g_prof.dirty_flip, (unsigned)g_prof.dirty_draw);
 
-    PRINTF("PROF inst=%u ecyc=%u | cpu=%u gp0=%u dma=%u | dev=%u (cd=%u gpu=%u pad=%u tmr=%u dma=%u) blit=%u bwait=%u | other=%u | frames=%u gp0cmds=%u px=%u (f=%u s=%u t4=%u t8=%u t15=%u r=%u fast=%u tr=%u raw=%u) | elapsed=%u\r\n",
+    PRINTF("PROF inst=%u ecyc=%u | cpu=%u gp0=%u dma=%u | dev=%u (cd=%u gpu=%u pad=%u tmr=%u dma=%u spu=%u) blit=%u bwait=%u | other=%u | frames=%u gp0cmds=%u px=%u (f=%u s=%u t4=%u t8=%u t15=%u r=%u fast=%u tr=%u raw=%u) | elapsed=%u\r\n",
            g_prof.instr, g_prof.ecycles,
            g_prof.cpu, g_prof.gp0, g_prof.dmax,
-           g_prof.dev, g_prof.d_cdrom, g_prof.d_gpu, g_prof.d_pad, g_prof.d_timer, g_prof.d_dma,
+           g_prof.dev, g_prof.d_cdrom, g_prof.d_gpu, g_prof.d_pad, g_prof.d_timer, g_prof.d_dma, g_prof.d_spu,
            g_prof.blit, g_prof.bwait,
            other, g_prof.frames, g_prof.gp0cmds, g_prof.pixels,
            g_prof.px_flat, g_prof.px_shade, g_prof.px_t4, g_prof.px_t8, g_prof.px_t15, g_prof.px_rect,
@@ -615,6 +615,11 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_update(psx_t *psx)
     /* DMA delays are counted in rounds of the original 21 cycle slice */
     psx_dma_update(psx->dma, (int32_t)((acc + 20u) / 21u));
     PROF_ADD(d_dma, t_d5);
+
+    PROF_T0(t_d6);
+    /* the voices run although nothing plays them: games wait on them */
+    psx_spu_update(psx->spu, acc);
+    PROF_ADD(d_spu, t_d6);
 
     PROF_ADD(dev, t_dev);
 

@@ -23,6 +23,7 @@ typedef struct
     uint32_t d_pad;
     uint32_t d_timer;
     uint32_t d_dma;
+    uint32_t d_spu;
     uint32_t gp0;      /* core cycles in GP0 command execution (rasterizer) */
     uint32_t blit;     /* core cycles in screen update (scale + LCD) */
     uint32_t dmax;     /* core cycles in DMA block transfers */

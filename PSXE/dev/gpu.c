@@ -241,6 +241,27 @@ static inline void gpu_update_draw_visible(psx_gpu_t *gpu)
     gpu->vis_y1 = (uint16_t)(gpu->disp_y + h);
 }
 
+/*
+    Interlaced 480 line output shows the even and the odd rows of the frame
+    buffer in turn, one field per vertical blank. A game that makes a whole
+    frame per field keeps a single frame buffer and clears GP0(E1).10 ("drawing
+    to the display area prohibited"): the GPU then leaves the rows of the field
+    on screen alone and draws only the others, which go on screen at the next
+    blank. Polygons, rectangles, lines and fills skip those rows, in all of
+    VRAM; uploads and copies do not. The field changes at the start of the
+    blank, before the game is told of it and draws the next frame. (As Mednafen
+    and DuckStation have it.)
+
+    Tekken 3 draws that way at 368x480, so this halves its rasterizer work.
+*/
+static inline void gpu_update_field(psx_gpu_t *gpu)
+{
+    if (((gpu->display_mode & 0x24u) == 0x24u) && !(gpu->gpustat & 0x400u))
+        gpu->skip_rows = (int32_t)((gpu->disp_y + (uint32_t)gpu->field) & 1u);
+    else
+        gpu->skip_rows = -1;
+}
+
 /* A polygon or a rectangle is about to draw into rows [y0, y1) of VRAM, which
    are inside the drawing area already */
 static inline void gpu_prim_rows(psx_gpu_t *gpu, int32_t y0, int32_t y1)
@@ -328,6 +349,8 @@ void psx_gpu_init(psx_gpu_t *gpu, psx_ic_t *ic)
 
     // Default window size, this is not normally needed
     gpu->display_mode = 1;
+
+    gpu->skip_rows = -1;
 
     gpu->ic = ic;
 }
@@ -1371,6 +1394,15 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
 
     gpu_prim_rows(gpu, ymin, ymax + 1);
 
+    /* the field on screen stays as it is (gpu_update_field): every other row,
+       from the first one of the other field */
+    const int ystep = (gpu->skip_rows >= 0) ? 2 : 1;
+    const int yfirst = ((ymin & 1) == gpu->skip_rows) ? (ymin + 1) : ymin;
+    const int row_stride = 1024 * ystep;
+
+    if (yfirst > ymax)
+        return 0;
+
 #if PSX_PROFILE
     {
         const uint32_t bbox = (uint32_t)(xmax - xmin + 1) * (uint32_t)(ymax - ymin + 1);
@@ -1400,9 +1432,9 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
     edge_func_t edge1 = edge_setup(b, c);
     edge_func_t edge2 = edge_setup(c, a);
 
-    int32_t e0_row = edge_eval(&edge0, xmin, ymin);
-    int32_t e1_row = edge_eval(&edge1, xmin, ymin);
-    int32_t e2_row = edge_eval(&edge2, xmin, ymin);
+    int32_t e0_row = edge_eval(&edge0, xmin, yfirst);
+    int32_t e1_row = edge_eval(&edge1, xmin, yfirst);
+    int32_t e2_row = edge_eval(&edge2, xmin, yfirst);
 
     uint16_t *vram = gpu->vram;
     const uint32_t flat_color = data.v[0].c;
@@ -1410,9 +1442,9 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
     const int32_t edge0_a = edge0.a;
     const int32_t edge1_a = edge1.a;
     const int32_t edge2_a = edge2.a;
-    const int32_t edge0_b = edge0.b;
-    const int32_t edge1_b = edge1.b;
-    const int32_t edge2_b = edge2.b;
+    const int32_t edge0_b = edge0.b * ystep;
+    const int32_t edge1_b = edge1.b * ystep;
+    const int32_t edge2_b = edge2.b * ystep;
 
     // ==== FAST PATH: Flat untextured non-transparent ====
     // Matches original implementation exactly for best compatibility
@@ -1420,9 +1452,9 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
     {
         const uint16_t out_color = flat_color555;
         const int row_px = xmax - xmin + 1;
-        int vram_row = ymin * 1024;
+        int vram_row = yfirst * 1024;
 
-        for (int y = ymin; y <= ymax; ++y, vram_row += 1024)
+        for (int y = yfirst; y <= ymax; y += ystep, vram_row += row_stride)
         {
             /* Solve for the span instead of walking it: a flat fill then costs
                three divisions per scanline plus the stores, rather than three
@@ -1455,11 +1487,11 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
         const int cg_base = (((src_color >> 5) & 0x1f) << 3) << 8;
         const int cb_base = (((src_color >> 10) & 0x1f) << 3) << 8;
 
-        int vram_row = ymin * 1024;
+        int vram_row = yfirst * 1024;
 
         const int row_px = xmax - xmin + 1;
 
-        for (int y = ymin; y <= ymax; ++y, vram_row += 1024)
+        for (int y = yfirst; y <= ymax; y += ystep, vram_row += row_stride)
         {
             /* Same solved span as the opaque path, so the blend loop no longer
                carries the edge functions. */
@@ -1525,9 +1557,9 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
 
     if (is_shaded)
     {
-        r_plane = plane_setup(&a, &b, &c, area, (a.c >> 0) & 0xff, (b.c >> 0) & 0xff, (c.c >> 0) & 0xff, ATTR_FRAC_BITS, xmin, ymin);
-        g_plane = plane_setup(&a, &b, &c, area, (a.c >> 8) & 0xff, (b.c >> 8) & 0xff, (c.c >> 8) & 0xff, ATTR_FRAC_BITS, xmin, ymin);
-        b_plane = plane_setup(&a, &b, &c, area, (a.c >> 16) & 0xff, (b.c >> 16) & 0xff, (c.c >> 16) & 0xff, ATTR_FRAC_BITS, xmin, ymin);
+        r_plane = plane_setup(&a, &b, &c, area, (a.c >> 0) & 0xff, (b.c >> 0) & 0xff, (c.c >> 0) & 0xff, ATTR_FRAC_BITS, xmin, yfirst);
+        g_plane = plane_setup(&a, &b, &c, area, (a.c >> 8) & 0xff, (b.c >> 8) & 0xff, (c.c >> 8) & 0xff, ATTR_FRAC_BITS, xmin, yfirst);
+        b_plane = plane_setup(&a, &b, &c, area, (a.c >> 16) & 0xff, (b.c >> 16) & 0xff, (c.c >> 16) & 0xff, ATTR_FRAC_BITS, xmin, yfirst);
         r_row = r_plane.row;
         g_row = g_plane.row;
         b_row = b_plane.row;
@@ -1535,8 +1567,8 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
 
     if (is_textured)
     {
-        tx_plane = plane_setup(&a, &b, &c, area, a.tx, b.tx, c.tx, ATTR_FRAC_BITS, xmin, ymin);
-        ty_plane = plane_setup(&a, &b, &c, area, a.ty, b.ty, c.ty, ATTR_FRAC_BITS, xmin, ymin);
+        tx_plane = plane_setup(&a, &b, &c, area, a.tx, b.tx, c.tx, ATTR_FRAC_BITS, xmin, yfirst);
+        ty_plane = plane_setup(&a, &b, &c, area, a.ty, b.ty, c.ty, ATTR_FRAC_BITS, xmin, yfirst);
         tx_row = tx_plane.row;
         ty_row = ty_plane.row;
     }
@@ -1560,10 +1592,10 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
         against the loops this replaces.
     */
     const int row_px = xmax - xmin + 1;
-    int vram_row = ymin * 1024;
+    int vram_row = yfirst * 1024;
 
     const int32_t r_dx = r_plane.dx, g_dx = g_plane.dx, b_dx = b_plane.dx;
-    const int32_t r_dy = r_plane.dy, g_dy = g_plane.dy, b_dy = b_plane.dy;
+    const int32_t r_dy = r_plane.dy * ystep, g_dy = g_plane.dy * ystep, b_dy = b_plane.dy * ystep;
 
 /* a colour channel: 8.12 fixed point plus the dither offset, clamped to 8 bits */
 #define PSXE_CH(v, d) ((uint32_t)fast_saturate_u8(((v) >> ATTR_FRAC_BITS) + (d)))
@@ -1574,7 +1606,7 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
         const int transp_mode = (gpu->gpustat >> 5) & 3;
 
 #define PSXE_GOURAUD_LOOP(TRANSP)                                                                      \
-        for (int y = ymin; y <= ymax; ++y, vram_row += 1024)                                           \
+        for (int y = yfirst; y <= ymax; y += ystep, vram_row += row_stride)                            \
         {                                                                                              \
             int start = 0;                                                                             \
             int end = row_px - 1;                                                                      \
@@ -1646,7 +1678,7 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
                                               (uint32_t)row_px * (uint32_t)(ymax - ymin + 1));
 
     const int32_t tx_dx = tx_plane.dx, ty_dx = ty_plane.dx;
-    const int32_t tx_dy = tx_plane.dy, ty_dy = ty_plane.dy;
+    const int32_t tx_dy = tx_plane.dy * ystep, ty_dy = ty_plane.dy * ystep;
 
     /*
         How the texel is fetched: 0 four bit, 1 eight bit, 2 fifteen bit. The
@@ -1695,7 +1727,7 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
                   : vram[(tpx + (tx)) + ((tpy + (ty)) << 10)])
 
 #define PSXE_TEX_LOOP(F, SH, TRANSP)                                                                   \
-    for (int y = ymin; y <= ymax; ++y, vram_row += 1024)                                               \
+    for (int y = yfirst; y <= ymax; y += ystep, vram_row += row_stride)                                \
     {                                                                                                  \
         int start = 0;                                                                                 \
         int end = row_px - 1;                                                                          \
@@ -1853,6 +1885,13 @@ PSX_GPU_HOT void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
 
     gpu_prim_rows(gpu, y0, y1);
 
+    /* as a polygon, the field on screen stays as it is (gpu_update_field) */
+    const int32_t ystep = (gpu->skip_rows >= 0) ? 2 : 1;
+    const int32_t yfirst = ((y0 & 1) == gpu->skip_rows) ? (y0 + 1) : y0;
+
+    if (yfirst >= y1)
+        return;
+
 #if PSX_PROFILE
     g_prof.pixels += (uint32_t)(x1 - x0) * (uint32_t)(y1 - y0);
     g_prof.px_rect += (uint32_t)(x1 - x0) * (uint32_t)(y1 - y0);
@@ -1863,7 +1902,7 @@ PSX_GPU_HOT void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
 
     if (!is_textured && !base_transp)
     {
-        for (int32_t y = y0; y < y1; ++y)
+        for (int32_t y = yfirst; y < y1; y += ystep)
         {
             uint16_t *dst = &gpu->vram[x0 + y * 1024];
             gpu_fill_span(dst, solid_color, rect_w);
@@ -1873,7 +1912,7 @@ PSX_GPU_HOT void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
 
     if (!is_textured)
     {
-        for (int32_t y = y0; y < y1; ++y)
+        for (int32_t y = yfirst; y < y1; y += ystep)
         {
             uint16_t *dst = &gpu->vram[x0 + y * 1024];
             for (int32_t i = 0; i < rect_w; ++i, ++dst)
@@ -1921,7 +1960,9 @@ PSX_GPU_HOT void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
         /* which halfword of a texture row a texel sits in */
         const int tshift = (depth == 0) ? 2 : ((depth == 1) ? 1 : 0);
 
-        for (int32_t y = y0; y < y1; ++y, ++tex_y)
+        tex_y += yfirst - y0;
+
+        for (int32_t y = yfirst; y < y1; y += ystep, tex_y += ystep)
         {
             uint16_t *dst = &gpu->vram[x0 + y * 1024];
             const uint16_t *const trow = &gpu->vram[tpx + ((tpy + tex_y) * 1024)];
@@ -1932,10 +1973,10 @@ PSX_GPU_HOT void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
                so asking for the next row now hides that wait behind this row's
                work. (Not for the frame buffer: whole line writes do not wait
                for a fill, and a preload only gets in their way - measured.) */
-            if ((y + 1) < y1)
+            if ((y + ystep) < y1)
             {
-                __builtin_prefetch(trow + 1024 + (tex_start_x >> tshift));
-                __builtin_prefetch(trow + 1024 + ((tex_start_x + rect_w - 1) >> tshift));
+                __builtin_prefetch(trow + (1024 * ystep) + (tex_start_x >> tshift));
+                __builtin_prefetch(trow + (1024 * ystep) + ((tex_start_x + rect_w - 1) >> tshift));
             }
 
             int32_t tx = tex_start_x;
@@ -1966,7 +2007,9 @@ PSX_GPU_HOT void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
         return;
     }
 
-    for (int32_t y = y0; y < y1; ++y, ++tex_y)
+    tex_y += yfirst - y0;
+
+    for (int32_t y = yfirst; y < y1; y += ystep, tex_y += ystep)
     {
         uint16_t *dst = &gpu->vram[x0 + y * 1024];
         int32_t tex_x = tex_start_x;
@@ -2031,7 +2074,7 @@ PSX_GPU_HOT void plotLineLow(psx_gpu_t *gpu, int x0, int y0, int x1, int y1, uin
         int bc = (x >= gpu->draw_x1) && (x <= gpu->draw_x2) &&
                  (y >= gpu->draw_y1) && (y <= gpu->draw_y2);
 
-        if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0) && bc)
+        if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0) && bc && ((y & 1) != gpu->skip_rows))
             gpu->vram[x + (y * 1024)] = color;
 
         if (d > 0)
@@ -2064,7 +2107,7 @@ PSX_GPU_HOT void plotLineHigh(psx_gpu_t *gpu, int x0, int y0, int x1, int y1, ui
         int bc = (x >= gpu->draw_x1) && (x <= gpu->draw_x2) &&
                  (y >= gpu->draw_y1) && (y <= gpu->draw_y2);
 
-        if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0) && bc)
+        if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0) && bc && ((y & 1) != gpu->skip_rows))
             gpu->vram[x + (y * 1024)] = color;
 
         if (d > 0)
@@ -3417,6 +3460,10 @@ PSX_GPU_HOT void gpu_cmd_02(psx_gpu_t *gpu)
 
             for (int y = gpu->v0.y; y < (gpu->v0.y + gpu->ysiz); y++)
             {
+                /* the field on screen stays as it is, as for a polygon */
+                if ((y & 1) == gpu->skip_rows)
+                    continue;
+
                 for (int x = gpu->v0.x; x < (gpu->v0.x + gpu->xsiz); x++)
                 {
                     if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0))
@@ -3618,6 +3665,8 @@ static PSX_GPU_HOT void psx_gpu_update_cmd_impl(psx_gpu_t *gpu)
         gpu->texp_x = (gpu->gpustat & 0xf) << 6;
         gpu->texp_y = (gpu->gpustat & 0x10) << 4;
         gpu->texp_d = (gpu->gpustat >> 7) & 0x3;
+
+        gpu_update_field(gpu);
     }
     break;
     case 0xe2:
@@ -3752,6 +3801,7 @@ PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value
             gpu->disp_y = y;
 
             gpu_update_draw_visible(gpu);
+            gpu_update_field(gpu);
         }
         break;
         case 0x06:
@@ -3785,6 +3835,7 @@ PSX_GPU_HOT void psx_gpu_write32(psx_gpu_t *gpu, uint32_t offset, uint32_t value
             gpu->display_mode = value & 0xffffff;
 
             gpu_update_draw_visible(gpu);
+            gpu_update_field(gpu);
 
             if (gpu->event_cb_table[GPU_EVENT_DMODE])
                 gpu->event_cb_table[GPU_EVENT_DMODE](gpu);
@@ -3831,26 +3882,28 @@ void psx_gpu_set_udata(psx_gpu_t *gpu, int index, void *udata)
 
 PSX_GPU_HOT void gpu_hblank_event(psx_gpu_t *gpu)
 {
+    const int interlaced_480 = (gpu->display_mode & 0x24u) == 0x24u;
+
+    /* GPUSTAT.31, the parity of the VRAM row being sent to the screen: in 480
+       line interlaced mode that of the field on screen, otherwise it changes
+       with every line; 0 during the vertical blank */
+    uint32_t odd = 0;
+
     if (gpu->line < GPU_SCANS_PER_VDRAW_NTSC)
-    {
-        if (gpu->line & 1)
-        {
-            gpu->gpustat |= 1 << 31;
-        }
-        else
-        {
-            gpu->gpustat &= ~(1 << 31);
-        }
-    }
-    else
-    {
-        gpu->gpustat &= ~(1 << 31);
-    }
+        odd = interlaced_480 ? ((gpu->disp_y + (uint32_t)gpu->field) & 1u) : ((uint32_t)gpu->line & 1u);
+
+    gpu->gpustat = (gpu->gpustat & 0x7fffffffu) | (odd << 31);
 
     gpu->line++;
 
     if (gpu->line == GPU_SCANS_PER_VDRAW_NTSC)
     {
+        /* the other field goes on screen - before the game hears of the blank,
+           so that what it draws next lands in the field that is not */
+        gpu->field = interlaced_480 ? (gpu->field ^ 1) : 0;
+
+        gpu_update_field(gpu);
+
         if (gpu->event_cb_table[GPU_EVENT_VBLANK])
             gpu->event_cb_table[GPU_EVENT_VBLANK](gpu);
 

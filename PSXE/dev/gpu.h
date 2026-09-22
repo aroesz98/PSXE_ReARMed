@@ -187,6 +187,13 @@ struct psx_gpu_t
     psx_ic_t *ic;
 
     psx_gpu_event_callback_t event_cb_table[8];
+
+    /* 480 line interlaced output: the field on screen (0 or 1, counted from
+       disp_y), which changes at every vertical blank, and the parity (y & 1)
+       of the rows the GPU must not draw into while it is there - -1 when every
+       row is drawn. See gpu_update_field in gpu.c. */
+    int32_t field;
+    int32_t skip_rows;
 };
 
 psx_gpu_t *psx_gpu_create(void);

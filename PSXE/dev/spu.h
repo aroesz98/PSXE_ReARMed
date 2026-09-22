@@ -188,4 +188,8 @@ void psx_spu_destroy(psx_spu_t *);
 void psx_spu_update_cdda_buffer(psx_spu_t *, void *);
 uint32_t psx_spu_get_sample(psx_spu_t *);
 
+/* Runs the voices for `cycles` more CPU cycles without making any sound: see
+   spu.c. Called with every device update round. */
+void psx_spu_update(psx_spu_t *, uint32_t cycles);
+
 #endif

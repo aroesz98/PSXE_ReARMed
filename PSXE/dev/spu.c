@@ -159,6 +159,24 @@ uint8_t psx_spu_read8(psx_spu_t *spu, uint32_t offset)
     return 0x0;
 }
 
+/*
+    IRQ9: when a voice reads the block (16 bytes at addr) that holds the IRQ
+    address, with SPUCNT.6 set. The address is in 8 byte units, so it can be the
+    second half of a block - Need for Speed II streams its music with the IRQ at
+    1F688h. It sets SPUSTAT.6 and does not come again until the game acknowledges
+    it by clearing SPUCNT.6: one interrupt per acknowledgement, not one per block.
+*/
+static inline void spu_irq_check(psx_spu_t *spu, uint32_t addr)
+{
+    if ((spu->spucnt & 0x40) && !(spu->spustat & 0x40) &&
+        (((((uint32_t)spu->irq9addr << 3) - addr) & SPU_RAM_MASK) < 16u))
+    {
+        spu->spustat |= 0x40;
+
+        psx_ic_irq(spu->ic, IC_SPU);
+    }
+}
+
 void spu_read_block(psx_spu_t *spu, int32_t v)
 {
     uint32_t addr = spu->data[v].current_addr & SPU_RAM_MASK;
@@ -404,6 +422,7 @@ void spu_kon(psx_spu_t *spu, uint32_t value)
 
             adsr_load_attack(spu, i);
             spu_read_block(spu, i);
+            spu_irq_check(spu, spu->data[i].current_addr);
         }
     }
 
@@ -483,6 +502,10 @@ int32_t spu_handle_write(psx_spu_t *spu, uint32_t offset, uint32_t value)
         spu->spucnt = value;
         spu->spustat &= 0xffc0;
         spu->spustat |= value & 0x3f;
+
+        /* clearing the IRQ enable acknowledges the IRQ */
+        if (!(value & 0x40))
+            spu->spustat &= ~0x40;
 
         if ((value >> 4) & 3)
         {
@@ -696,17 +719,11 @@ uint32_t psx_spu_get_sample(psx_spu_t *spu)
             case 0:
             case 2:
             {
-                if (((spu->irq9addr << 3) == spu->data[v].current_addr) && (spu->spucnt & 0x40))
-                {
-                    psx_ic_irq(spu->ic, IC_SPU);
-                }
+                spu_irq_check(spu, spu->data[v].current_addr);
 
                 spu->data[v].current_addr = (spu->data[v].current_addr + 0x10) & SPU_RAM_MASK;
 
-                if (((spu->irq9addr << 3) == spu->data[v].current_addr) && (spu->spucnt & 0x40))
-                {
-                    psx_ic_irq(spu->ic, IC_SPU);
-                }
+                spu_irq_check(spu, spu->data[v].current_addr);
             }
             break;
 
@@ -724,6 +741,8 @@ uint32_t psx_spu_get_sample(psx_spu_t *spu)
             {
                 spu->endx |= 1 << v;
                 spu->data[v].current_addr = spu->data[v].repeat_addr;
+
+                spu_irq_check(spu, spu->data[v].current_addr);
             }
             break;
             }
@@ -816,6 +835,123 @@ uint32_t psx_spu_get_sample(psx_spu_t *spu)
     }
 
     return clampl | (((uint32_t)clampr) << 16);
+}
+
+/*
+    Nothing plays the sound on this board - psx_spu_get_sample, which decodes and
+    mixes the voices, has no caller - but games watch the voices all the same. A
+    sound driver keys a voice on, waits for its envelope to rise and takes the
+    sound as finished when the envelope is back at zero (libspu's SpuGetKeyStatus
+    reads the current envelope volume, 1F801C0Ch + 10h * N); others wait for ENDX
+    or the SPU interrupt. With the voices standing still, Need for Speed 2 waited
+    in its menu for a sound that never started.
+
+    So the voices run as they would, 44100 times a second of emulated time: the
+    envelope, the position in the sample and what its block flags do (loop, end,
+    ENDX), and the IRQ - everything psx_spu_get_sample does to a voice except
+    decoding, interpolating and mixing its samples, and in the same order. They
+    are advanced a few dozen samples at a time; each voice on its own, which
+    changes nothing, as no voice depends on another here.
+
+    (Should the board ever play the sound, psx_spu_get_sample does all of this
+    itself, and this has to go.)
+*/
+#define SPU_CYCLES_PER_SAMPLE 768u /* 33.8688 MHz / 44100 */
+#define SPU_BATCH_SAMPLES 16u
+
+static uint32_t g_spu_cycles;
+
+/* the part of spu_read_block the voice's course depends on */
+static inline void spu_read_block_flags(psx_spu_t *spu, int32_t v)
+{
+    spu->data[v].block_flags = spu->ram[(spu->data[v].current_addr + 1u) & SPU_RAM_MASK];
+}
+
+static void spu_run_voice(psx_spu_t *spu, int32_t v, uint32_t samples)
+{
+    for (uint32_t i = 0; i < samples; i++)
+    {
+        /* spu_handle_adsr, whose first step this is */
+        if (spu->data[v].adsr_cycles)
+            spu->data[v].adsr_cycles -= 1;
+        else
+            spu_handle_adsr(spu, v);
+
+        uint32_t sample_index = spu->data[v].counter >> 12;
+
+        if (sample_index > 27)
+        {
+            sample_index -= 28;
+
+            spu->data[v].counter &= 0xfff;
+            spu->data[v].counter |= sample_index << 12;
+
+            if (spu->data[v].block_flags & 4)
+                spu->data[v].repeat_addr = spu->data[v].current_addr;
+
+            switch (spu->data[v].block_flags & 3)
+            {
+            case 0:
+            case 2:
+            {
+                spu_irq_check(spu, spu->data[v].current_addr);
+
+                spu->data[v].current_addr = (spu->data[v].current_addr + 0x10) & SPU_RAM_MASK;
+
+                spu_irq_check(spu, spu->data[v].current_addr);
+            }
+            break;
+
+            case 1:
+            {
+                spu->data[v].current_addr = spu->data[v].repeat_addr;
+                spu->data[v].playing = 0;
+                spu->voice[v].envcvol = 0;
+
+                adsr_load_release(spu, v);
+            }
+            break;
+
+            case 3:
+            {
+                spu->endx |= 1 << v;
+                spu->data[v].current_addr = spu->data[v].repeat_addr;
+
+                spu_irq_check(spu, spu->data[v].current_addr);
+            }
+            break;
+            }
+
+            spu_read_block_flags(spu, v);
+        }
+
+        spu->data[v].counter += spu->voice[v].adsampr;
+
+        if (!spu->data[v].playing)
+            return;
+    }
+}
+
+void psx_spu_update(psx_spu_t *spu, uint32_t cycles)
+{
+    g_spu_cycles += cycles;
+
+    if (g_spu_cycles < (SPU_BATCH_SAMPLES * SPU_CYCLES_PER_SAMPLE))
+        return;
+
+    const uint32_t samples = g_spu_cycles / SPU_CYCLES_PER_SAMPLE;
+
+    g_spu_cycles -= samples * SPU_CYCLES_PER_SAMPLE;
+
+    /* as psx_spu_get_sample does for every sample */
+    spu->koff = 0;
+    spu->kon = 0;
+
+    for (int32_t v = 0; v < VOICE_COUNT; v++)
+    {
+        if (spu->data[v].playing)
+            spu_run_voice(spu, v, samples);
+    }
 }
 
 int32_t counter = 0;
