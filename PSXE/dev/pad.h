@@ -138,6 +138,9 @@ void psx_pad_analog_change(psx_pad_t *, int32_t, uint32_t, uint16_t);
 void psx_pad_attach_joy(psx_pad_t *, int32_t, psx_input_t *);
 void psx_pad_detach_joy(psx_pad_t *, int32_t);
 int32_t psx_pad_attach_mcd(psx_pad_t *, int32_t, const char *);
+
+/* Saves memory card changes to the SD card once the game is done writing (psx_mcd_tick) */
+void psx_pad_tick_mcd(psx_pad_t *, uint32_t now_ms);
 void psx_pad_detach_mcd(psx_pad_t *, int32_t);
 void psx_pad_update(psx_pad_t *, int32_t);
 

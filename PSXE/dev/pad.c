@@ -156,6 +156,12 @@ void pad_handle_ctrl_write(psx_pad_t *pad, uint32_t value)
     {
         pad->ctrl &= ~CTRL_SLOT;
 
+        /* /SEL goes high: whatever was being talked to is done, finished or
+           not, and the next byte picks the device (01h pad, 81h card) again.
+           Keeping the old destination sent the pad's next poll to the memory
+           card after an access the card did not end itself. */
+        pad->dest[slot >> 13] = 0;
+
         if (pad->mcd_slot[slot >> 13])
             psx_mcd_reset(pad->mcd_slot[slot >> 13]);
     }
@@ -393,22 +399,30 @@ void psx_pad_detach_joy(psx_pad_t *pad, int32_t slot)
     pad->joy_slot[slot] = NULL;
 }
 
+void psx_pad_tick_mcd(psx_pad_t *pad, uint32_t now_ms)
+{
+    for (int32_t slot = 0; slot < 2; slot++)
+        if (pad->mcd_slot[slot])
+            psx_mcd_tick(pad->mcd_slot[slot], now_ms);
+}
+
 int32_t psx_pad_attach_mcd(psx_pad_t *pad, int32_t slot, const char *path)
 {
-    PRINTF("Memory Card support is disabled\r\n");
-
-    return 0;
-
     if (pad->mcd_slot[slot])
         psx_pad_detach_mcd(pad, slot);
 
     psx_mcd_t *mcd = psx_mcd_create();
 
+    if (!mcd)
+        return 4;
+
     int32_t r = psx_mcd_init(mcd, path);
 
     if (r)
     {
-        psx_pad_detach_mcd(pad, slot);
+        /* not in the slot yet: freed here, nothing to save */
+        free(mcd->buf);
+        free(mcd);
 
         return r;
     }

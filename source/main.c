@@ -76,6 +76,20 @@ typedef struct
 /* Set to 1 to print the memory benchmark at boot */
 #define PSX_MEM_BENCH 0
 
+/* The memory cards: files in the root of the SD card. Slot 2 costs another
+   128 KB of heap and is off; most games save to slot 1. */
+#ifndef PSXE_MCD1_PATH
+#define PSXE_MCD1_PATH "/memcard1.mcd"
+#endif
+
+#ifndef PSXE_MCD2
+#define PSXE_MCD2 0
+#endif
+
+#ifndef PSXE_MCD2_PATH
+#define PSXE_MCD2_PATH "/memcard2.mcd"
+#endif
+
 /* The stock NXP DCD programs the SDRAM (and the SEMC) for burst length 1, so a
    single 32 byte cache line refill turns into 16 separate SDRAM accesses.
    VRAM and PSX RAM live in SDRAM, so this directly limits the rasterizer. */
@@ -500,9 +514,21 @@ static void psx_emulator_task(void *pvParameters)
         PRINTF("Input system initialized\r\n");
     }
 
-    /* Memory card support (commented out for now) */
-    /* psx_pad_attach_mcd(g_psx->pad, 0, "slot1.mcd"); */
-    /* psx_pad_attach_mcd(g_psx->pad, 1, "slot2.mcd"); */
+    /* Memory cards: files on the SD card, 128 KB raw images (the .mcd / .mcr
+       format other emulators use). A missing file becomes a new, formatted
+       card; what a game saves reaches the file half a second after it stops
+       writing (psx_pad_tick_mcd in the loop below). */
+    {
+        const int32_t r = psx_pad_attach_mcd(g_psx->pad, 0, PSXE_MCD1_PATH);
+
+        if (r)
+            PRINTF("Memory card 1 (%s) not available: error %d\r\n", PSXE_MCD1_PATH, (int)r);
+
+#if PSXE_MCD2
+        if (psx_pad_attach_mcd(g_psx->pad, 1, PSXE_MCD2_PATH))
+            PRINTF("Memory card 2 (%s) not available\r\n", PSXE_MCD2_PATH);
+#endif
+    }
 
     g_psxInitialized = true;
     PRINTF("PSX Emulator fully initialized!\r\n");
@@ -566,7 +592,13 @@ static void psx_emulator_task(void *pvParameters)
            few hundred frames a second, so looking every few hundred device
            slices is plenty - and costs nothing when nothing has arrived. */
         if ((++pad_tick & 0x1ffu) == 0u)
+        {
             psxe_gamepad_poll();
+
+            /* memory card writes to the SD card, once a save is complete */
+            if ((pad_tick & 0x3fffu) == 0u)
+                psx_pad_tick_mcd(g_psx->pad, (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
+        }
     }
 
     /* Cleanup on exit */

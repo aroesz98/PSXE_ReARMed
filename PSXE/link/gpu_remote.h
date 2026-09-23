@@ -77,4 +77,8 @@ void gpu_remote_vblank(psx_gpu_t *gpu, uint32_t field);
 uint32_t gpu_remote_presented(void);
 void gpu_remote_report(void);
 
+/* the link in a few characters, for the on-screen status: "H7 off" (no cable),
+   "H7 eth" (carrier, no GPU board), "H7 up", "H7 hyb" / "H7 strm" (drawing there) */
+const char *gpu_remote_state(void);
+
 #endif

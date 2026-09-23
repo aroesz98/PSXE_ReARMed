@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "enet_link.h"
+#include "prof_switch.h"
 
 #include "fsl_clock.h"
 #include "fsl_debug_console.h"
@@ -214,9 +215,15 @@ bool enet_link_poll_phy(void)
     if (PHY_GetLinkStatus(&s_phy, &link) != kStatus_Success)
         return s_up;
 
-    /* while there is no link: the registers every ten seconds, to see why */
+    /* while there is no link: the registers every ten seconds, to see why -
+       in the profiling build only; the build that is played shows the link
+       state on screen (osd.c) and keeps the UART for one-off messages */
+#if PSX_PROFILE
     if (!link && ((++polls % 100u) == 0u))
         phy_dump("no link");
+#else
+    (void)polls;
+#endif
 
     if (link && !s_up)
     {

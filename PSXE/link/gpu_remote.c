@@ -1116,6 +1116,14 @@ uint32_t gpu_remote_presented(void)
     return s_presented;
 }
 
+const char *gpu_remote_state(void)
+{
+    if (s_ready)
+        return g_gpu_remote ? (g_gpu_stream ? "H7 strm" : "H7 hyb") : "H7 up";
+
+    return enet_link_up() ? "H7 eth" : "H7 off";
+}
+
 void gpu_remote_report(void)
 {
     const uint32_t kb = (s_tx_bytes - s_rep_tx_bytes) / 1024u;

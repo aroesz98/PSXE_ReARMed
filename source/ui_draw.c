@@ -12,10 +12,20 @@
 #include "display_support.h"
 
 static uint16_t *g_fb;
+static int g_w = UI_WIDTH, g_h = UI_HEIGHT; /* the target's size, also its pitch in pixels */
 
 void ui_begin(void)
 {
     g_fb = (uint16_t *)DEMO_GetCurrentFrameBuffer();
+    g_w = UI_WIDTH;
+    g_h = UI_HEIGHT;
+}
+
+void ui_begin_buffer(uint16_t *buf, int w, int h)
+{
+    g_fb = buf;
+    g_w = w;
+    g_h = h;
 }
 
 void ui_present(void)
@@ -51,11 +61,11 @@ static inline void ui_clip(int *x, int *y, int *w, int *h)
         *y = 0;
     }
 
-    if ((*x + *w) > UI_WIDTH)
-        *w = UI_WIDTH - *x;
+    if ((*x + *w) > g_w)
+        *w = g_w - *x;
 
-    if ((*y + *h) > UI_HEIGHT)
-        *h = UI_HEIGHT - *y;
+    if ((*y + *h) > g_h)
+        *h = g_h - *y;
 }
 
 /* alpha is 0..255, where 255 is fully the new colour */
@@ -93,7 +103,7 @@ void ui_fill(int x, int y, int w, int h, uint16_t color)
 
     for (int row = 0; row < h; row++)
     {
-        uint16_t *d = g_fb + (uint32_t)(y + row) * UI_WIDTH + x;
+        uint16_t *d = g_fb + (uint32_t)(y + row) * g_w + x;
 
         for (int col = 0; col < w; col++)
             d[col] = color;
@@ -109,7 +119,7 @@ void ui_fill_blend(int x, int y, int w, int h, uint16_t color, uint8_t alpha)
 
     for (int row = 0; row < h; row++)
     {
-        uint16_t *d = g_fb + (uint32_t)(y + row) * UI_WIDTH + x;
+        uint16_t *d = g_fb + (uint32_t)(y + row) * g_w + x;
 
         for (int col = 0; col < w; col++)
             d[col] = ui_mix(d[col], color, alpha);
@@ -140,7 +150,7 @@ void ui_vgradient(int x, int y, int w, int h, uint16_t top, uint16_t bottom)
                                       (((tg + (dg * t) / height) & 0x3f) << 5) |
                                       ((tb + (db * t) / height) & 0x1f));
 
-        uint16_t *d = g_fb + (uint32_t)(y + row) * UI_WIDTH + x;
+        uint16_t *d = g_fb + (uint32_t)(y + row) * g_w + x;
 
         for (int col = 0; col < w; col++)
             d[col] = c;
@@ -236,25 +246,25 @@ static void ui_round_rect_impl(int x, int y, int w, int h, int radius, uint16_t 
             const int lx = x + i;
             const int rx = x + w - 1 - i;
 
-            if ((top_y >= 0) && (top_y < UI_HEIGHT))
+            if ((top_y >= 0) && (top_y < g_h))
             {
-                uint16_t *d = g_fb + (uint32_t)top_y * UI_WIDTH;
+                uint16_t *d = g_fb + (uint32_t)top_y * g_w;
 
-                if ((lx >= 0) && (lx < UI_WIDTH))
+                if ((lx >= 0) && (lx < g_w))
                     d[lx] = ui_mix(d[lx], color, a);
 
-                if ((rx >= 0) && (rx < UI_WIDTH))
+                if ((rx >= 0) && (rx < g_w))
                     d[rx] = ui_mix(d[rx], color, a);
             }
 
-            if ((bottom_y >= 0) && (bottom_y < UI_HEIGHT))
+            if ((bottom_y >= 0) && (bottom_y < g_h))
             {
-                uint16_t *d = g_fb + (uint32_t)bottom_y * UI_WIDTH;
+                uint16_t *d = g_fb + (uint32_t)bottom_y * g_w;
 
-                if ((lx >= 0) && (lx < UI_WIDTH))
+                if ((lx >= 0) && (lx < g_w))
                     d[lx] = ui_mix(d[lx], color, a);
 
-                if ((rx >= 0) && (rx < UI_WIDTH))
+                if ((rx >= 0) && (rx < g_w))
                     d[rx] = ui_mix(d[rx], color, a);
             }
         }
@@ -305,10 +315,10 @@ static void ui_glyph_draw(const ui_font_t *font, const ui_glyph_t *g, int pen_x,
     {
         const int py = baseline - font->ascent + g->top + row;
 
-        if ((py < 0) || (py >= UI_HEIGHT))
+        if ((py < 0) || (py >= g_h))
             continue;
 
-        uint16_t *d = g_fb + (uint32_t)py * UI_WIDTH;
+        uint16_t *d = g_fb + (uint32_t)py * g_w;
         const uint8_t *src = bits + (uint32_t)row * stride;
 
         for (int col = 0; col < g->width; col++)
@@ -321,7 +331,7 @@ static void ui_glyph_draw(const ui_font_t *font, const ui_glyph_t *g, int pen_x,
 
             const int px = pen_x + g->left + col;
 
-            if ((px < 0) || (px >= UI_WIDTH))
+            if ((px < 0) || (px >= g_w))
                 continue;
 
             /* 4 bit coverage to 0..255 */

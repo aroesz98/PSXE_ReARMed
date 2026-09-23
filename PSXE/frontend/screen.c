@@ -33,6 +33,8 @@
 #include "fsl_cache.h"
 #include "fsl_debug_console.h"
 #include "overclock.h"
+#include "osd.h"
+#include "ui_draw.h"
 #include "../prof.h"
 #include "../jit/jit.h"
 #include "gamepad.h"
@@ -690,9 +692,26 @@ void psxe_screen_update(psxe_screen_t *screen)
                 (void)presented;
                 last_presented = presented;
 
+#if PSX_PROFILE || PSXE_AUTOTEST
                 gpu_remote_report();
+#endif
             }
 #endif
+
+            /* the status on screen (osd.c), left of the picture */
+            {
+                const uint32_t pct = (kcyc * 100u) / 33869u;
+                const int32_t temp = BOARD_TempCelsius();
+
+                osd_line(0, (pct >= 99u) ? UI_RGB(120, 230, 120) : ((pct >= 80u) ? UI_RGB(240, 210, 90) : UI_RGB(240, 110, 90)),
+                         "%u%%", (unsigned)pct);
+                osd_line(1, UI_RGB(200, 200, 200), "%u vbl", (unsigned)vblanks);
+                osd_line(2, UI_RGB(200, 200, 200), "%u fps", (unsigned)g_presented_frames);
+                osd_line(3, (temp >= 75) ? UI_RGB(240, 110, 90) : UI_RGB(200, 200, 200), "%d C", (int)temp);
+#if PSXE_GPU_REMOTE
+                osd_line(5, UI_RGB(150, 150, 150), "%s", gpu_remote_state());
+#endif
+            }
 
 #if PSX_JIT_HIST
             {
@@ -743,12 +762,10 @@ void psxe_screen_update(psxe_screen_t *screen)
                    (unsigned)jit->hot_used, (unsigned)jit->hot_blocks, (unsigned)jit->retiers,
                    (unsigned)jit->interp_steps, (unsigned)jit->dispatches, (unsigned)jit->cold_dispatches);
 #else
-            /* a character is 87 microseconds of blocking UART: the long line is 1.7%
-               of the machine, so the build that is meant to be played prints a short one
-               (the core temperature is in it: the core runs above its rated clock, overclock.c) */
-            PRINTF("emu: %u%% of PS1 | vbl/s: %u | fps: %u | %dC | jit blk=%u flush=%u\r\n",
-                   (unsigned)((kcyc * 100u) / 33869u), vblanks, g_presented_frames, (int)BOARD_TempCelsius(),
-                   (unsigned)jit->blocks, (unsigned)jit->flushes);
+            /* The build that is meant to be played has its status on screen
+               (above) and keeps the UART for one-off messages - a character is 87
+               microseconds of blocking UART, so this also saves time. */
+            (void)jit;
 #endif
 
 /* Display mode and pad link counters: for chasing display problems, so they
@@ -848,7 +865,7 @@ void psxe_screen_update(psxe_screen_t *screen)
 
     /* Nothing visible changed since the last presented frame: the LCD already
        shows this picture, so re-scaling it would be pure overhead. */
-    if (!gpu->vram_dirty && !screen->debug_mode)
+    if (!gpu->vram_dirty && !screen->debug_mode && !osd_changed())
         return;
 
     /* A game that draws one field per frame (480 line interlaced, gpu.c has it
@@ -1293,8 +1310,27 @@ static void psxe_screen_update_impl(psxe_screen_t *screen, uint32_t dirty_y0, ui
         ps_pitch = (uint32_t)src_width * 2u;
     }
 
+    /* The status (osd.c) as the PXP's alpha surface, in the bar left of the
+       picture - when there is one wide enough. */
+    if (!screen->debug_mode && (x_offset >= OSD_W))
+    {
+        static const pxp_as_blend_config_t blend = {
+            .alpha = 0xffu, .invertAlpha = false, .alphaMode = kPXP_AlphaOverride, .ropMode = kPXP_RopMergeAs};
+        pxp_as_buffer_config_t as = {
+            .pixelFormat = kPXP_AsPixelFormatRGB565, .bufferAddr = (uint32_t)osd_buffer(), .pitchBytes = OSD_W * 2u};
+
+        PXP_SetAlphaSurfaceBufferConfig(APP_PXP, &as);
+        PXP_SetAlphaSurfaceBlendConfig(APP_PXP, &blend);
+        PXP_SetAlphaSurfacePosition(APP_PXP, 0u, 0u, OSD_W - 1u, OSD_H - 1u);
+    }
+    else
+    {
+        PXP_SetAlphaSurfacePosition(APP_PXP, 0xFFFFU, 0xFFFFU, 0U, 0U);
+    }
+
     /* The rasterizer writes VRAM through the D-cache, PXP reads it as a bus
-       master - a full clean is cheaper than cleaning the display window. */
+       master - a full clean is cheaper than cleaning the display window
+       (and it covers the status buffer too). */
     SCB_CleanDCache();
 
     /* Process surface = PSX display area inside VRAM */

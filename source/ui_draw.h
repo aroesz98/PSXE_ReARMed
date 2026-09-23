@@ -24,6 +24,10 @@ extern "C" {
 /* Starts drawing into the current back buffer. */
 void ui_begin(void);
 
+/* Starts drawing into buf instead, w x h pixels of RGB565 without padding
+   (the on-screen status, osd.c). ui_present does not apply to it. */
+void ui_begin_buffer(uint16_t *buf, int w, int h);
+
 /* Shows what was drawn and waits for the flip. */
 void ui_present(void);
 
