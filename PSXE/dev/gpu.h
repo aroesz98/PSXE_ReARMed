@@ -221,6 +221,17 @@ struct psx_gpu_t
     int32_t field;
     int32_t skip_rows;
 
+    /* The frontend shows one field of a 480 line picture only, the rows from
+       disp_y on in steps of two (psx_gpu_set_one_field): what field drawing
+       puts into the other field of the display window is then never seen and
+       is left out. See gpu_update_hidden in gpu.c. */
+    int32_t one_field;
+    int32_t field_reads;  /* the game read the window back meanwhile: stop leaving out */
+    int32_t field_guard;  /* fields may be left out: reads of the window are watched */
+    int32_t field_hidden; /* what is drawn now goes into the field nobody sees */
+    int32_t draw_in_window; /* the drawing area lies wholly inside the display window */
+    int32_t skip_prims;   /* both: polygons, rectangles and lines are left out */
+
     /*
         The share of the drawing area this board rasterizes, when two boards
         divide the work: band_share is 0 to 256 (256 = all of it) and band_top
@@ -263,6 +274,10 @@ uint32_t psx_gpu_cycles_to_edge(const psx_gpu_t *);
    goes on screen now. What gpu_hblank_event does at the blank, without the
    interrupt and the callbacks. */
 void psx_gpu_set_field(psx_gpu_t *, uint32_t field);
+
+/* 1: the frontend shows only the field of a 480 line picture that starts at
+   disp_y (see one_field in psx_gpu_t), 0: it shows every row */
+void psx_gpu_set_one_field(psx_gpu_t *, int32_t on);
 
 /* the share of the drawing area this board draws (see band_share in psx_gpu_t) */
 void psx_gpu_set_band(psx_gpu_t *, int32_t share, int32_t top);

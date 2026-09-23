@@ -615,9 +615,51 @@ static void psxe_screen_thumbnail(psxe_screen_t *screen)
 }
 #endif
 
+/*
+    Does the panel show only one field of what a game draws in 480 line field
+    mode? The repack (psxe_screen_update_impl) and the frames for the GPU board
+    (psxe_screen_send_frame) take every other row from disp_y on when the
+    picture, sized by the same rules as there, is more than 272 rows high (the
+    GPU board's rule, more than 240, follows). What goes into the other field is
+    then never seen, and gpu.c leaves it out (psx_gpu_set_one_field). Not for a
+    320 pixel wide 480 line picture, which is shown as its top 240 rows.
+*/
+static int32_t psxe_screen_one_field(const psxe_screen_t *screen)
+{
+    if (screen->debug_mode)
+        return 0;
+
+    const psx_gpu_t *const gpu = screen->psx->gpu;
+
+    int32_t w = (int32_t)psx_get_display_width(screen->psx);
+    int32_t h = (int32_t)psx_get_display_height(screen->psx);
+
+    if ((w <= 0) || (w > 640))
+        w = 320;
+
+    if ((h <= 0) || (h > 480))
+        h = 240;
+
+    if ((w == 320) && (h > 240))
+        h = 240;
+
+    if (((int32_t)gpu->disp_y + h) > PSX_GPU_FB_HEIGHT)
+        h = PSX_GPU_FB_HEIGHT - (int32_t)gpu->disp_y;
+
+    return h > 272;
+}
+
 void psxe_screen_update(psxe_screen_t *screen)
 {
     psx_gpu_t *const gpu = screen->psx->gpu;
+
+    /* at the blank, before the game draws the next field */
+    {
+        const int32_t one_field = psxe_screen_one_field(screen);
+
+        if (gpu->one_field != one_field)
+            psx_gpu_set_one_field(gpu, one_field);
+    }
 
     /* Speed report once a second. Runs on the emulated vblank (not per
        instruction), so it costs nothing measurable.

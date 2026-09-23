@@ -291,15 +291,9 @@ static PSX_GPU_HOT void psx_gpu_update_cmd_impl(psx_gpu_t *gpu);
 */
 #define GPU_DIRTY_MARGIN 8u
 
-/* Is any of [x0, x1) x [y0, y1), in VRAM coordinates, inside the display window
-   less `margin` rows at its top and bottom? */
-static inline int gpu_rect_in_window(const psx_gpu_t *gpu, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
-                                     uint32_t margin)
+/* the display window in VRAM coordinates: [x0, x1) x [y0, y1) */
+static inline void gpu_window(const psx_gpu_t *gpu, uint32_t *x0, uint32_t *y0, uint32_t *x1, uint32_t *y1)
 {
-    /* empty, or wrapping around VRAM: not worth working out */
-    if ((x1 > 1024u) || (y1 > 512u) || (x1 <= x0) || (y1 <= y0))
-        return 1;
-
     static const uint16_t hres[4] = {256, 320, 512, 640};
 
     const uint32_t mode = gpu->display_mode;
@@ -311,12 +305,41 @@ static inline int gpu_rect_in_window(const psx_gpu_t *gpu, uint32_t x0, uint32_t
 
     const uint32_t h = ((mode & 0x24u) == 0x24u) ? 480u : 240u;
 
-    const uint32_t wx0 = gpu->disp_x;
-    const uint32_t wx1 = gpu->disp_x + w;
-    const uint32_t wy0 = gpu->disp_y + margin;
-    const uint32_t wy1 = gpu->disp_y + h - margin;
+    *x0 = gpu->disp_x;
+    *x1 = gpu->disp_x + w;
+    *y0 = gpu->disp_y;
+    *y1 = gpu->disp_y + h;
+}
+
+/* Is any of [x0, x1) x [y0, y1), in VRAM coordinates, inside the display window
+   less `margin` rows at its top and bottom? */
+static inline int gpu_rect_in_window(const psx_gpu_t *gpu, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+                                     uint32_t margin)
+{
+    /* empty, or wrapping around VRAM: not worth working out */
+    if ((x1 > 1024u) || (y1 > 512u) || (x1 <= x0) || (y1 <= y0))
+        return 1;
+
+    uint32_t wx0, wy0, wx1, wy1;
+
+    gpu_window(gpu, &wx0, &wy0, &wx1, &wy1);
+
+    wy0 += margin;
+    wy1 -= margin;
 
     return (x0 < wx1) && (x1 > wx0) && (y0 < wy1) && (y1 > wy0);
+}
+
+/* Is all of [x0, x1) x [y0, y1) inside the display window? (Not when either
+   wraps around VRAM - that is only ever "maybe".) */
+static inline int gpu_rect_inside_window(const psx_gpu_t *gpu, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+{
+    uint32_t wx0, wy0, wx1, wy1;
+
+    gpu_window(gpu, &wx0, &wy0, &wx1, &wy1);
+
+    return (x0 < x1) && (y0 < y1) && (x0 >= wx0) && (x1 <= wx1) && (y0 >= wy0) && (y1 <= wy1) &&
+           (wx1 <= 1024u) && (wy1 <= 512u);
 }
 
 /* ... on screen, as far as a new frame is concerned? */
@@ -386,6 +409,135 @@ static inline void gpu_touch(psx_gpu_t *gpu, uint32_t x0, uint32_t y0, uint32_t 
     gpu_dirty_rows(gpu, y0, y1);
 }
 
+/*
+    Leaving out the field nobody sees.
+
+    In 480 line field drawing (gpu_update_field) a game draws every frame into
+    one field of its frame buffer, the two fields in turn. A frontend whose
+    panel has fewer lines than that shows one field of the picture - the rows
+    from disp_y on in steps of two - so every other frame the game draws goes
+    into rows that never reach the screen: Tekken 3 spent half of its
+    rasterizer time there. While the frontend says it shows one field
+    (psx_gpu_set_one_field), those frames are not drawn: polygons, rectangles
+    and lines while the drawing area lies inside the display window, and fills
+    that do.
+
+    The rows left out are then out of date, which matters only if the game
+    reads them back - copies them, reads them to the CPU, or textures from
+    them - and they stay so when the game stops field drawing (E1.10) but not
+    the 480 line display. So for as long as the display is 480 line
+    interlaced, reads of the display window are watched, and the first one
+    stops the leaving out, until the display is something else (a game
+    redraws its picture then anyway).
+*/
+static inline void gpu_update_hidden(psx_gpu_t *gpu)
+{
+    gpu->field_guard = ((gpu->display_mode & 0x24u) == 0x24u) && gpu->one_field && !gpu->field_reads;
+
+    /* field drawing, and the field on screen is the one shown: the game draws into the other */
+    gpu->field_hidden = gpu->field_guard && (gpu->skip_rows >= 0) &&
+                        ((uint32_t)gpu->skip_rows == (gpu->disp_y & 1u));
+
+    gpu->skip_prims = gpu->field_hidden && gpu->draw_in_window;
+}
+
+/* [x0, x1) x [y0, y1) of VRAM is about to be read (as texture, palette, copy
+   source or by the CPU): if that is the display window, stop leaving fields out */
+static void gpu_field_read(psx_gpu_t *gpu, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+{
+    if (!gpu->field_guard || (x1 <= x0) || (y1 <= y0))
+        return;
+
+    /* past the right or the bottom edge of VRAM a read goes on at the other
+       side: up to two ranges each way */
+    uint32_t xs[2][2], ys[2][2];
+    int nx = 1, ny = 1;
+
+    if ((x1 - x0) >= 1024u)
+    {
+        x0 = 0;
+        x1 = 1024u;
+    }
+
+    x0 &= 0x3ffu;
+    x1 = x0 + ((x1 - x0) & 0x7ffu);
+
+    xs[0][0] = x0;
+    xs[0][1] = (x1 > 1024u) ? 1024u : x1;
+
+    if (x1 > 1024u)
+    {
+        xs[1][0] = 0;
+        xs[1][1] = x1 - 1024u;
+        nx = 2;
+    }
+
+    if ((y1 - y0) >= 512u)
+    {
+        y0 = 0;
+        y1 = 512u;
+    }
+
+    y0 &= 0x1ffu;
+    y1 = y0 + ((y1 - y0) & 0x3ffu);
+
+    ys[0][0] = y0;
+    ys[0][1] = (y1 > 512u) ? 512u : y1;
+
+    if (y1 > 512u)
+    {
+        ys[1][0] = 0;
+        ys[1][1] = y1 - 512u;
+        ny = 2;
+    }
+
+    for (int i = 0; i < nx; i++)
+        for (int j = 0; j < ny; j++)
+            if (gpu_rect_in_window(gpu, xs[i][0], ys[j][0], xs[i][1], ys[j][1], 0))
+            {
+                gpu->field_reads = 1;
+                gpu_update_hidden(gpu);
+
+                return;
+            }
+}
+
+/* the same for a textured primitive: texels u0..u1, v0..v1 of the page at
+   (tpx, tpy) of the given depth, and its palette */
+static inline void gpu_field_read_tex(psx_gpu_t *gpu, uint32_t tpx, uint32_t tpy, uint32_t depth, uint32_t clut,
+                                      uint32_t u0, uint32_t u1, uint32_t v0, uint32_t v1)
+{
+    /* which halfword of the page texel u is in: u >> 2, 1, 0 - the reserved
+       depth 3 is read as 4, 8 or 15 bit depending on the loop, so all of them */
+    const uint32_t shift_lo = (depth == 0) ? 2u : ((depth == 1) ? 1u : ((depth == 2) ? 0u : 2u));
+    const uint32_t shift_hi = (depth == 0) ? 2u : ((depth == 1) ? 1u : 0u);
+
+    if (gpu->texw_mx || gpu->texw_my)
+    {
+        u0 = 0;
+        u1 = 255;
+        v0 = 0;
+        v1 = 255;
+    }
+
+    gpu_field_read(gpu, tpx + (u0 >> shift_lo), tpy + v0, tpx + (u1 >> shift_hi) + 1u, tpy + v1 + 1u);
+
+    if (depth != 2)
+    {
+        const uint32_t cx = (clut & 0x3fu) << 4;
+        const uint32_t cy = (clut >> 6) & 0x1ffu;
+
+        gpu_field_read(gpu, cx, cy, cx + ((depth == 0) ? 16u : 256u), cy + 1u);
+    }
+}
+
+void psx_gpu_set_one_field(psx_gpu_t *gpu, int32_t on)
+{
+    gpu->one_field = on ? 1 : 0;
+
+    gpu_update_hidden(gpu);
+}
+
 /* Polygons, lines and rectangles are clipped to the drawing area, so whether
    they can show is a property of that area and of the display window - worked
    out when either changes instead of once per primitive. The rows of the window
@@ -424,6 +576,12 @@ static inline void gpu_update_draw_visible(psx_gpu_t *gpu)
 
     gpu->vis_y0 = (uint16_t)gpu->disp_y;
     gpu->vis_y1 = (uint16_t)(gpu->disp_y + h);
+
+    gpu->draw_in_window = (gpu->draw_ry1 <= gpu->draw_ry2) &&
+                          gpu_rect_inside_window(gpu, gpu->draw_x1, (uint32_t)gpu->draw_ry1, gpu->draw_x2 + 1u,
+                                                 (uint32_t)gpu->draw_ry2 + 1u);
+
+    gpu_update_hidden(gpu);
 }
 
 /*
@@ -445,6 +603,12 @@ static inline void gpu_update_field(psx_gpu_t *gpu)
         gpu->skip_rows = (int32_t)((gpu->disp_y + (uint32_t)gpu->field) & 1u);
     else
         gpu->skip_rows = -1;
+
+    /* no 480 line picture any more: fields may be left out again (gpu_update_hidden) */
+    if ((gpu->display_mode & 0x24u) != 0x24u)
+        gpu->field_reads = 0;
+
+    gpu_update_hidden(gpu);
 }
 
 /* A polygon or a rectangle is about to draw into rows [y0, y1) of VRAM, which
@@ -475,7 +639,7 @@ static inline void gpu_note_cmd(psx_gpu_t *gpu)
        (gpu_prim_rows); lines are rare enough to count as the whole picture */
     if ((cmd >= 0x20u) && (cmd < 0x80u))
     {
-        if ((cmd >= 0x40u) && (cmd < 0x60u) && gpu->draw_visible)
+        if ((cmd >= 0x40u) && (cmd < 0x60u) && gpu->draw_visible && !gpu->skip_prims)
         {
             if (!gpu->vram_dirty)
                 PROF_INC(dirty_draw);
@@ -2265,6 +2429,18 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
 
 PSX_GPU_RAS void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, poly_data_t data, int edge)
 {
+    /* the field nobody sees (gpu_update_hidden) */
+    if (gpu->field_guard)
+    {
+        if (data.attrib & PA_TEXTURED)
+            gpu_field_read_tex(gpu, (data.texp & 0xfu) << 6, (data.texp & 0x10u) << 4, (data.texp >> 7) & 3u,
+                               data.clut, min3(v0.tx, v1.tx, v2.tx), max3(v0.tx, v1.tx, v2.tx),
+                               min3(v0.ty, v1.ty, v2.ty), max3(v0.ty, v1.ty, v2.ty));
+
+        if (gpu->skip_prims)
+            return;
+    }
+
 #if PSX_GPU_EXTERNAL_RASTER
     if (psx_raster_triangle(gpu, v0, v1, v2, data))
     {
@@ -2291,6 +2467,26 @@ PSX_GPU_RAS void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, v
 
 PSX_GPU_RAS void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
 {
+    /* the field nobody sees (gpu_update_hidden) */
+    if (gpu->field_guard)
+    {
+        if (data.attrib & RA_TEXTURED)
+        {
+            /* texels from (tx, ty) on, as many as the rectangle is big - all of
+               the page when that runs past its end */
+            const uint32_t u0 = data.v0.tx, v0 = data.v0.ty;
+            const uint32_t u1 = (u0 + data.width > 256u) ? 255u : (u0 + data.width - 1u);
+            const uint32_t v1 = (v0 + data.height > 256u) ? 255u : (v0 + data.height - 1u);
+
+            if (data.width && data.height)
+                gpu_field_read_tex(gpu, gpu->texp_x, gpu->texp_y, gpu->texp_d, data.clut,
+                                   (u1 == 255u) ? 0u : u0, u1, (v1 == 255u) ? 0u : v0, v1);
+        }
+
+        if (gpu->skip_prims)
+            return;
+    }
+
 #if PSX_GPU_EXTERNAL_RASTER
     if (data.width && data.height && psx_raster_rect(gpu, data))
     {
@@ -2600,6 +2796,10 @@ PSX_GPU_HOT void plotLine(psx_gpu_t *gpu, int x0, int y0, int x1, int y1, uint16
 
 PSX_GPU_HOT void gpu_render_flat_line(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, uint32_t color)
 {
+    /* the field nobody sees (gpu_update_hidden); lines are clipped to the drawing area too */
+    if (gpu->skip_prims)
+        return;
+
 #if PSX_GPU_EXTERNAL_RASTER
     if (psx_raster_line(gpu, v0, v1, (uint16_t)color, 0))
     {
@@ -3910,6 +4110,7 @@ PSX_GPU_HOT void gpu_cmd_c0(psx_gpu_t *gpu)
             c0_ypos = c0_ypos & 0x1ff;
             gpu->c0_xsiz = ((gpu->c0_xsiz - 1) & 0x3ff) + 1;
             gpu->c0_ysiz = ((gpu->c0_ysiz - 1) & 0x1ff) + 1;
+            gpu_field_read(gpu, c0_xpos, c0_ypos, c0_xpos + (uint32_t)gpu->c0_xsiz, c0_ypos + (uint32_t)gpu->c0_ysiz);
             PSX_RASTER_SYNC();
             PSX_VRAM_CPU_READ(gpu, c0_ypos, (uint32_t)gpu->c0_ysiz);
 #if PSX_GPU_EXTERNAL_RASTER
@@ -3953,6 +4154,16 @@ PSX_GPU_HOT void gpu_cmd_02(psx_gpu_t *gpu)
             gpu->v0.y = gpu->v0.y & 0x1ff;
             gpu->xsiz = (((gpu->xsiz & 0x3ff) + 0x0f) & 0xfffffff0);
             gpu->ysiz = gpu->ysiz & 0x1ff;
+
+            /* the field nobody sees (gpu_update_hidden): inside the display
+               window a fill draws only into it */
+            if (gpu->field_hidden &&
+                gpu_rect_inside_window(gpu, gpu->v0.x, gpu->v0.y, gpu->v0.x + gpu->xsiz, gpu->v0.y + gpu->ysiz))
+            {
+                gpu->state = GPU_STATE_RECV_CMD;
+
+                return;
+            }
 
 #if PSX_GPU_EXTERNAL_RASTER
             if (psx_raster_fill(gpu, (int)gpu->v0.x, (int)gpu->v0.y, (int)gpu->xsiz, (int)gpu->ysiz,
@@ -4012,6 +4223,9 @@ PSX_GPU_HOT void gpu_cmd_80(psx_gpu_t *gpu)
             uint32_t dsty = gpu->buf[2] >> 16;
             uint32_t xsiz = gpu->buf[3] & 0xffff;
             uint32_t ysiz = gpu->buf[3] >> 16;
+
+            if (xsiz && ysiz)
+                gpu_field_read(gpu, srcx, srcy, srcx + xsiz, srcy + ysiz);
 
             PSX_VRAM_CPU_READ(gpu, srcy & 0x1ffu, ysiz);
 
