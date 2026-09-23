@@ -27,6 +27,7 @@
 #include "fsl_debug_console.h"
 #include "pin_mux.h"
 #include "clock_config.h"
+#include "overclock.h"
 #include "board.h"
 #include "fsl_gpio.h"
 #include "MIMXRT1052.h"
@@ -259,6 +260,11 @@ int main(void)
 //    CLOCK_SetDiv(kCLOCK_Usdhc1Div, 2);
 //    CLOCK_SetDiv(kCLOCK_Usdhc2Div, 2);
 
+    /* the core clock above the stock 600 MHz, and the voltage for it (overclock.c) */
+    const uint32_t core_mv = BOARD_SetCoreClock(PSXE_CPU_MHZ);
+
+    BOARD_TempStart();
+
     PRINTF("PSXE MCU Emulator Starting...\r\n");
 
     /* DWT cycle counter, used by the benchmarks and the profiler */
@@ -292,7 +298,9 @@ int main(void)
         PRINTF("SDRAM: %u core cycles per cache line fill, SDRAMCR0=%08x%s\r\n",
                (unsigned int)fill, (unsigned int)SEMC->SDRAMCR0, (fill > 400u) ? " - SLOW" : "");
     }
-    PRINTF("Initial Core Clock: %u Hz (%u MHz)\r\n", (unsigned int)SystemCoreClock, (unsigned int)(SystemCoreClock / 1000000));
+    PRINTF("Initial Core Clock: %u Hz (%u MHz) at %u mV, IPG %u MHz, %d C\r\n", (unsigned int)SystemCoreClock,
+           (unsigned int)(SystemCoreClock / 1000000), (unsigned int)core_mv,
+           (unsigned int)(CLOCK_GetFreq(kCLOCK_IpgClk) / 1000000u), (int)BOARD_TempCelsius());
 
 /* Display architecture information */
 #ifdef __arm__

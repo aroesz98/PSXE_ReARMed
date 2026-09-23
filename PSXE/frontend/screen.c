@@ -32,6 +32,7 @@
 #include "fsl_pxp.h"
 #include "fsl_cache.h"
 #include "fsl_debug_console.h"
+#include "overclock.h"
 #include "../prof.h"
 #include "../jit/jit.h"
 #include "gamepad.h"
@@ -735,17 +736,18 @@ void psxe_screen_update(psxe_screen_t *screen)
 #endif
 
 #if PSX_PROFILE || PSXE_AUTOTEST
-            PRINTF("emu: %u kcyc/s (%u%% of PS1) | vbl/s: %u | fps: %u | jit blk=%u cmp=%u flush=%u inv=%u code=%uB hot=%uB/%u tier=%u int=%u disp=%u cold=%u\r\n",
-                   kcyc, (unsigned)((kcyc * 100u) / 33869u), vblanks, g_presented_frames,
+            PRINTF("emu: %u kcyc/s (%u%% of PS1) | vbl/s: %u | fps: %u | %dC | jit blk=%u cmp=%u flush=%u inv=%u code=%uB hot=%uB/%u tier=%u int=%u disp=%u cold=%u\r\n",
+                   kcyc, (unsigned)((kcyc * 100u) / 33869u), vblanks, g_presented_frames, (int)BOARD_TempCelsius(),
                    (unsigned)jit->blocks, (unsigned)jit->compiles, (unsigned)jit->flushes,
                    (unsigned)jit->invalidations, (unsigned)jit->code_used,
                    (unsigned)jit->hot_used, (unsigned)jit->hot_blocks, (unsigned)jit->retiers,
                    (unsigned)jit->interp_steps, (unsigned)jit->dispatches, (unsigned)jit->cold_dispatches);
 #else
             /* a character is 87 microseconds of blocking UART: the long line is 1.7%
-               of the machine, so the build that is meant to be played prints a short one */
-            PRINTF("emu: %u%% of PS1 | vbl/s: %u | fps: %u | jit blk=%u flush=%u\r\n",
-                   (unsigned)((kcyc * 100u) / 33869u), vblanks, g_presented_frames,
+               of the machine, so the build that is meant to be played prints a short one
+               (the core temperature is in it: the core runs above its rated clock, overclock.c) */
+            PRINTF("emu: %u%% of PS1 | vbl/s: %u | fps: %u | %dC | jit blk=%u flush=%u\r\n",
+                   (unsigned)((kcyc * 100u) / 33869u), vblanks, g_presented_frames, (int)BOARD_TempCelsius(),
                    (unsigned)jit->blocks, (unsigned)jit->flushes);
 #endif
 
