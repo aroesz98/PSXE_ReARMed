@@ -84,7 +84,7 @@ int is_pixel_set(psx_gpu_t *gpu, int x, int y) {
     if (x < 0 || x >= 1024 || y < 0 || y >= 512) {
         return 0;
     }
-    return gpu->vram[x + y * 1024] != 0;
+    return gpu->vram[PSX_VRAM_AT(x, y)] != 0;
 }
 
 // Helper to get pixel color from VRAM
@@ -92,7 +92,7 @@ uint16_t get_pixel_color(psx_gpu_t *gpu, int x, int y) {
     if (x < 0 || x >= 1024 || y < 0 || y >= 512) {
         return 0;
     }
-    return gpu->vram[x + y * 1024];
+    return gpu->vram[PSX_VRAM_AT(x, y)];
 }
 
 // Helper to count non-zero pixels in a rectangular region

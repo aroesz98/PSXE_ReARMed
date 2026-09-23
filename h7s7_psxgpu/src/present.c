@@ -34,6 +34,8 @@
 
 #include "nema_port.h"
 #include "present.h"
+#include "nema_raster.h"
+#include "psxe_link.h"
 
 LOG_MODULE_REGISTER(present, LOG_LEVEL_INF);
 
@@ -48,7 +50,7 @@ LOG_MODULE_REGISTER(present, LOG_LEVEL_INF);
 
 static uint16_t fb_mem[NFB][FB_W * FB_H] PSRAM_SECTION __aligned(64);
 static uint16_t stage[STAGE_W * STAGE_H] PSRAM_SECTION __aligned(64);
-static uint8_t cl_mem[8192] __aligned(32);
+static uint8_t cl_mem[65536] __aligned(32);
 static nema_cmdlist_t cl;
 
 extern const uint8_t font8x8_a1[768];
@@ -80,6 +82,7 @@ static int clear_pending;
 /* the picture the GPU is still scaling: it goes to the panel once the GPU is done,
    checked at every vertical blank, so the scaling overlaps the next frame's drawing */
 static void flip_queue(int i);
+static bool flip_pending(void);
 
 static int pending_fb = -1;
 static int32_t pending_id;
@@ -102,6 +105,17 @@ static void pending_poll(void)
 		return;
 	}
 	if (nema_port_cl_done(pending_id)) {
+		/*
+		    The LTDC takes the address of the next frame buffer at its own
+		    vertical blank, and only one flip can be armed at a time: arming
+		    another before the panel has taken the first would leave the first
+		    buffer queued for good, and after three pictures there would be
+		    none free to draw into. So the picture waits here until the panel
+		    has taken the one before it.
+		*/
+		if (flip_pending()) {
+			return;
+		}
 		st.gpu_us = k_cyc_to_us_floor32(k_cycle_get_32() - pending_since);
 		flip_queue(pending_fb);
 		pending_fb = -1;
@@ -116,9 +130,22 @@ static void pending_poll(void)
 
 static void pending_wait(void)
 {
-	if (pending_fb >= 0) {
-		(void)nema_port_wait_cl(pending_id);
+	if (pending_fb < 0) {
+		return;
+	}
+	(void)nema_port_wait_cl(pending_id);
+
+	/* ... and for the panel, which takes a flip every 16.7 ms */
+	const int64_t deadline = k_uptime_get() + 100;
+
+	while (pending_fb >= 0) {
 		pending_poll();
+		if ((pending_fb >= 0) && (k_uptime_get() > deadline)) {
+			fb_st[pending_fb] = FB_FREE;
+			pending_fb = -1;
+			st.skipped++;
+			break;
+		}
 	}
 }
 
@@ -165,6 +192,11 @@ static int pick_free_fb(void)
 }
 
 /* ---- init ----------------------------------------------------------------- */
+
+nema_cmdlist_t *present_cl(void)
+{
+	return &cl;
+}
 
 int present_init(void)
 {
@@ -218,6 +250,7 @@ int present_init(void)
 	(void)display_blanking_off(disp);
 	clear_pending = NFB;
 	direct_ok = probe_abgr1555();
+	psx_raster_init();
 	LOG_INF("NeoChrom %s, panel %dx%d", nema_get_sw_device_name(), FB_W, FB_H);
 	return 0;
 }
@@ -415,6 +448,10 @@ static bool probe_abgr1555(void)
 
 static uint32_t bench_pal[16] __nocache __aligned(32);
 
+/* the benchmark's numbers, in nanoseconds per triangle, also readable over SWD:
+   flat cpu/gpu, gouraud cpu/gpu, lut4 cpu/gpu */
+uint32_t g_bench_ns[6];
+
 static uint32_t xorshift(uint32_t *st)
 {
 	uint32_t x = *st;
@@ -428,17 +465,24 @@ static uint32_t xorshift(uint32_t *st)
 
 static void bench_prims(psx_gpu_t *gpu)
 {
-	enum { N = 2000, SZ = 24 };
+	/*
+	    What a PSX sized primitive really costs on this GPU: N of them into a
+	    command list large enough that it never wraps, so that the time the CPU
+	    spends building the commands (t_cpu) is apart from the time the GPU
+	    needs to draw them (t_gpu, measured from the submit). The software
+	    rasterizer this board runs costs 12.5 us for a textured triangle and
+	    30 us for a textured Gouraud one, so that is the mark to beat.
+	*/
+	enum { N = 500, SZ = 24 };
 	uint16_t *target = stage; /* 320x240, stride 640 */
 	uint32_t rs = 0x1234567u;
 	uint32_t t0, t_cpu, t_gpu;
-	char line[200];
+	char line[220];
 	size_t n = 0;
 
 	for (int i = 0; i < 16; i++) {
 		bench_pal[i] = 0xff000000u | ((uint32_t)(i * 16) << 16) | ((uint32_t)(255 - i * 16) << 8) | 0x55u;
 	}
-	/* something in the texture page */
 	for (uint32_t i = 0; i < 128u * 256u / 2u; i++) {
 		((uint32_t *)gpu->vram)[i] = xorshift(&rs);
 	}
@@ -448,6 +492,7 @@ static void bench_prims(psx_gpu_t *gpu)
 	nema_set_clip(0, 0, 320, 240);
 
 	/* flat */
+	nema_cl_rewind(&cl);
 	t0 = k_cycle_get_32();
 	nema_set_blend_fill(NEMA_BL_SRC);
 	for (int i = 0; i < N; i++) {
@@ -455,13 +500,17 @@ static void bench_prims(psx_gpu_t *gpu)
 
 		nema_fill_triangle(x, y, x + SZ, y + 3, x + 5, y + SZ, 0xff000000u | xorshift(&rs));
 	}
-	nema_cl_submit(&cl);
 	t_cpu = k_cycle_get_32() - t0;
+	t0 = k_cycle_get_32();
+	nema_cl_submit(&cl);
 	(void)nema_cl_wait(&cl);
 	t_gpu = k_cycle_get_32() - t0;
-	n += snprintf(line + n, sizeof(line) - n, " flat %u/%u us", k_cyc_to_us_floor32(t_cpu), k_cyc_to_us_floor32(t_gpu));
+	g_bench_ns[0] = k_cyc_to_ns_floor32(t_cpu) / N;
+	g_bench_ns[1] = k_cyc_to_ns_floor32(t_gpu) / N;
+	n += snprintf(line + n, sizeof(line) - n, " flat cpu %u ns gpu %u ns", g_bench_ns[0], g_bench_ns[1]);
 
 	/* Gouraud */
+	nema_cl_rewind(&cl);
 	t0 = k_cycle_get_32();
 	nema_enable_gradient(1);
 	nema_set_blend_fill(NEMA_BL_SRC);
@@ -473,13 +522,17 @@ static void bench_prims(psx_gpu_t *gpu)
 		nema_fill_triangle_f(x, y, x + SZ, y + 3, x + 5, y + SZ, 0xffffffffu);
 	}
 	nema_enable_gradient(0);
-	nema_cl_submit(&cl);
 	t_cpu = k_cycle_get_32() - t0;
+	t0 = k_cycle_get_32();
+	nema_cl_submit(&cl);
 	(void)nema_cl_wait(&cl);
 	t_gpu = k_cycle_get_32() - t0;
-	n += snprintf(line + n, sizeof(line) - n, " gouraud %u/%u us", k_cyc_to_us_floor32(t_cpu), k_cyc_to_us_floor32(t_gpu));
+	g_bench_ns[2] = k_cyc_to_ns_floor32(t_cpu) / N;
+	g_bench_ns[3] = k_cyc_to_ns_floor32(t_gpu) / N;
+	n += snprintf(line + n, sizeof(line) - n, " | gouraud cpu %u ns gpu %u ns", g_bench_ns[2], g_bench_ns[3]);
 
-	/* textured, 4 bit palette out of a 256x256 page of VRAM (stride 2048) */
+	/* textured, 4 bit palette out of a page of VRAM, bound once */
+	nema_cl_rewind(&cl);
 	t0 = k_cycle_get_32();
 	platform_invalidate_cache();
 	nema_bind_lut_tex((uintptr_t)gpu->vram, 256, 256, NEMA_L4, 2048, NEMA_FILTER_PS, (uintptr_t)bench_pal,
@@ -492,16 +545,20 @@ static void bench_prims(psx_gpu_t *gpu)
 		nema_blit_tri_uv(x, y, 1.f, x + SZ, y + 3, 1.f, x + 5, y + SZ, 1.f, u, v, u + 32.f, v + 4.f, u + 6.f,
 				 v + 32.f);
 	}
-	nema_cl_submit(&cl);
 	t_cpu = k_cycle_get_32() - t0;
+	t0 = k_cycle_get_32();
+	nema_cl_submit(&cl);
 	(void)nema_cl_wait(&cl);
 	t_gpu = k_cycle_get_32() - t0;
-	n += snprintf(line + n, sizeof(line) - n, " lut4 %u/%u us", k_cyc_to_us_floor32(t_cpu), k_cyc_to_us_floor32(t_gpu));
+	g_bench_ns[4] = k_cyc_to_ns_floor32(t_cpu) / N;
+	g_bench_ns[5] = k_cyc_to_ns_floor32(t_gpu) / N;
+	n += snprintf(line + n, sizeof(line) - n, " | lut4 cpu %u ns gpu %u ns", g_bench_ns[4], g_bench_ns[5]);
 
-	/* the same, with the texture page in the internal SRAM (the font buffer is too small: use the CL area's neighbour) */
-	LOG_INF("GPU primitives, %d of %dpx (CPU/total):%s", N, SZ, line);
+	LOG_INF("GPU per %dpx triangle, %d of them:%s", SZ, N, line);
 	memset(gpu->vram, 0, 256u * 2048u);
 	sys_cache_data_flush_range(gpu->vram, 256u * 2048u);
+	nema_cl_rewind(&cl);
+	nema_cl_bind_circular(&cl);
 }
 
 void present_bench(psx_gpu_t *gpu)
@@ -534,6 +591,7 @@ void present_text(const char *line1, const char *line2)
 
 void present_vblank(psx_gpu_t *gpu)
 {
+	psx_raster_sync(); /* the primitives of this frame, before it is shown */
 	pending_poll();
 
 	if (!gpu->vram_dirty) {
@@ -546,10 +604,6 @@ void present_vblank(psx_gpu_t *gpu)
 		pending_wait();
 	}
 
-	/* one field per frame: only when the rows we show were just drawn */
-	if ((gpu->skip_rows >= 0) && ((uint32_t)gpu->skip_rows != (gpu->disp_y & 1u))) {
-		return;
-	}
 
 	int fb = pick_free_fb();
 
@@ -588,10 +642,9 @@ void present_vblank(psx_gpu_t *gpu)
 		src_h = 1;
 	}
 
-	/* a field-drawing game: one field, parity of disp_y, scaled up */
-	const int32_t row_step = (gpu->skip_rows >= 0 && src_h > 240) ? 2 : 1;
-
-	src_h /= row_step;
+	/* every row is drawn here (nema_raster.c does not skip fields), so the
+	   picture is whole and goes out as it stands */
+	const int32_t row_step = 1;
 
 	/* repack: all of it when the window changed, else the rows that were drawn */
 	int32_t row0 = 0;
@@ -616,9 +669,13 @@ void present_vblank(psx_gpu_t *gpu)
 	staged_24 = is_24;
 	staged_step = row_step;
 
-	/* 15 bit pictures go to the GPU straight from VRAM (an even x start keeps the
-	   texture 4 byte aligned); 24 bit ones and a GPU without the format are repacked */
-	const bool direct = direct_ok && !is_24 && ((win_x & 1u) == 0u);
+	/* Everything this board drew is already in the GPU's own 16 bit format, so
+	   the window of VRAM is the texture and nothing is repacked. Only a 24 bit
+	   picture - full motion video, which the game uploads as packed bytes -
+	   still goes through the CPU. */
+	const bool direct = !is_24 && ((win_x & 1u) == 0u);
+
+	psx_raster_sync(); /* whatever is still queued belongs in this picture */
 
 	if (direct) {
 		if (row1 > row0 && !display_off) {
@@ -675,9 +732,8 @@ void present_vblank(psx_gpu_t *gpu)
 		const bool whole = ((scaled_w % src_w) == 0) && ((scaled_h % src_h) == 0);
 
 		if (direct) {
-			nema_bind_dst_tex((uintptr_t)fb_mem[fb], FB_W, FB_H, direct_dst_fmt, FB_W * 2);
 			nema_bind_src_tex((uintptr_t)(gpu->vram + win_x + (size_t)win_y * PSX_GPU_FB_WIDTH), src_w,
-					  src_h, direct_src_fmt, PSX_GPU_FB_STRIDE * row_step,
+					  src_h, NEMA_RGBA5551, PSX_GPU_FB_STRIDE * row_step,
 					  whole ? NEMA_FILTER_PS : NEMA_FILTER_BL);
 		} else {
 			nema_bind_src_tex((uintptr_t)stage, src_w, src_h, NEMA_RGB565, src_w * 2,
@@ -698,6 +754,112 @@ void present_vblank(psx_gpu_t *gpu)
 	st.src_w = (uint32_t)src_w;
 	st.src_h = (uint32_t)src_h;
 	st.mode = gpu->display_mode;
+}
+
+/* ---- the hybrid: the CPU board rasterized, this board shows ---------------------
+   The rows arrive in the PSX's own pixel format and are repacked to RGB565 for
+   the NeoChrom right out of the receive buffer, so a picture is read once and
+   written once. present_show() then scales it onto the panel. */
+
+void present_rows(const void *px, uint32_t w, uint32_t row, uint32_t rows, uint32_t stride,
+		  uint32_t flags)
+{
+	if (!w || (w > STAGE_W) || ((row + rows) > STAGE_H)) {
+		return;
+	}
+
+	/* the flip and the scaling of the picture before this one, while the rows
+	   of this one are still arriving */
+	pending_poll();
+
+	/* ... but the staging picture is what the GPU scales from: it must be done
+	   reading it before a row of the next picture goes in, or the panel gets
+	   rows of two pictures (the flip itself need not be waited for) */
+	if (pending_fb >= 0) {
+		(void)nema_port_wait_cl(pending_id);
+	}
+
+	const uint32_t t0 = k_cycle_get_32();
+	uint16_t *dst = stage + (size_t)row * w;
+
+	for (uint32_t i = 0; i < rows; i++) {
+		const uint8_t *s = (const uint8_t *)px + (size_t)i * stride;
+
+		if (flags & PSXE_FRAME_24BPP) {
+			repack_rgb24(s, (int32_t)w, 1, 1, dst + (size_t)i * w);
+		} else {
+			repack_bgr555((const uint16_t *)s, (int32_t)w, 1, 1, dst + (size_t)i * w);
+		}
+	}
+	sys_cache_data_flush_range(dst, (size_t)rows * w * 2u);
+	st.repack_acc += k_cycle_get_32() - t0;
+}
+
+void present_show(uint32_t w, uint32_t h, uint32_t flags, uint32_t mode)
+{
+	psx_raster_sync();  /* the picture is finished before it is shown */
+	pending_wait();     /* and the panel is one picture behind at most */
+
+	int fb = pick_free_fb();
+
+	if (fb < 0) {
+		st.skipped++;
+		return;
+	}
+
+	const uint32_t t0 = k_cycle_get_32();
+	const bool blank = (flags & PSXE_FRAME_BLANK) != 0u;
+
+	if (!w || !h || (w > STAGE_W) || (h > STAGE_H)) {
+		return;
+	}
+
+	/* 4:3 into the panel, as the local presenter does */
+	const int32_t scaled_h = FB_H;
+	const int32_t scaled_w = (FB_H * 4) / 3;
+	const int32_t x_off = (FB_W - scaled_w) / 2;
+
+	if (((int32_t)w != last_scaled_w) || ((int32_t)h != last_scaled_h)) {
+		last_scaled_w = (int32_t)w;
+		last_scaled_h = (int32_t)h;
+		clear_pending = NFB;
+		LOG_INF("picture %ux%u%s mode %03x -> %dx%d", w, h,
+			(flags & PSXE_FRAME_24BPP) ? " 24bpp" : "", mode, scaled_w, scaled_h);
+	}
+
+	nema_bind_dst_tex((uintptr_t)fb_mem[fb], FB_W, FB_H, NEMA_RGB565, FB_W * 2);
+	nema_set_clip(0, 0, FB_W, FB_H);
+	if (clear_pending > 0) {
+		clear_pending--;
+		nema_set_blend_fill(NEMA_BL_SRC);
+		nema_clear(nema_rgba(0, 0, 0, 255));
+	}
+	if (blank) {
+		nema_set_blend_fill(NEMA_BL_SRC);
+		nema_fill_rect(x_off, 0, scaled_w, scaled_h, nema_rgba(0, 0, 0, 255));
+	} else {
+		platform_invalidate_cache();
+
+		const bool whole = ((scaled_w % (int32_t)w) == 0) && ((scaled_h % (int32_t)h) == 0);
+
+		nema_bind_src_tex((uintptr_t)stage, w, h, NEMA_RGB565, (int32_t)w * 2,
+				  whole ? NEMA_FILTER_PS : NEMA_FILTER_BL);
+		nema_set_blend_blit(NEMA_BL_SRC);
+		nema_blit_subrect_fit(x_off, 0, scaled_w, scaled_h, 0, 0, (int)w, (int)h);
+	}
+	nema_cl_submit(&cl);
+	fb_st[fb] = FB_BUSY;
+	pending_fb = fb;
+	pending_id = cl.submission_id;
+	pending_since = k_cycle_get_32();
+
+	st.frames++;
+	st.repack_us = k_cyc_to_us_floor32(st.repack_acc);
+	st.cpu_us_acc += k_cyc_to_us_floor32(st.repack_acc + (pending_since - t0));
+	st.repack_acc = 0;
+	st.src_w = w;
+	st.src_h = h;
+	st.mode = mode;
 }
 
 void present_get_stats(struct present_stats *out)

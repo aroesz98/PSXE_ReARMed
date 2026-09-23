@@ -148,9 +148,28 @@ typedef struct
 {
     uint32_t ram;   /* r6  */
     uint32_t pages; /* r7  */
+    uint32_t links; /* r8  */
     uint32_t exit;  /* r10 */
     uint32_t helpers[PSX_JIT_H_COUNT];
 } psx_jit_regs_t;
+
+/*
+    Register jumps (JR / JALR, mostly function returns) find their block here
+    without going back to the dispatcher: guest pc -> link offset, direct
+    mapped. An entry stays right for as long as the link exists, which is until
+    the whole code cache is emptied - a block that was invalidated keeps its
+    link, which then leads out - so only psx_jit_reset() clears it.
+*/
+#define PSX_JIT_JRC_BITS 7u
+#define PSX_JIT_JRC_SIZE (1u << PSX_JIT_JRC_BITS)
+
+typedef struct
+{
+    uint32_t pc;     /* 1: empty (no guest pc is odd) */
+    uint32_t offset; /* of the link */
+} psx_jit_jrc_t;
+
+static psx_jit_jrc_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) g_jit_jrc[PSX_JIT_JRC_SIZE];
 
 static psx_jit_regs_t __attribute__((section(".bss.$SRAM_DTC"))) g_jit_regs;
 
@@ -177,51 +196,56 @@ static uint32_t g_jit_cycles;
 
 /*
     Runs translated code: sets up the registers every block relies on and jumps
-    to `code`. Blocks hand over to one another without coming back; whichever
-    block stops - out of budget, a register jump, a miss - returns to
-    psx_jit_block_exit through r10, and r5 is the emulated cycles of all of them.
+    to `code` (behind the budget test the block starts with). Blocks hand over
+    to one another without coming back; whichever block stops - out of budget,
+    a miss, a helper that leaves - returns to psx_jit_block_exit through r10.
+    r5 counts the slice down, so what the blocks used is the budget (kept on the
+    stack) minus r5.
 
     psx_jit_exit_link is the way out for a block that would have jumped into
-    another one but may not (the budget is used up) or cannot (the link has no
-    code): r3 is that link, and since a jump from block to block publishes
-    nothing, the guest pc the link stands for is stored here, on the way out.
+    another one but may not (the budget is used up: the budget test of that
+    block sends it here) or cannot (the link has no code): r3 is the offset of
+    that link, and since a jump from block to block publishes nothing, the guest
+    pc the link stands for is stored here, on the way out.
 */
 uint32_t psx_jit_enter(psx_cpu_t *cpu, uint32_t code, uint32_t budget, const psx_jit_regs_t *regs);
 void psx_jit_block_exit(void);
 void psx_jit_exit_link(void);
 
 _Static_assert((offsetof(psx_cpu_t, pc) == 132u) && (offsetof(psx_cpu_t, next_pc) == 136u),
-               "psx_jit_exit_link stores pc / next_pc at fixed offsets");
-_Static_assert(PSX_JIT_H_PC_DELTA == 40u, "psx_jit_exit_link reads the delta from [r9, #40]");
+               "the stubs store pc / next_pc at fixed offsets");
+_Static_assert(PSX_JIT_H_PC_BASE == 44u, "psx_jit_exit_link reads the pc table from [r9, #44]");
+_Static_assert(offsetof(psx_jit_regs_t, helpers) == 16u, "the entry stub points r9 at regs + 16");
 
 __attribute__((naked, noinline, used, section(".ramfunc.$SRAM_ITC")))
 uint32_t psx_jit_enter(psx_cpu_t *cpu, uint32_t code, uint32_t budget, const psx_jit_regs_t *regs)
 {
     __asm__(
-        "push {r4-r10, lr}\n"
+        "push {r2, r4-r11, lr}\n"
         "mov r4, r0\n"
-        "movs r5, #0\n"
-        "mov r8, r2\n"
+        "mov r5, r2\n"
         "ldr r6, [r3, #0]\n"
         "ldr r7, [r3, #4]\n"
-        "ldr r10, [r3, #8]\n"
-        "add r9, r3, #12\n"
+        "ldr r8, [r3, #8]\n"
+        "ldr r10, [r3, #12]\n"
+        "add r9, r3, #16\n"
         "bx r1\n"
         ".balign 4\n"
         ".global psx_jit_exit_link\n"
         ".thumb_func\n"
         ".type psx_jit_exit_link, %function\n"
         "psx_jit_exit_link:\n"
-        "ldr r0, [r9, #40]\n"
-        "ldr r0, [r3, r0]\n"
+        "ldr r0, [r9, #44]\n"
+        "ldr r0, [r0, r3]\n"
         "adds r1, r0, #4\n"
         "strd r0, r1, [r4, #132]\n"
         ".global psx_jit_block_exit\n"
         ".thumb_func\n"
         ".type psx_jit_block_exit, %function\n"
         "psx_jit_block_exit:\n"
-        "mov r0, r5\n"
-        "pop {r4-r10, pc}\n"
+        "ldr r0, [sp]\n"
+        "subs r0, r0, r5\n"
+        "pop {r2, r4-r11, pc}\n"
     );
 }
 
@@ -239,6 +263,34 @@ void psx_jit_clear_hist(void)
 {
     for (uint32_t i = 0; i < PSX_JIT_HIST_SIZE; i++)
         g_jit_hist[i] = 0;
+}
+
+/* Where the interpreted instructions are: a small table that keeps the guest
+   pcs seen most often (a slot is taken over once its count has decayed), for a
+   look through the probe. Diagnostic, like the histogram. */
+#define PSX_JIT_HIST_PCS 128u
+
+typedef struct
+{
+    uint32_t pc;
+    uint32_t count;
+} psx_jit_hist_pc_t;
+
+psx_jit_hist_pc_t __attribute__((section(".bss.$SRAM_DTC"), used)) g_jit_hist_pc[PSX_JIT_HIST_PCS];
+
+static inline void jit_hist_note_pc(uint32_t pc)
+{
+    psx_jit_hist_pc_t *const t = &g_jit_hist_pc[(pc >> 2) & (PSX_JIT_HIST_PCS - 1u)];
+
+    if (t->pc == pc)
+        t->count++;
+    else if (t->count)
+        t->count--;
+    else
+    {
+        t->pc = pc;
+        t->count = 1;
+    }
 }
 
 static inline void jit_hist_note(uint32_t opcode)
@@ -268,6 +320,7 @@ static inline uint32_t jit_after_interp(psx_cpu_t *cpu)
 
 #if PSX_JIT_HIST
     jit_hist_note(cpu->opcode);
+    jit_hist_note_pc(cpu->saved_pc);
 #endif
 
     if (cpu->pc != (cpu->saved_pc + 4u))
@@ -336,146 +389,149 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_load_at(p
     return jit_after_interp(cpu);
 }
 
-/*
-    Escape of a natively translated load or store whose address is not plain RAM:
-    what psx_jit_mem_fast below does not serve itself. A store into a page that
-    holds translated code is done here, everything else goes to the interpreter,
-    which does the device access or raises the address error.
-*/
-uint32_t __attribute__((used, section(".ramfunc.$SRAM_ITC"))) psx_jit_mem_escape(psx_cpu_t *cpu, uint32_t pc,
-                                                                                 uint32_t addr, uint32_t desc)
+/* where the branch a delay slot belongs to goes: r3 of the block, a link offset
+   or a guest pc */
+static inline uint32_t jit_branch_target(uint32_t r3, uint32_t is_link)
 {
-    const uint32_t size = PSX_JIT_MD_SIZE(desc);
+    return is_link ? g_jit_pc[r3 >> 2] : r3;
+}
 
-    /* A store into RAM only gets here because its page holds translated code.
-       Most of those hit the data that lives next to the code: written right
-       here, and whatever code it does overwrite is dropped. (With the cache
-       isolated the dispatcher interprets everything, so that never gets here.) */
-    if ((desc & PSX_JIT_MD_STORE) && !(addr & 0x1fe00000u) && !(addr & (size - 1u)))
+/*
+    The slow path of a natively translated load or store (PSX_JIT_H_MEM): what the
+    stub below does not serve itself - the scratchpad - comes here, with the
+    address, the stub's data (the PSX_JIT_MD_* description) and the block's r3.
+
+    Everything goes through the same bus functions the interpreter uses, so a
+    device sees exactly the same accesses. A misaligned address is run by the
+    interpreter (as a delay slot, with the branch pending, when it is one),
+    which raises the address error; the block leaves after that.
+
+    Returns the loaded value in the low word; the high word is 0 to go on in the
+    block, or 1 + the cycles to take off r5 on the way out.
+*/
+static inline uint64_t jit_slow_leave(uint32_t cycles)
+{
+    return (uint64_t)(cycles + 1u) << 32;
+}
+
+/* The guest pc of a PSX_JIT_H_MEM stub: the stub's BL leads to the block's
+   trampoline, which keeps the guest pc of the block's first instruction. */
+static inline uint32_t jit_stub_pc(const uint32_t *data, uint32_t desc)
+{
+    const uint16_t *const bl = (const uint16_t *)(const void *)data - 2;
+
+    const uint32_t h1 = bl[0];
+    const uint32_t h2 = bl[1];
+    const uint32_t s = (h1 >> 10) & 1u;
+    const uint32_t i1 = ~(((h2 >> 13) & 1u) ^ s) & 1u;
+    const uint32_t i2 = ~(((h2 >> 11) & 1u) ^ s) & 1u;
+
+    const uint32_t imm = (s << 24) | (i1 << 23) | (i2 << 22) | ((h1 & 0x3ffu) << 12) | ((h2 & 0x7ffu) << 1);
+    const int32_t off = ((int32_t)(imm << 7)) >> 7;
+
+    /* the BL's pc is the address of the data word */
+    const uint32_t *const tramp = (const uint32_t *)(uintptr_t)((uint32_t)(uintptr_t)data + (uint32_t)off);
+
+    return tramp[1] + PSX_JIT_MD_INDEX(desc) * 4u;
+}
+
+uint64_t __attribute__((used, section(".ramfunc.$SRAM_ITC"))) psx_jit_mem_slow(psx_cpu_t *cpu, uint32_t addr,
+                                                                              const uint32_t *data, uint32_t r3)
+{
+    const uint32_t desc = data[0];
+    const uint32_t pc = jit_stub_pc(data, desc);
+    const uint32_t size = PSX_JIT_MD_SIZE(desc);
+    const uint32_t cycles = PSX_JIT_MD_CYCLES(desc);
+
+    psx_bus_t *const bus = cpu->bus;
+
+    g_jit_stats.slow_mem++;
+
+    if (addr & (size - 1u))
     {
-        const uint32_t phys = addr & 0x1fffffu;
-        uint8_t *const p = cpu->bus->ram->buf + phys;
+        /* An address error: the interpreter runs the instruction, and raises
+           it - as a delay slot, with the branch pending, when it is one. The
+           dispatcher could not be left to do it: it would run the same block
+           again. The instruction's cycles are the interpreter's. */
+        cpu->pc = pc;
+
+        if (desc & PSX_JIT_MD_DELAY)
+        {
+            cpu->next_pc = jit_branch_target(r3, desc & PSX_JIT_MD_LINK);
+            cpu->branch = 1;
+        }
+        else
+        {
+            cpu->next_pc = pc + 4u;
+        }
+
+        psx_cpu_cycle(cpu);
+
+        g_jit_cycles += cpu->last_cycles;
+        g_jit_stats.interp_steps++;
+
+        return jit_slow_leave(cycles);
+    }
+
+    if (desc & PSX_JIT_MD_STORE)
+    {
         const uint32_t v = cpu->r[PSX_JIT_MD_RT(desc)];
 
+        /* RAM gets here only because code was translated from where it goes:
+           the fast write invalidates it */
         if (size == 4u)
-            *(uint32_t *)p = v;
+            psx_bus_fast_write32(bus, addr, v);
         else if (size == 2u)
-            *(uint16_t *)p = (uint16_t)v;
+            psx_bus_fast_write16(bus, addr, v);
         else
-            *p = (uint8_t)v;
+            psx_bus_fast_write8(bus, addr, v);
 
-        if (g_jit_page_cells[phys >> PSX_JIT_PAGE_SHIFT] & jit_cell_mask(phys, size))
-            psx_jit_invalidate(phys, size);
+        g_jit_cycles += psx_bus_fast_take_cycles(bus);
 
-        /* no cycles to add: the block counts two for the instruction whichever
-           way the store went, and RAM has no bus delay on top of that */
+        /* A device register was written: the slice this block runs in was
+           sized from the devices' deadlines, and one of them may just have
+           moved closer. psx_update looks at it again before anything else
+           runs - the block leaves behind this instruction. */
+        if (g_psx_bus_io_written)
+        {
+            if (desc & PSX_JIT_MD_DELAY)
+            {
+                const uint32_t t = jit_branch_target(r3, desc & PSX_JIT_MD_LINK);
+
+                cpu->pc = t;
+                cpu->next_pc = t + 4u;
+            }
+            else
+            {
+                cpu->pc = pc + 4u;
+                cpu->next_pc = pc + 8u;
+            }
+
+            return jit_slow_leave(cycles + 2u);
+        }
+
         return 0u;
     }
 
-    if ((desc & PSX_JIT_MD_STORE) || (desc & PSX_JIT_MD_PENDING))
-        return psx_jit_interp_op_at(cpu, pc);
+    uint32_t v;
 
-    return psx_jit_interp_load_at(cpu, pc);
-}
+    if (size == 4u)
+        v = psx_bus_fast_read32(bus, addr);
+    else if (size == 2u)
+        v = (desc & PSX_JIT_MD_SIGNED) ? (uint32_t)(int32_t)(int16_t)psx_bus_fast_read16(bus, addr)
+                                       : (uint32_t)psx_bus_fast_read16(bus, addr);
+    else
+        v = (desc & PSX_JIT_MD_SIGNED) ? (uint32_t)(int32_t)(int8_t)psx_bus_fast_read8(bus, addr)
+                                       : (uint32_t)psx_bus_fast_read8(bus, addr);
 
-/*
-    What a block calls for an access that is not plain RAM (PSX_JIT_H_MEM): r0 cpu,
-    r1 guest pc, r2 guest address, r3 the PSX_JIT_MD_* description of the access.
+    g_jit_cycles += psx_bus_fast_take_cycles(bus);
 
-    Nearly all of those are the scratchpad - FF7 keeps its 3D working set there,
-    some 165 000 accesses a second in a battle - and that is memory like any
-    other. It used to be served by the C function above, at about 90 cycles a
-    time with the call, the decoding of the description and the way back; this
-    does an aligned scratchpad access in about twenty instructions and no stack,
-    and hands everything else on as it came. (Putting the test into the blocks
-    themselves would cost thirty bytes per load and store, and with them the
-    room the hot blocks have in the ITCM.)
-
-    The access costs the two cycles the block counts for any instruction, which
-    is what the interpreter charges: the scratchpad has no bus delay. The pending
-    load of a delay slot hazard goes into load_d / load_v, as the interpreter
-    leaves it.
-*/
-uint32_t psx_jit_mem_fast(psx_cpu_t *cpu, uint32_t pc, uint32_t addr, uint32_t desc);
-
-_Static_assert((offsetof(psx_cpu_t, load_d) == 152u) && (offsetof(psx_cpu_t, load_v) == 156u),
-               "psx_jit_mem_fast stores load_d / load_v at fixed offsets");
-_Static_assert(offsetof(psx_cpu_t, r) == 0u, "psx_jit_mem_fast indexes the guest registers from the cpu");
-_Static_assert(PSX_JIT_H_SPAD == 44u, "psx_jit_mem_fast reads the scratchpad address from [r9, #44]");
-_Static_assert((PSX_JIT_MD_STORE == 0x100u) && (PSX_JIT_MD_PENDING == 0x200u) && (PSX_JIT_MD_SIGNED == 0x80u),
-               "psx_jit_mem_fast tests these bits of the description");
-
-__attribute__((naked, noinline, used, section(".ramfunc.$SRAM_ITC")))
-uint32_t psx_jit_mem_fast(psx_cpu_t *cpu, uint32_t pc, uint32_t addr, uint32_t desc)
-{
-    __asm__(
-        "bic r12, r2, #0xe0000000\n"
-        "sub r12, r12, #0x1f800000\n"
-        "cmp r12, #0x400\n"
-        "bhs 9f\n"
-        "tst r3, #0x60\n"
-        "beq 1f\n"
-        "tst r3, #0x40\n"
-        "ite ne\n"
-        "tstne r2, #3\n"
-        "tsteq r2, #1\n"
-        "bne 9f\n"
-        "1:\n"
-        "ldr r0, [r9, #44]\n"
-        "add r0, r0, r12\n"
-        "and r12, r3, #0x1f\n"
-        "tst r3, #0x100\n"
-        "bne 5f\n"
-        "tst r3, #0x40\n"
-        "beq 2f\n"
-        "ldr r1, [r0]\n"
-        "b 4f\n"
-        "2:\n"
-        "tst r3, #0x20\n"
-        "beq 3f\n"
-        "tst r3, #0x80\n"
-        "ite ne\n"
-        "ldrshne r1, [r0]\n"
-        "ldrheq r1, [r0]\n"
-        "b 4f\n"
-        "3:\n"
-        "tst r3, #0x80\n"
-        "ite ne\n"
-        "ldrsbne r1, [r0]\n"
-        "ldrbeq r1, [r0]\n"
-        "4:\n"
-        "tst r3, #0x200\n"
-        "bne 6f\n"
-        "cmp r12, #0\n"
-        "it ne\n"
-        "strne r1, [r4, r12, lsl #2]\n"
-        "b 8f\n"
-        "6:\n"
-        "strd r12, r1, [r4, #152]\n"
-        "b 8f\n"
-        "5:\n"
-        "ldr r1, [r4, r12, lsl #2]\n"
-        "tst r3, #0x40\n"
-        "beq 7f\n"
-        "str r1, [r0]\n"
-        "b 8f\n"
-        "7:\n"
-        "tst r3, #0x20\n"
-        "ite ne\n"
-        "strhne r1, [r0]\n"
-        "strbeq r1, [r0]\n"
-        "8:\n"
-        "movs r0, #0\n"
-        "bx lr\n"
-        "9:\n"
-        "mov r0, r4\n"
-        "b psx_jit_mem_escape\n"
-    );
+    return v;
 }
 
 /* LWC2 / SWC2 */
-uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_gte_transfer(psx_cpu_t *cpu, uint32_t pc,
-                                                                             uint32_t opcode)
+uint32_t __attribute__((used, section(".ramfunc.$SRAM_ITC"))) psx_jit_gte_transfer(psx_cpu_t *cpu, uint32_t pc,
+                                                                                  uint32_t opcode)
 {
     const uint32_t diverged = psx_cpu_gte_transfer(cpu, pc, opcode);
 
@@ -488,11 +544,75 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_gte_transfer(psx
     return g_psx_bus_io_written ? 1u : 0u;
 }
 
+void psx_jit_interp_delay(psx_cpu_t *cpu, uint32_t pc, uint32_t next_pc);
+
+/*
+    The slow path of a natively translated LWC2 / SWC2 (PSX_JIT_H_GTE_MEM): r0 of
+    the block is the address, the data the pc (with PSX_JIT_GF_* in the low
+    bits) and the opcode. An aligned transfer of a plain register to or from
+    the scratchpad is done right here and the block goes on; everything else is
+    the interpreter's, and in a delay slot that leaves the block. Returns non zero
+    to leave.
+*/
+uint32_t __attribute__((used, section(".ramfunc.$SRAM_ITC"))) psx_jit_gte_slow(psx_cpu_t *cpu, uint32_t addr,
+                                                                              const uint32_t *data, uint32_t r3)
+{
+    const uint32_t pc = data[0] & ~3u;
+    const uint32_t flags = data[0] & 3u;
+    const uint32_t opcode = data[1];
+
+    const uint32_t a = psx_bus_fast_mask(addr);
+
+    if (!(addr & 3u) && ((a - PSX_SPAD_FAST_BASE) < PSX_SPAD_FAST_SIZE))
+    {
+        const psx_jit_gte_reg_t *const g = &g_psx_jit_gte_regs[PSX_RT(opcode)];
+        uint8_t *const p = cpu->bus->scratchpad->buf + (a - PSX_SPAD_FAST_BASE);
+        uint8_t *const f = (uint8_t *)cpu + g->off;
+
+        if ((opcode >> 26) == 0x32u) /* LWC2 */
+        {
+            if (g->wr != PSX_GTE_WR_CALL)
+            {
+                const uint32_t v = *(const uint32_t *)p;
+
+                if (g->wr == PSX_GTE_WR_32)
+                    *(uint32_t *)f = v;
+                else if (g->wr == PSX_GTE_WR_16)
+                    *(uint16_t *)f = (uint16_t)v;
+
+                return 0u;
+            }
+        }
+        else if (g->rd != PSX_GTE_RD_CALL) /* SWC2 */
+        {
+            uint32_t v;
+
+            if (g->rd == PSX_GTE_RD_32)
+                v = *(const uint32_t *)f;
+            else if (g->rd == PSX_GTE_RD_S16)
+                v = (uint32_t)(int32_t) * (const int16_t *)f;
+            else
+                v = *(const uint16_t *)f;
+
+            *(uint32_t *)p = v;
+
+            return 0u;
+        }
+    }
+
+    if (!(flags & PSX_JIT_GF_DELAY))
+        return psx_jit_gte_transfer(cpu, pc, opcode);
+
+    psx_jit_interp_delay(cpu, pc, jit_branch_target(r3, flags & PSX_JIT_GF_LINK));
+
+    return 1u;
+}
+
 /* A delay slot the block could not run natively after all: the interpreter runs
    it with the branch pending, and leaves pc at the target (or at an exception
    vector). The block ends right after, so there is nothing to report. */
-void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_delay(psx_cpu_t *cpu, uint32_t pc,
-                                                                         uint32_t next_pc)
+void __attribute__((used, section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_delay(psx_cpu_t *cpu, uint32_t pc,
+                                                                              uint32_t next_pc)
 {
     cpu->pc = pc;
     cpu->next_pc = next_pc;
@@ -505,8 +625,242 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_interp_delay(psx_cpu
 
 #if PSX_JIT_HIST
     jit_hist_note(cpu->opcode);
+    jit_hist_note_pc(cpu->saved_pc);
 #endif
 }
+
+/* PSX_JIT_H_BHOOK: what the interpreter does when it fetches from 0xb4 */
+void __attribute__((used, section(".ramfunc.$SRAM_ITC"))) psx_jit_b_hook(psx_cpu_t *cpu)
+{
+    if (cpu->b_function_hook)
+        cpu->b_function_hook(cpu);
+}
+
+uint32_t psx_jit_jr_miss(uint32_t pc);
+
+/*
+    The helper stubs. A block calls them through r9 with data words behind the
+    call (lr points at them, plus the Thumb bit); they return behind the data,
+    or - when the C function says so - leave the block through r10 themselves,
+    which is why the block does not test anything after a call. r3 survives
+    them: in a branch delay slot it says where the branch goes.
+*/
+_Static_assert((PSX_JIT_H_SPAD == 48u) && (PSX_JIT_H_JRC == 52u), "the stubs read [r9, #48] / [r9, #52]");
+_Static_assert((PSX_JIT_MD_STORE == 0x100u) && (PSX_JIT_MD_SIGNED == 0x80u), "psx_jit_mem_stub tests these bits");
+_Static_assert(PSX_JIT_JRC_BITS == 7u, "psx_jit_jr takes seven bits of the pc");
+_Static_assert(sizeof(psx_jit_jrc_t) == 8u, "psx_jit_jr indexes the cache by eight");
+
+__attribute__((naked, noinline, used, section(".ramfunc.$SRAM_ITC"))) void psx_jit_stubs(void)
+{
+    __asm__(
+        /* H_INTERP: no data */
+        ".global psx_jit_interp_stub\n"
+        ".thumb_func\n"
+        ".type psx_jit_interp_stub, %function\n"
+        "psx_jit_interp_stub:\n"
+        "push {r3, lr}\n"
+        "mov r0, r4\n"
+        "ldr r12, =psx_jit_interp_op\n"
+        "blx r12\n"
+        "pop {r3, lr}\n"
+        "cbnz r0, 1f\n"
+        "bx lr\n"
+        "1:\n"
+        "bx r10\n"
+
+        /* H_INTERP_AT / H_LOAD_AT: .word pc */
+        ".balign 4\n"
+        ".global psx_jit_interp_at_stub\n"
+        ".thumb_func\n"
+        ".type psx_jit_interp_at_stub, %function\n"
+        "psx_jit_interp_at_stub:\n"
+        "ldr r12, =psx_jit_interp_op_at\n"
+        "b 2f\n"
+        ".global psx_jit_load_at_stub\n"
+        ".thumb_func\n"
+        ".type psx_jit_load_at_stub, %function\n"
+        "psx_jit_load_at_stub:\n"
+        "ldr r12, =psx_jit_interp_load_at\n"
+        "2:\n"
+        "push {r3, lr}\n"
+        "ldr r1, [lr, #-1]\n"
+        "mov r0, r4\n"
+        "blx r12\n"
+        "pop {r3, lr}\n"
+        "cbnz r0, 1f\n"
+        "add lr, lr, #4\n"
+        "bx lr\n"
+        "1:\n"
+        "bx r10\n"
+
+        /* H_DELAY: .word pc, .word flags; never comes back */
+        ".balign 4\n"
+        ".global psx_jit_delay_stub\n"
+        ".thumb_func\n"
+        ".type psx_jit_delay_stub, %function\n"
+        "psx_jit_delay_stub:\n"
+        "ldr r1, [lr, #-1]\n"
+        "ldr r12, [lr, #3]\n"
+        "mov r2, r3\n"
+        "tst r12, #1\n"
+        "beq 1f\n"
+        "ldr r2, [r9, #44]\n"
+        "ldr r2, [r2, r3]\n"
+        "1:\n"
+        "mov r0, r4\n"
+        "ldr r12, =psx_jit_interp_delay\n"
+        "blx r12\n"
+        "bx r10\n"
+
+        /* H_GTE_MEM: r0 guest address, .word pc | PSX_JIT_GF_*, .word opcode */
+        ".balign 4\n"
+        ".global psx_jit_gte_mem_stub\n"
+        ".thumb_func\n"
+        ".type psx_jit_gte_mem_stub, %function\n"
+        "psx_jit_gte_mem_stub:\n"
+        "push {r3, lr}\n"
+        "mov r1, r0\n"
+        "sub r2, lr, #1\n"
+        "mov r0, r4\n"
+        "ldr r12, =psx_jit_gte_slow\n"
+        "blx r12\n"
+        "pop {r3, lr}\n"
+        "cbnz r0, 1f\n"
+        "add lr, lr, #8\n"
+        "bx lr\n"
+        "1:\n"
+        "bx r10\n"
+
+        /*
+            H_MEM: r0 guest address, .word desc. The scratchpad - FF7
+            keeps its 3D working set there, some 165 000 accesses a second in a
+            battle - is served right here in about twenty instructions and no
+            stack; everything else goes to psx_jit_mem_slow. Back to the block
+            (desc >> 22) halfwords before the end of the word, a loaded value
+            in r2.
+        */
+        ".balign 4\n"
+        ".global psx_jit_mem_stub\n"
+        ".thumb_func\n"
+        ".type psx_jit_mem_stub, %function\n"
+        "psx_jit_mem_stub:\n"
+        "ldr r12, [lr, #-1]\n"
+        "bic r1, r0, #0xe0000000\n"
+        "sub r1, r1, #0x1f800000\n"
+        "cmp r1, #0x400\n"
+        "bhs 9f\n"
+        "tst r12, #0x40\n"
+        "it ne\n"
+        "tstne r0, #3\n"
+        "bne 9f\n"
+        "tst r12, #0x20\n"
+        "it ne\n"
+        "tstne r0, #1\n"
+        "bne 9f\n"
+        "ldr r2, [r9, #48]\n"
+        "add r1, r1, r2\n"
+        "tst r12, #0x100\n"
+        "bne 5f\n"
+        "tst r12, #0x40\n"
+        "bne 3f\n"
+        "tst r12, #0x20\n"
+        "bne 4f\n"
+        "tst r12, #0x80\n"
+        "ite ne\n"
+        "ldrsbne r2, [r1]\n"
+        "ldrbeq r2, [r1]\n"
+        "b 8f\n"
+        "3:\n"
+        "ldr r2, [r1]\n"
+        "b 8f\n"
+        "4:\n"
+        "tst r12, #0x80\n"
+        "ite ne\n"
+        "ldrshne r2, [r1]\n"
+        "ldrheq r2, [r1]\n"
+        "b 8f\n"
+        "5:\n"
+        "and r2, r12, #0x1f\n"
+        "ldr r2, [r4, r2, lsl #2]\n"
+        "tst r12, #0x40\n"
+        "bne 6f\n"
+        "tst r12, #0x20\n"
+        "ite ne\n"
+        "strhne r2, [r1]\n"
+        "strbeq r2, [r1]\n"
+        "b 8f\n"
+        "6:\n"
+        "str r2, [r1]\n"
+        "8:\n"
+        "lsr r12, r12, #22\n"
+        "add lr, lr, #4\n"
+        "sub lr, lr, r12, lsl #1\n"
+        "bx lr\n"
+        "9:\n"
+        "push {r3, lr}\n"
+        "sub r2, lr, #1\n"
+        "mov r1, r0\n"
+        "mov r0, r4\n"
+        "ldr r12, =psx_jit_mem_slow\n"
+        "blx r12\n"
+        "pop {r3, lr}\n"
+        "cbnz r1, 7f\n"
+        "mov r2, r0\n"
+        "ldr r12, [lr, #-1]\n"
+        "b 8b\n"
+        "7:\n"
+        "subs r1, r1, #1\n"
+        "subs r5, r5, r1\n"
+        "bx r10\n"
+
+        /*
+            H_JR, jumped to with a guest pc in r3 and the block's cycles already
+            taken off r5: the block there, through the cache above, without the
+            dispatcher. Its budget test gets the flags of CMP r5, #0 and r3 = its
+            link offset, like after any other jump.
+        */
+        ".balign 4\n"
+        ".global psx_jit_jr\n"
+        ".thumb_func\n"
+        ".type psx_jit_jr, %function\n"
+        "psx_jit_jr:\n"
+        "ldr r0, [r9, #52]\n"
+        "ubfx r1, r3, #2, #7\n"
+        "add r0, r0, r1, lsl #3\n"
+        "ldrd r1, r2, [r0]\n"
+        "cmp r1, r3\n"
+        "bne 1f\n"
+        "mov r3, r2\n"
+        "cmp r5, #0\n"
+        "ldr pc, [r8, r3]\n"
+        "1:\n"
+        "push {r0, r3}\n"
+        "mov r0, r3\n"
+        "ldr r12, =psx_jit_jr_miss\n"
+        "blx r12\n"
+        "pop {r1, r3}\n"
+        "cbz r0, 2f\n"
+        "subs r0, r0, #1\n"
+        "strd r3, r0, [r1]\n"
+        "mov r3, r0\n"
+        "cmp r5, #0\n"
+        "ldr pc, [r8, r3]\n"
+        "2:\n"
+        "adds r0, r3, #4\n"
+        "strd r3, r0, [r4, #132]\n"
+        "bx r10\n"
+        ".ltorg\n"
+    );
+}
+
+void psx_jit_interp_stub(void);
+void psx_jit_interp_at_stub(void);
+void psx_jit_load_at_stub(void);
+void psx_jit_delay_stub(void);
+void psx_jit_gte_mem_stub(void);
+void psx_jit_mem_stub(void);
+void psx_jit_jr(void);
+
 
 /* ------------------------------------------------------------------ lookup */
 
@@ -564,6 +918,28 @@ static uint32_t jit_get_block(uint32_t pc)
     return i;
 }
 
+/*
+    A register jump whose target is not in the cache of psx_jit_jr: the link
+    offset + 1 of the block there, made a link if there was none yet, or 0 when
+    the dispatcher has to see it (a pc code is never taken from, a misaligned
+    one, no room for another link).
+*/
+uint32_t __attribute__((used, section(".ramfunc.$SRAM_ITC"))) psx_jit_jr_miss(uint32_t pc)
+{
+    const uint32_t phys = pc & 0x1fffffffu;
+
+    if ((pc & 3u) || ((phys >= 0x00200000u) && ((phys < 0x1fc00000u) || (phys >= 0x1fc80000u))))
+        return 0;
+
+    /* the dispatcher's compile needs three links of room: leave them to it */
+    uint32_t i = jit_lookup(pc);
+
+    if (!i && ((g_jit_block_count + 4u) <= PSX_JIT_MAX_BLOCKS))
+        i = jit_get_block(pc);
+
+    return i ? ((i - 1u) * 4u + 1u) : 0u;
+}
+
 static inline void jit_data_words_forget(void);
 
 void psx_jit_reset(void)
@@ -572,6 +948,13 @@ void psx_jit_reset(void)
     memset(g_jit_page_head, 0, sizeof(g_jit_page_head));
     memset(g_jit_page_cells, 0, sizeof(g_jit_page_cells));
     memset(g_psx_jit_code_pages, 0, sizeof(g_psx_jit_code_pages));
+
+    /* the links are numbered afresh */
+    for (uint32_t i = 0; i < PSX_JIT_JRC_SIZE; i++)
+    {
+        g_jit_jrc[i].pc = 1u;
+        g_jit_jrc[i].offset = 0u;
+    }
 
     jit_data_words_forget();
 
@@ -596,19 +979,23 @@ void psx_jit_init(void)
     memset(&g_jit_regs, 0, sizeof(g_jit_regs));
 
     g_jit_regs.pages = (uint32_t)(uintptr_t)g_psx_jit_code_pages;
+    g_jit_regs.links = (uint32_t)(uintptr_t)g_jit_link;
     g_jit_regs.exit = (uint32_t)(uintptr_t)&psx_jit_block_exit | 1u;
 
-    g_jit_regs.helpers[PSX_JIT_H_INTERP / 4u] = (uint32_t)(uintptr_t)&psx_jit_interp_op;
-    g_jit_regs.helpers[PSX_JIT_H_INTERP_AT / 4u] = (uint32_t)(uintptr_t)&psx_jit_interp_op_at;
-    g_jit_regs.helpers[PSX_JIT_H_LOAD_AT / 4u] = (uint32_t)(uintptr_t)&psx_jit_interp_load_at;
-    g_jit_regs.helpers[PSX_JIT_H_DELAY / 4u] = (uint32_t)(uintptr_t)&psx_jit_interp_delay;
+    g_jit_regs.helpers[PSX_JIT_H_INTERP / 4u] = (uint32_t)(uintptr_t)&psx_jit_interp_stub | 1u;
+    g_jit_regs.helpers[PSX_JIT_H_INTERP_AT / 4u] = (uint32_t)(uintptr_t)&psx_jit_interp_at_stub | 1u;
+    g_jit_regs.helpers[PSX_JIT_H_LOAD_AT / 4u] = (uint32_t)(uintptr_t)&psx_jit_load_at_stub | 1u;
+    g_jit_regs.helpers[PSX_JIT_H_DELAY / 4u] = (uint32_t)(uintptr_t)&psx_jit_delay_stub | 1u;
     g_jit_regs.helpers[PSX_JIT_H_GTE / 4u] = (uint32_t)(uintptr_t)&psx_cpu_gte_command;
     g_jit_regs.helpers[PSX_JIT_H_GTE_READ / 4u] = (uint32_t)(uintptr_t)&psx_cpu_gte_read;
     g_jit_regs.helpers[PSX_JIT_H_GTE_WRITE / 4u] = (uint32_t)(uintptr_t)&psx_cpu_gte_write;
-    g_jit_regs.helpers[PSX_JIT_H_GTE_MEM / 4u] = (uint32_t)(uintptr_t)&psx_jit_gte_transfer;
-    g_jit_regs.helpers[PSX_JIT_H_MEM / 4u] = (uint32_t)(uintptr_t)&psx_jit_mem_fast;
+    g_jit_regs.helpers[PSX_JIT_H_GTE_MEM / 4u] = (uint32_t)(uintptr_t)&psx_jit_gte_mem_stub | 1u;
+    g_jit_regs.helpers[PSX_JIT_H_MEM / 4u] = (uint32_t)(uintptr_t)&psx_jit_mem_stub | 1u;
     g_jit_regs.helpers[PSX_JIT_H_EXIT_LINK / 4u] = (uint32_t)(uintptr_t)&psx_jit_exit_link | 1u;
-    g_jit_regs.helpers[PSX_JIT_H_PC_DELTA / 4u] = (uint32_t)(uintptr_t)g_jit_pc - (uint32_t)(uintptr_t)g_jit_link;
+    g_jit_regs.helpers[PSX_JIT_H_JR / 4u] = (uint32_t)(uintptr_t)&psx_jit_jr | 1u;
+    g_jit_regs.helpers[PSX_JIT_H_PC_BASE / 4u] = (uint32_t)(uintptr_t)g_jit_pc;
+    g_jit_regs.helpers[PSX_JIT_H_JRC / 4u] = (uint32_t)(uintptr_t)g_jit_jrc;
+    g_jit_regs.helpers[PSX_JIT_H_BHOOK / 4u] = (uint32_t)(uintptr_t)&psx_jit_b_hook;
 
     psx_jit_reset();
 
@@ -877,7 +1264,8 @@ static uint32_t jit_link_of(void *ud, uint32_t pc)
 
     const uint32_t i = jit_get_block(pc);
 
-    return i ? (uint32_t)(uintptr_t)&g_jit_link[i - 1u] : 0u;
+    /* the offset of the link in the table r8 points at, + 1 */
+    return i ? ((i - 1u) * 4u + 1u) : 0u;
 }
 
 /* Translates the block at pc; returns its index + 1, 0 when that failed */
@@ -931,7 +1319,6 @@ static uint32_t jit_compile(psx_cpu_t *cpu, uint32_t pc)
         ctx.e = &e;
         ctx.read32 = jit_read32;
         ctx.get_link = jit_link_of;
-        ctx.link_pc_delta = g_jit_regs.helpers[PSX_JIT_H_PC_DELTA / 4u];
         ctx.ud = cpu;
 
         ok = psx_jit_build_block(&ctx, pc, max_instr, PSX_JIT_PAGE_MASK, &info);
@@ -1176,7 +1563,10 @@ uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_jit_step(psx_cpu_t *
 
     g_jit_cycles = 0;
 
-    const uint32_t native_cycles = psx_jit_enter(cpu, g_jit_link[index - 1u].code, budget, &g_jit_regs);
+    /* in behind the budget test the block starts with: this block runs at
+       least once, whatever the budget */
+    const uint32_t native_cycles =
+        psx_jit_enter(cpu, g_jit_link[index - 1u].code + PSX_JIT_ENTRY_TEST_BYTES, budget, &g_jit_regs);
 
     /* Natively translated instructions never touch total_cycles, so the speed
        counters would only ever see the interpreted part of the work. */

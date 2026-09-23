@@ -65,6 +65,7 @@ target_sources(app PRIVATE
   src/main.c
   src/eth_raw.c
   src/present.c
+  src/nema_raster.c
   src/shim/psx_shim.c
   "${NEOCHROM_ROOT}/src/nema_hal_zephyr.c"
   "${NEOCHROM_ROOT}/src/font8x8.c"

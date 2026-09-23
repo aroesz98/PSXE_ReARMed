@@ -73,6 +73,7 @@ typedef struct
     uint32_t retiers;        /* times the ITCM tier was revised  */
     uint32_t dispatches;     /* blocks entered from the dispatcher */
     uint32_t cold_dispatches;/* of those, into a block running from SDRAM */
+    uint32_t slow_mem;       /* loads / stores through the slow path helper */
 } psx_jit_stats_t;
 
 /* Counts the instructions the fallback runs, per opcode class, so the next

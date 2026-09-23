@@ -7,6 +7,7 @@
 
 #if PSXE_GPU_REMOTE
 #include "../link/gpu_remote.h"
+#include "../link/psxe_link.h"
 #endif
 
 #include <stdio.h>
@@ -438,6 +439,9 @@ volatile uint32_t log = 0;
 
 static void psxe_screen_update_impl(psxe_screen_t *screen, uint32_t dirty_y0, uint32_t dirty_y1);
 static void psxe_screen_poll_pxp(void);
+#if PSXE_GPU_REMOTE
+static void psxe_screen_send_frame(psxe_screen_t *screen, uint32_t dirty_y0, uint32_t dirty_y1);
+#endif
 
 static uint32_t g_presented_frames = 0;
 static int32_t s_pxp_busy = 0;
@@ -597,7 +601,7 @@ static void psxe_screen_thumbnail(psxe_screen_t *screen)
         {
             const uint32_t x = (gpu->disp_x + (uint32_t)((tx * w) / 64)) & 0x3ffu;
             const uint32_t y = (gpu->disp_y + (uint32_t)((ty * h) / 24)) & 0x1ffu;
-            const uint32_t p = gpu->vram[x + y * 1024u];
+            const uint32_t p = gpu->vram[PSX_VRAM_AT(x, y)];
 
             const uint32_t luma = ((p & 0x1fu) * 2u + ((p >> 5) & 0x1fu) * 5u + ((p >> 10) & 0x1fu)) / 8u;
 
@@ -636,11 +640,11 @@ void psxe_screen_update(psxe_screen_t *screen)
 
 #if PSXE_GPU_REMOTE
             {
-                /* the frames the GPU board shows, since the last report */
+                /* while the GPU board draws: the frames it shows, since the last report */
                 static uint32_t last_presented = 0;
                 const uint32_t presented = gpu_remote_presented();
 
-                g_presented_frames = presented - last_presented;
+                (void)presented;
                 last_presented = presented;
 
                 gpu_remote_report();
@@ -734,7 +738,7 @@ void psxe_screen_update(psxe_screen_t *screen)
 #if PSXE_AUTOTEST
             {
                 /* how fast is SDRAM right now: 64 KB of VRAM, read cold */
-                const uint16_t *v = (const uint16_t *)screen->psx->gpu->vram + (300u * 1024u);
+                const uint16_t *v = (const uint16_t *)screen->psx->gpu->vram + PSX_VRAM_AT(0u, 300u);
                 uint32_t sum = 0;
                 const uint32_t t0 = DWT->CYCCNT;
 
@@ -791,12 +795,6 @@ void psxe_screen_update(psxe_screen_t *screen)
 
     psxe_screen_pace();
 
-#if PSXE_GPU_REMOTE
-    /* the picture is made and shown by the GPU board */
-    gpu->vram_dirty = 0;
-
-    return;
-#endif
 
     /* The frame the scaler was given at the last vblank goes to the panel now.
        This must not wait for the next changed picture: there may not be one for
@@ -856,7 +854,19 @@ void psxe_screen_update(psxe_screen_t *screen)
 
     PROF_T0(t_blit);
     PROF_INC(frames);
-    psxe_screen_update_impl(screen, dirty_y0, dirty_y1);
+#if PSXE_GPU_REMOTE
+    if (g_gpu_remote && g_gpu_stream)
+    {
+        /* the GPU board has the whole picture: nothing is drawn or shown here */
+        g_presented_frames++;
+    }
+    else if (g_gpu_remote)
+    {
+        psxe_screen_send_frame(screen, dirty_y0, dirty_y1);
+    }
+    else
+#endif
+        psxe_screen_update_impl(screen, dirty_y0, dirty_y1);
     PROF_ADD(blit, t_blit);
 }
 
@@ -904,6 +914,102 @@ static void psxe_screen_finish_pxp(void)
 
     DEMO_SwapBuffers();
 }
+
+#if PSXE_GPU_REMOTE
+/*
+    The hybrid: this board rasterized the picture, the GPU board shows it. What
+    goes over the link is the display window as it stands in VRAM, in the PSX's
+    own pixel format - only the rows drawn into since the last picture, unless
+    the window itself moved, which is what the local repack does too.
+
+    The GPU board's panel is 800x480, so a 480 line picture goes over whole;
+    the local path halves it because its own panel has 272 lines.
+*/
+static void psxe_screen_send_frame(psxe_screen_t *screen, uint32_t dirty_y0, uint32_t dirty_y1)
+{
+    psx_gpu_t *const gpu = screen->psx->gpu;
+
+    int32_t w = psx_get_display_width(screen->psx);
+    int32_t h = psx_get_display_height(screen->psx);
+
+    if ((w <= 0) || (w > 640))
+        w = 320;
+
+    if ((h <= 0) || (h > 480))
+        h = 240;
+
+    if ((w == 320) && (h > 240))
+        h = 240;
+
+    if (((int32_t)gpu->disp_y + h) > PSX_GPU_FB_HEIGHT)
+        h = PSX_GPU_FB_HEIGHT - (int32_t)gpu->disp_y;
+
+    if (h <= 0)
+        h = 1;
+
+    const int32_t is_24 = psx_get_display_format(screen->psx) != 0;
+    const int blank = (gpu->gpustat & 0x800000u) != 0;
+
+    /*
+        A game that draws one field of an interlaced picture per frame (gpu.c,
+        gpu_update_field; Tekken 3 at 368x480) has just finished the field that
+        starts at disp_y. Sending both fields would put a fresh one next to one
+        a frame old - which combs, and costs twice the wire - so only every
+        other row goes, and the GPU board scales the 240 rows to its panel.
+    */
+    const int32_t row_step = ((gpu->skip_rows >= 0) && (h > 240)) ? 2 : 1;
+
+    h /= row_step;
+
+    uint32_t flags = (is_24 ? PSXE_FRAME_24BPP : 0u) | (blank ? PSXE_FRAME_BLANK : 0u);
+
+    /* the rows that changed, in the window's coordinates; anything else about
+       the window having changed makes it a new picture */
+    static uint32_t sent_x = ~0u, sent_y = ~0u;
+    static int32_t sent_w = -1, sent_h = -1, sent_24 = -1, sent_step = -1;
+
+    uint32_t row0 = 0;
+    uint32_t row1 = (uint32_t)h;
+
+    if ((sent_x == gpu->disp_x) && (sent_y == gpu->disp_y) && (sent_w == w) && (sent_h == h) &&
+        (sent_24 == is_24) && (sent_step == row_step) && (dirty_y0 < dirty_y1))
+    {
+        const int32_t first = ((int32_t)dirty_y0 - (int32_t)gpu->disp_y) / row_step;
+        const int32_t last = ((int32_t)dirty_y1 - (int32_t)gpu->disp_y + row_step - 1) / row_step;
+
+        if (first > 0)
+            row0 = (first < h) ? (uint32_t)first : (uint32_t)h;
+
+        if (last < h)
+            row1 = (last > (int32_t)row0) ? (uint32_t)last : row0;
+    }
+    else
+    {
+        flags |= PSXE_FRAME_WHOLE;
+    }
+
+    const void *src = psx_get_display_buffer(screen->psx);
+
+    if (blank || !src)
+    {
+        row0 = 0;
+        row1 = 0;
+    }
+
+    if (gpu_remote_frame(src, (uint32_t)row_step * PSX_GPU_FB_STRIDE, (uint32_t)w, (uint32_t)h, row0,
+                         row1, flags, gpu->display_mode) != 0)
+        return; /* the link went: the next picture is a whole one, and it may well be local */
+
+    sent_x = gpu->disp_x;
+    sent_y = gpu->disp_y;
+    sent_w = w;
+    sent_h = h;
+    sent_24 = is_24;
+    sent_step = row_step;
+
+    g_presented_frames++;
+}
+#endif
 
 static void psxe_screen_update_impl(psxe_screen_t *screen, uint32_t dirty_y0, uint32_t dirty_y1)
 {

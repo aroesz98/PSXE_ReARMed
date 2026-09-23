@@ -71,12 +71,45 @@ enum
     PSXE_REC_GP1 = 2,
     PSXE_REC_VBLANK = 3,
     PSXE_REC_RESET = 4,
+    PSXE_REC_FRAME = 5,   /* rows of a finished picture, straight out of VRAM */
+    PSXE_REC_BAND = 6,    /* the rows of VRAM the GPU board is to rasterize into */
 
     PSXE_REC_STATUS = 8,
     PSXE_REC_VRAM = 9
 };
 
 #define PSXE_REC_GP0_BOUNDARY 1u /* flag: the record starts at a command boundary */
+
+/*
+    FRAME: the CPU board rasterized the picture itself and sends the part of it
+    that is on screen, in the PSX's own pixel format, for the GPU board to
+    repack, scale and show. Words before the pixels:
+
+      0: width | height << 16      the picture, in source pixels
+      1: first row | rows << 16    which rows of it this record carries
+      2: flags (below)
+      3: GP1(08) display mode      for the aspect and the interlace
+
+    then the rows: 15 bpp is width halfwords a row, 24 bpp is width * 3 bytes,
+    both padded to a whole number of words. A record with LAST set is the end of
+    the picture: the GPU board shows it.
+*/
+#define PSXE_FRAME_24BPP 1u
+#define PSXE_FRAME_BLANK 2u   /* the display is off: show black */
+#define PSXE_FRAME_LAST 4u    /* the last record of this picture */
+#define PSXE_FRAME_WHOLE 8u   /* every row is here, not just the ones that changed */
+#define PSXE_FRAME_VRAM 16u   /* the rows are VRAM rows and go into VRAM, not to the panel */
+#define PSXE_FRAME_WORDS 4u   /* header words before the pixels */
+
+/*
+    BAND: one word, the share of the drawing area the GPU board is to rasterize,
+    0 to 256 (256 = all of it, which is where it starts). The CPU board keeps
+    the rest, drawing the top of the area and sending those rows over as FRAME
+    records with PSXE_FRAME_VRAM, so that the GPU board's VRAM holds the whole
+    picture. The share is moved a little at a time to keep both boards busy
+    without either waiting (gpu_remote.c).
+*/
+#define PSXE_BAND_SHARE(w) ((w) & 0x1ffu)
 
 /* VBLANK payload */
 #define PSXE_VBLANK_FIELD(w) ((w) & 1u)
@@ -91,7 +124,8 @@ enum
     PSXE_STATUS_PRESENTED = 3,
     PSXE_STATUS_ERRORS = 4,   /* lost frames, parser resyncs, ring overruns */
     PSXE_STATUS_BOOT = 5,     /* the GPU board's boot id: a change means it started over */
-    PSXE_STATUS_WORDS = 6
+    PSXE_STATUS_BUSY = 6,     /* how much of its time it spends working, per mille */
+    PSXE_STATUS_WORDS = 7
 };
 
 #define PSXE_STATUS_FLAG_READY 1u   /* the GPU board is initialised and listening */

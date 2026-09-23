@@ -16,6 +16,38 @@
 
 #include "gpu.h"
 
+/*
+    Two boards, one picture.
+
+    g_gpu_remote: the GPU board is there and takes the picture. What it does
+    with it depends on g_gpu_stream:
+
+      0 (the hybrid, the default): this board rasterizes into its own VRAM - its
+        memory is the faster one - and sends the finished picture over the link
+        (gpu_remote_frame); the GPU board repacks it, scales it with the
+        NeoChrom and shows it on its 800x480 panel. The LCD here stays dark, and
+        this board is spared the repack and the PXP.
+      1 (PSXE_GPU_REMOTE_CMD=1): the GP0/GP1 stream goes over instead and the
+        GPU board rasterizes it as well. Slower for games with many small
+        textured polygons (its VRAM is external PSRAM), kept for measuring.
+
+    Both are 0 while there is no GPU board: everything happens here, on the LCD.
+*/
+extern int g_gpu_remote;
+extern int g_gpu_stream;
+
+/* how the drawing is divided: the share of the drawing area this board takes,
+   0 to 256 (0 = the GPU board draws all of it). Only in the GP0 stream mode. */
+extern int g_gpu_band;
+
+/* the picture, or the rows of it that changed, to the GPU board. src points at
+   the top left of the display window in VRAM and its rows are src_stride bytes
+   apart - two VRAM rows for a game that draws one field of an interlaced
+   picture per frame, so that only the field just finished goes over.
+   row0/row1 are the rows to send, 0 .. h. Returns 0 when it went out. */
+int gpu_remote_frame(const void *src, uint32_t src_stride, uint32_t w, uint32_t h, uint32_t row0,
+                     uint32_t row1, uint32_t flags, uint32_t mode);
+
 /* psx_gpu_init(): fresh state; a RESET goes to the GPU board once it listens */
 void gpu_remote_reset(psx_gpu_t *gpu);
 
@@ -26,6 +58,10 @@ uint32_t gpu_remote_gp0(psx_gpu_t *gpu, uint32_t word);
 /* rows of a CPU -> VRAM upload straight from guest RAM (psx_gpu_write_bulk):
    the number of words taken, 0 when the stream is not inside such an upload */
 uint32_t gpu_remote_gp0_bulk(psx_gpu_t *gpu, const uint32_t *src, uint32_t words);
+
+/* the local rasterizer took this many words of an upload in bulk: the stream
+   follower must not lose count of them */
+void gpu_remote_note_bulk(uint32_t words);
 
 /* a GP1 word: forwarded (gpu.c handles the display state locally as well) */
 void gpu_remote_gp1(psx_gpu_t *gpu, uint32_t word);

@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "gpu_remote.h"
+#include "../gpu_switch.h"
 #include "psxe_link.h"
 #include "enet_link.h"
 #include "fsl_debug_console.h"
@@ -79,6 +80,9 @@ static uint16_t *s_vram;
 static uint32_t s_a0_x, s_a0_y, s_a0_w, s_a0_xcnt, s_a0_ycnt;
 
 /* the link */
+int g_gpu_remote;            /* the GPU board has the picture (see gpu_remote.h) */
+int g_gpu_stream = PSXE_GPU_REMOTE_CMD; /* ... as a GP0 stream, rather than finished frames */
+static int s_switch_to = -1; /* a change of g_gpu_remote waiting for a command boundary, or -1 */
 static psx_gpu_t *s_gpu;
 static uint32_t s_ready;     /* the GPU board listens (STATUS with READY seen since the link came up) */
 static uint32_t s_boot;      /* its boot id: a change means it restarted and lost everything */
@@ -88,9 +92,16 @@ static uint32_t s_presented; /* frames it has shown */
 static uint32_t s_gpu_errors;
 static uint32_t s_gpu_flags;
 static uint32_t s_frame_no;
+static uint32_t s_restore;       /* the GPU board lost data: send it everything again at the next blank */
+static uint32_t s_restore_frame; /* ... and when that was last done */
+static uint32_t s_restores;
 
 /* statistics, for the report */
 static uint32_t s_tx_frames, s_tx_bytes, s_credit_waits, s_wait_ms, s_timeouts, s_drops, s_rx_status, s_rx_vram;
+static uint32_t s_frames_out;     /* pictures sent to the GPU board */
+static uint32_t s_frames_skipped; /* ... and pictures the link had no room for */
+static uint32_t s_frame_force;    /* the next one must carry every row */
+static uint32_t s_nowait;         /* inside a picture: never wait, drop it instead */
 static uint32_t s_rep_tx_bytes, s_rep_presented, s_rep_wait_ms;
 
 /* VRAM -> CPU data, in the order it came */
@@ -142,6 +153,21 @@ static void link_lost(const char *why)
     s_used = 0;
     s_rec = -1;
     s_hold = 1;
+
+    /* the picture is made here again: in the hybrid at once, with the GP0 stream
+       from the next command on (the GPU board's parser must not be left mid-command) */
+    if (g_gpu_remote)
+    {
+        if (g_gpu_stream)
+        {
+            s_switch_to = 0;
+        }
+        else
+        {
+            g_gpu_remote = 0;
+            PRINTF("gpu: the picture is made here\r\n");
+        }
+    }
 }
 
 static void on_status(const uint32_t *w, uint32_t n)
@@ -157,7 +183,25 @@ static void on_status(const uint32_t *w, uint32_t n)
 
     s_gpu_flags = flags;
     s_presented = w[PSXE_STATUS_PRESENTED];
+
+    /*
+        Its error count went up: frames were lost on the wire or found no room.
+        In the GP0 stream whatever they carried is gone for good - a texture, a
+        palette, a drawing mode - and a palette lost is a scene whose every
+        texel is transparent: a black screen with only the HUD on it. The
+        GPU board picks the stream up again at the next command, but only a
+        restore of everything (link_replay: its state and the VRAM shadow)
+        makes its VRAM right again.
+    */
+    if (s_ready && (boot == s_boot) && (w[PSXE_STATUS_ERRORS] != s_gpu_errors) && g_gpu_stream)
+        s_restore = 1;
+
     s_gpu_errors = w[PSXE_STATUS_ERRORS];
+
+    /* it lost a frame: what it holds is part of an old picture, so the next one
+       carries every row rather than only what changed */
+    if (flags & PSXE_STATUS_FLAG_RESYNC)
+        s_frame_force = 1;
 
     if (!s_ready || (boot != s_boot))
     {
@@ -171,7 +215,10 @@ static void on_status(const uint32_t *w, uint32_t n)
 
         PRINTF("gpu-link: up (boot %08x, ring %u KB)\r\n", (unsigned)boot, (unsigned)(w[PSXE_STATUS_RING] / 1024u));
 
-        link_replay();
+        /* it takes over at the next command boundary (gpu_remote_vblank), with
+           everything it needs sent first; until then nothing goes out */
+        s_hold = 1;
+        s_switch_to = 1;
 
         return;
     }
@@ -263,6 +310,16 @@ static int credit_wait(uint32_t bytes)
     if ((s_sent - s_consumed) + bytes <= WINDOW)
         return 1;
 
+    /* a picture is only worth sending while it is current: rather than hold the
+       emulation up for one the GPU board has no room for, it is dropped and the
+       next one goes - a display frame, unlike a command, is nothing to keep */
+    if (s_nowait)
+    {
+        rx_poll();
+
+        return ((s_sent - s_consumed) + bytes <= WINDOW);
+    }
+
     const TickType_t t0 = xTaskGetTickCount();
 
     s_credit_waits++;
@@ -351,6 +408,13 @@ static void frame_send(void)
         /* the transmit ring is full: the wire drains it at 10 MB/s */
         rx_poll();
 
+        if (s_nowait && ((xTaskGetTickCount() - t0) > pdMS_TO_TICKS(2)))
+        {
+            s_drops++;
+
+            return;
+        }
+
         if ((xTaskGetTickCount() - t0) > pdMS_TO_TICKS(TX_BUSY_TIMEOUT_MS))
         {
             s_timeouts++;
@@ -435,7 +499,7 @@ static void link_replay(void)
 /* one halfword of a CPU -> VRAM upload, where gpu.c would put it */
 static inline void shadow_half(uint16_t v)
 {
-    s_vram[(((s_a0_y + s_a0_ycnt) & 0x1ffu) << 10) + ((s_a0_x + s_a0_xcnt) & 0x3ffu)] = v;
+    s_vram[PSX_VRAM_AT((s_a0_x + s_a0_xcnt) & 0x3ffu, (s_a0_y + s_a0_ycnt) & 0x1ffu)] = v;
 
     if (++s_a0_xcnt == s_a0_w)
     {
@@ -446,7 +510,7 @@ static inline void shadow_half(uint16_t v)
 
 static inline void shadow_word(uint32_t w)
 {
-    if (!s_vram)
+    if (!s_vram || !g_gpu_remote)
         return;
 
     shadow_half((uint16_t)w);
@@ -455,7 +519,7 @@ static inline void shadow_word(uint32_t w)
 
 static void shadow_words(const uint32_t *src, uint32_t n)
 {
-    if (!s_vram)
+    if (!s_vram || !g_gpu_remote)
         return;
 
     while (n)
@@ -463,7 +527,7 @@ static void shadow_words(const uint32_t *src, uint32_t n)
         /* a whole row that does not wrap: one copy */
         if ((s_a0_xcnt == 0u) && !(s_a0_w & 1u) && ((s_a0_x + s_a0_w) <= 1024u) && (n >= (s_a0_w >> 1)))
         {
-            memcpy(&s_vram[(((s_a0_y + s_a0_ycnt) & 0x1ffu) << 10) + s_a0_x], src, s_a0_w * 2u);
+            memcpy(&s_vram[PSX_VRAM_AT(s_a0_x, (s_a0_y + s_a0_ycnt) & 0x1ffu)], src, s_a0_w * 2u);
 
             src += s_a0_w >> 1;
             n -= s_a0_w >> 1;
@@ -480,7 +544,7 @@ static void shadow_words(const uint32_t *src, uint32_t n)
 /* GP0(80h) VRAM -> VRAM, as gpu.c does it */
 static void shadow_copy(void)
 {
-    if (!s_vram)
+    if (!s_vram || !g_gpu_remote)
         return;
 
     const uint32_t srcx = s_arg[0] & 0xffffu;
@@ -498,7 +562,7 @@ static void shadow_copy(void)
         for (uint32_t x = 0; x < xsiz; x++)
         {
             if (((dstx + x) < 1024u) && ((srcx + x) < 1024u))
-                s_vram[(dstx + x) + ((dsty + y) << 10)] = s_vram[(srcx + x) + ((srcy + y) << 10)];
+                s_vram[PSX_VRAM_AT(dstx + x, dsty + y)] = s_vram[PSX_VRAM_AT(srcx + x, srcy + y)];
         }
     }
 }
@@ -519,10 +583,9 @@ static void vram_replay(void)
         put(y << 16);
         put((8u << 16) | 1024u);
 
-        const uint32_t *src = (const uint32_t *)&s_vram[y << 10];
-        uint32_t left = 4096u;
+        uint32_t done = 0; /* words of the eight rows sent */
 
-        while (left)
+        while (done < 4096u)
         {
             if (s_rec < 0)
             {
@@ -539,13 +602,21 @@ static void vram_replay(void)
                 continue;
             }
 
-            const uint32_t chunk = (left < space) ? left : space;
+            /* no further than the end of a row: rows are PSX_GPU_VRAM_PITCH apart here */
+            const uint32_t *const src = (const uint32_t *)&s_vram[PSX_VRAM_AT(0u, y + (done >> 9))] + (done & 511u);
+            const uint32_t row_left = 512u - (done & 511u);
+            uint32_t chunk = 4096u - done;
+
+            if (chunk > space)
+                chunk = space;
+
+            if (chunk > row_left)
+                chunk = row_left;
 
             memcpy(&PAYLOAD[s_used], src, chunk * 4u);
 
             s_used += chunk;
-            src += chunk;
-            left -= chunk;
+            done += chunk;
         }
 
         rec_close();
@@ -582,10 +653,10 @@ void gpu_remote_reset(psx_gpu_t *gpu)
     s_rd_head = 0;
     s_rd_tail = 0;
 
+    s_hold = 1;
+
     if (s_ready)
-        link_replay();
-    else
-        s_hold = 1;
+        s_switch_to = 1; /* the GPU board takes over again at the next blank */
 }
 
 /* the size words of A0h/C0h, as gpu.c reads them: words of pixel data */
@@ -601,6 +672,18 @@ uint32_t gpu_remote_gp0(psx_gpu_t *gpu, uint32_t w)
 {
     uint32_t env = 0;
     int boundary = 0;
+
+    /* the link went: from this command on the local rasterizer draws (gpu.c sees
+       g_gpu_remote == 0 after this call and parses the word itself) */
+    if ((s_switch_to == 0) && (s_kind == K_NONE))
+    {
+        s_switch_to = -1;
+        g_gpu_remote = 0;
+        PRINTF("gpu: the picture is made here\r\n");
+    }
+
+    if (!g_gpu_stream)
+        return 0;
 
     switch (s_kind)
     {
@@ -740,7 +823,7 @@ uint32_t gpu_remote_gp0(psx_gpu_t *gpu, uint32_t w)
         break;
     }
 
-    if (s_ready)
+    if (s_ready && g_gpu_remote)
     {
         if (s_hold)
         {
@@ -756,11 +839,22 @@ uint32_t gpu_remote_gp0(psx_gpu_t *gpu, uint32_t w)
     return env;
 }
 
+void gpu_remote_note_bulk(uint32_t words)
+{
+    if ((s_kind != K_A0_DATA) || !words)
+        return;
+
+    s_left -= (words < s_left) ? words : s_left;
+
+    if (!s_left)
+        s_kind = K_NONE;
+}
+
 uint32_t gpu_remote_gp0_bulk(psx_gpu_t *gpu, const uint32_t *src, uint32_t words)
 {
     (void)gpu;
 
-    if ((s_kind != K_A0_DATA) || !words)
+    if (!g_gpu_stream || (s_kind != K_A0_DATA) || !words)
         return 0;
 
     const uint32_t n = (words < s_left) ? words : s_left;
@@ -768,7 +862,7 @@ uint32_t gpu_remote_gp0_bulk(psx_gpu_t *gpu, const uint32_t *src, uint32_t words
 
     shadow_words(src, n);
 
-    if (s_ready && !s_hold)
+    if (s_ready && g_gpu_remote && !s_hold)
     {
         while (left)
         {
@@ -809,7 +903,7 @@ void gpu_remote_gp1(psx_gpu_t *gpu, uint32_t w)
 {
     (void)gpu;
 
-    if (s_ready)
+    if (s_ready && g_gpu_remote && !s_hold)
         emit_gp1(w);
 }
 
@@ -865,11 +959,33 @@ uint32_t gpu_remote_read_vram(psx_gpu_t *gpu)
 
 void gpu_remote_vblank(psx_gpu_t *gpu, uint32_t field)
 {
-    (void)gpu;
-
     s_frame_no++;
 
-    if (s_ready)
+    if ((s_switch_to == 1) && s_ready &&
+        (!g_gpu_stream || ((s_kind == K_NONE) && (gpu->state == GPU_STATE_RECV_CMD))))
+    {
+        s_switch_to = -1;
+        g_gpu_remote = 1;
+        s_frame_force = 1;
+        PRINTF("gpu: the GPU board has the picture (%s)\r\n", g_gpu_stream ? "GP0 stream" : "frames");
+
+        if (g_gpu_stream)
+            link_replay(); /* its VRAM as it is here, then the stream */
+    }
+
+    /* at a command boundary, and not more than once a second: a link losing
+       frames all the time would otherwise do nothing but restore */
+    if (s_restore && s_ready && g_gpu_remote && g_gpu_stream && (s_kind == K_NONE) &&
+        (gpu->state == GPU_STATE_RECV_CMD) && ((s_frame_no - s_restore_frame) >= 60u))
+    {
+        s_restore = 0;
+        s_restore_frame = s_frame_no;
+        s_restores++;
+        PRINTF("gpu-link: the GPU board lost data (errors %u), restoring its VRAM\r\n", (unsigned)s_gpu_errors);
+        link_replay();
+    }
+
+    if (s_ready && g_gpu_remote && g_gpu_stream)
     {
         rec_close();
         room(2);
@@ -888,6 +1004,113 @@ void gpu_remote_vblank(psx_gpu_t *gpu, uint32_t field)
     }
 }
 
+/* ---- the finished picture (the hybrid) ------------------------------------------ */
+
+int gpu_remote_frame(const void *src, uint32_t src_stride, uint32_t w, uint32_t h, uint32_t row0,
+                     uint32_t row1, uint32_t flags, uint32_t mode)
+{
+    if (!s_ready || !g_gpu_remote)
+        return -1;
+
+    /* the first picture after the GPU board appeared has to be a whole one */
+    if (s_frame_force)
+    {
+        row0 = 0;
+        row1 = h;
+        flags |= PSXE_FRAME_WHOLE;
+    }
+
+    if (row0 >= row1)
+    {
+        /* nothing changed: tell it anyway, so it shows the picture it has */
+        row0 = 0;
+        row1 = 0;
+    }
+
+    const uint32_t row_bytes = (flags & PSXE_FRAME_24BPP) ? (w * 3u) : (w * 2u);
+    const uint32_t row_words = (row_bytes + 3u) >> 2;
+
+    if (!row_words || (row_words > PAYLOAD_WORDS - PSXE_FRAME_WORDS - 1u))
+        return -1;
+
+    /* the whole picture has to fit the window as it stands, or it is skipped:
+       waiting for the GPU board to catch up costs the emulation more than a
+       missed frame does */
+    {
+        const uint32_t per_frame = (PAYLOAD_WORDS - PSXE_FRAME_WORDS - 1u) / row_words;
+        const uint32_t frames = ((row1 - row0) + per_frame - 1u) / per_frame;
+        const uint32_t bytes = (row1 - row0) * row_words * 4u +
+                               (frames + 1u) * ((PSXE_FRAME_WORDS + 1u) * 4u + PSXE_LINK_HDR);
+
+        rx_poll();
+
+        if ((s_sent - s_consumed) + bytes > WINDOW)
+        {
+            s_frames_skipped++;
+            s_frame_force = 1;
+
+            return -1;
+        }
+    }
+
+    s_nowait = 1;
+
+    const uint8_t *p = (const uint8_t *)src + (size_t)row0 * src_stride;
+    uint32_t row = row0;
+
+    do
+    {
+        /* as many whole rows as fit one Ethernet frame */
+        uint32_t rows = (PAYLOAD_WORDS - PSXE_FRAME_WORDS - 1u) / row_words;
+
+        if (rows > (row1 - row))
+            rows = row1 - row;
+
+        const uint32_t need = PSXE_FRAME_WORDS + 1u + rows * row_words;
+
+        rec_close();
+        room(need);
+
+        const int last = ((row + rows) >= row1);
+
+        put(PSXE_REC_HDR(PSXE_REC_FRAME, 0u, PSXE_FRAME_WORDS + rows * row_words));
+        put(w | (h << 16));
+        put(row | (rows << 16));
+        put(flags | (last ? PSXE_FRAME_LAST : 0u));
+        put(mode);
+
+        for (uint32_t i = 0; i < rows; i++)
+        {
+            memcpy(&PAYLOAD[s_used], p, row_bytes);
+            s_used += row_words;
+            p += src_stride;
+        }
+
+        row += rows;
+
+        frame_send(); /* one picture row set per Ethernet frame: nothing waits in the buffer */
+
+        if (!s_ready || s_used)
+        {
+            /* the link went, or a frame was dropped: what the GPU board has is
+               half a picture, so the next one carries every row */
+            s_used = 0;
+            s_rec = -1;
+            s_nowait = 0;
+            s_frame_force = 1;
+            s_frames_skipped++;
+
+            return -1;
+        }
+    } while (row < row1);
+
+    s_nowait = 0;
+    s_frame_force = 0;
+    s_frames_out++;
+
+    return 0;
+}
+
 uint32_t gpu_remote_presented(void)
 {
     return s_presented;
@@ -903,8 +1126,11 @@ void gpu_remote_report(void)
     s_rep_presented = s_presented;
     s_rep_wait_ms = s_wait_ms;
 
-    PRINTF("gpu-link: %s tx=%uKB/s wait=%ums drop=%u to=%u | gpu: shown=%u/s err=%u%s | rd=%u\r\n",
-           s_ready ? "up" : (enet_link_up() ? "carrier" : "down"), (unsigned)kb, (unsigned)wait,
-           (unsigned)s_drops, (unsigned)s_timeouts, (unsigned)pres, (unsigned)s_gpu_errors,
-           (s_gpu_flags & PSXE_STATUS_FLAG_RESYNC) ? " RESYNC" : "", (unsigned)s_rx_vram);
+    PRINTF("gpu-link: %s%s tx=%uKB/s wait=%ums drop=%u to=%u skip=%u | gpu: shown=%u/s err=%u%s | sent=%u restored=%u\r\n",
+           s_ready ? "up" : (enet_link_up() ? "carrier" : "down"),
+           g_gpu_remote ? (g_gpu_stream ? " (stream)" : " (hybrid)") : " (local)",
+           (unsigned)kb, (unsigned)wait,
+           (unsigned)s_drops, (unsigned)s_timeouts, (unsigned)s_frames_skipped, (unsigned)pres,
+           (unsigned)s_gpu_errors,
+           (s_gpu_flags & PSXE_STATUS_FLAG_RESYNC) ? " RESYNC" : "", (unsigned)s_frames_out, (unsigned)s_restores);
 }

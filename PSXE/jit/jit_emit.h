@@ -562,6 +562,85 @@ static inline void psx_emit_sub_imm12(psx_emit_t *e, uint32_t rd, uint32_t rn, u
     psx_emit32(e, 0xf2a0u | (i << 10) | rn, (imm3 << 12) | (rd << 8) | imm8);
 }
 
+/* SUBS Rd, Rn, #imm (always sets the flags: the budget test of the next block
+   reads them). The narrow form for a low register and a byte, the wide one
+   with a modified immediate otherwise. */
+static inline void psx_emit_subs_imm(psx_emit_t *e, uint32_t rd, uint32_t rn, uint32_t imm)
+{
+    if (PSX_EMIT_LOW(rd) && (rd == rn) && (imm <= 255u))
+    {
+        psx_emit16(e, 0x3800u | (rd << 8) | imm);
+        return;
+    }
+
+    const uint32_t imm12 = psx_thumb_expand_imm(imm);
+
+    if (imm12 == 0xffffffffu)
+    {
+        e->overflow = 1; /* no block ever needs that many cycles at once */
+        return;
+    }
+
+    const uint32_t i = (imm12 >> 11) & 1u;
+    const uint32_t imm3 = (imm12 >> 8) & 0x7u;
+    const uint32_t imm8 = imm12 & 0xffu;
+
+    psx_emit32(e, 0xf1b0u | (i << 10) | rn, (imm3 << 12) | (rd << 8) | imm8);
+}
+
+/* A word of data in the instruction stream, for the helper that is called
+   right before it (it reads it through its return address). */
+static inline void psx_emit_data32(psx_emit_t *e, uint32_t value)
+{
+    psx_emit16(e, value & 0xffffu);
+    psx_emit16(e, value >> 16);
+}
+
+/* Rd = imm32 with the shortest sequence there is (flags may change) */
+static inline void psx_emit_const(psx_emit_t *e, uint32_t rd, uint32_t value)
+{
+    if (PSX_EMIT_LOW(rd) && (value < 0x100u))
+    {
+        psx_emit16(e, 0x2000u | (rd << 8) | value); /* MOVS Rd, #imm8 */
+        return;
+    }
+
+    const uint32_t imm12 = psx_thumb_expand_imm(value);
+
+    if (imm12 != 0xffffffffu)
+    {
+        const uint32_t i = (imm12 >> 11) & 1u;
+        const uint32_t imm3 = (imm12 >> 8) & 0x7u;
+
+        psx_emit32(e, 0xf04fu | (i << 10), (imm3 << 12) | (rd << 8) | (imm12 & 0xffu)); /* MOV.W */
+        return;
+    }
+
+    const uint32_t inv12 = psx_thumb_expand_imm(~value);
+
+    if (inv12 != 0xffffffffu)
+    {
+        const uint32_t i = (inv12 >> 11) & 1u;
+        const uint32_t imm3 = (inv12 >> 8) & 0x7u;
+
+        psx_emit32(e, 0xf06fu | (i << 10), (imm3 << 12) | (rd << 8) | (inv12 & 0xffu)); /* MVN.W */
+        return;
+    }
+
+    /* the upper half only (every LUI): MOVW + LSLS is six bytes, MOVW + MOVT eight */
+    if (PSX_EMIT_LOW(rd) && !(value & 0xffffu))
+    {
+        psx_emit_movw(e, rd, value >> 16);
+        psx_emit16(e, (16u << 6) | (rd << 3) | rd); /* LSLS Rd, Rd, #16 */
+        return;
+    }
+
+    psx_emit_movw(e, rd, value & 0xffffu);
+
+    if (value >> 16)
+        psx_emit_movt(e, rd, value >> 16);
+}
+
 /* ---------------------------------------------------------------- register offset memory */
 
 /* LDR/LDRB/LDRH/LDRSB/LDRSH Rt, [Rn, Rm] */
@@ -675,6 +754,101 @@ static inline void psx_emit_strh_imm(psx_emit_t *e, uint32_t rt, uint32_t rn, ui
 static inline void psx_emit_ldrb_imm(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t imm12)
 {
     psx_emit32(e, 0xf890u | rn, (rt << 12) | (imm12 & 0xfffu));
+}
+
+/* LDRSB Rt, [Rn, #imm12] / STRB Rt, [Rn, #imm12] */
+static inline void psx_emit_ldrsb_imm(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t imm12)
+{
+    psx_emit32(e, 0xf990u | rn, (rt << 12) | (imm12 & 0xfffu));
+}
+
+static inline void psx_emit_strb_imm(psx_emit_t *e, uint32_t rt, uint32_t rn, uint32_t imm12)
+{
+    psx_emit32(e, 0xf880u | rn, (rt << 12) | (imm12 & 0xfffu));
+}
+
+/*
+    Guest sized accesses: size 1, 2 or 4 bytes, loads sign or zero extended.
+    The immediate forms take the narrow encoding where there is one.
+*/
+static inline void psx_emit_load_imm(psx_emit_t *e, uint32_t size, int is_signed, uint32_t rt, uint32_t rn,
+                                     uint32_t off)
+{
+    const int low = PSX_EMIT_LOW(rt) && PSX_EMIT_LOW(rn);
+
+    if (size == 4u)
+        psx_emit_ldr_imm(e, rt, rn, off);
+    else if (size == 2u)
+    {
+        if (is_signed)
+            psx_emit_ldrsh_imm(e, rt, rn, off);
+        else if (low && (off <= 62u) && !(off & 1u))
+            psx_emit16(e, 0x8800u | ((off >> 1) << 6) | (rn << 3) | rt);
+        else
+            psx_emit_ldrh_imm(e, rt, rn, off);
+    }
+    else
+    {
+        if (is_signed)
+            psx_emit_ldrsb_imm(e, rt, rn, off);
+        else if (low && (off <= 31u))
+            psx_emit16(e, 0x7800u | (off << 6) | (rn << 3) | rt);
+        else
+            psx_emit_ldrb_imm(e, rt, rn, off);
+    }
+}
+
+static inline void psx_emit_store_imm(psx_emit_t *e, uint32_t size, uint32_t rt, uint32_t rn, uint32_t off)
+{
+    const int low = PSX_EMIT_LOW(rt) && PSX_EMIT_LOW(rn);
+
+    if (size == 4u)
+        psx_emit_str_imm(e, rt, rn, off);
+    else if (size == 2u)
+    {
+        if (low && (off <= 62u) && !(off & 1u))
+            psx_emit16(e, 0x8000u | ((off >> 1) << 6) | (rn << 3) | rt);
+        else
+            psx_emit_strh_imm(e, rt, rn, off);
+    }
+    else
+    {
+        if (low && (off <= 31u))
+            psx_emit16(e, 0x7000u | (off << 6) | (rn << 3) | rt);
+        else
+            psx_emit_strb_imm(e, rt, rn, off);
+    }
+}
+
+static inline void psx_emit_load_reg(psx_emit_t *e, uint32_t size, int is_signed, uint32_t rt, uint32_t rn,
+                                     uint32_t rm)
+{
+    if (size == 4u)
+        psx_emit_ldr_reg(e, rt, rn, rm);
+    else if (size == 2u)
+    {
+        if (is_signed)
+            psx_emit_ldrsh_reg(e, rt, rn, rm);
+        else
+            psx_emit_ldrh_reg(e, rt, rn, rm);
+    }
+    else
+    {
+        if (is_signed)
+            psx_emit_ldrsb_reg(e, rt, rn, rm);
+        else
+            psx_emit_ldrb_reg(e, rt, rn, rm);
+    }
+}
+
+static inline void psx_emit_store_reg(psx_emit_t *e, uint32_t size, uint32_t rt, uint32_t rn, uint32_t rm)
+{
+    if (size == 4u)
+        psx_emit_str_reg(e, rt, rn, rm);
+    else if (size == 2u)
+        psx_emit_strh_reg(e, rt, rn, rm);
+    else
+        psx_emit_strb_reg(e, rt, rn, rm);
 }
 
 /* ---------------------------------------------------------------- branches */

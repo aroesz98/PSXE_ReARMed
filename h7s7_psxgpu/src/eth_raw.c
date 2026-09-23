@@ -261,12 +261,23 @@ bool eth_raw_link_poll(void)
 	if (!(bmsr & PHY_BMSR_LINK) && ((++polls % 50) == 0)) {
 		phy_dump("no link");
 	}
-	/* the link bit latches low: read twice to see the current state */
+	/* the link bit latches low: read twice to see the current state. A low
+	   first read while the link is up here means it went down and came back
+	   between two polls - renegotiated, possibly to another duplex (a partner
+	   that was not negotiating yet gives half duplex): the MAC has to take the
+	   new result, or every frame collides with a full duplex partner */
+	bool flapped = false;
+
 	if ((bmsr & PHY_BMSR_LINK) == 0U) {
+		flapped = link_up;
 		(void)phy_read(PHY_BMSR, &bmsr);
 	}
 	bool up = (bmsr & PHY_BMSR_LINK) != 0U && (bmsr & PHY_BMSR_AN_DONE) != 0U;
 
+	if (up && link_up && flapped) {
+		mac_stop();
+		link_up = false;
+	}
 	if (up && !link_up) {
 		if (mac_start() == 0) {
 			link_up = true;

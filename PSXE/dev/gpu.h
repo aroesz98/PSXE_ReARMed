@@ -20,11 +20,31 @@ typedef struct psx_ic_t psx_ic_t;
 #define PSX_GPU_FB_WIDTH 1024
 #define PSX_GPU_FB_HEIGHT 512
 
-// Use this when updating your texture
-#define PSX_GPU_FB_STRIDE 2048
+/*
+    VRAM rows are PSX_GPU_VRAM_PITCH halfwords apart: pixel (x, y) is
+    vram[PSX_VRAM_AT(x, y)]. 1024 is the PSX's own layout. The RT1050 pads every
+    row by one 32 byte cache line: at 2048 bytes a row, every fourth row falls
+    into the same sets of the Cortex-M7's 32 KB 4-way data cache, so at any one
+    x only 16 rows of a texture - and of the frame being drawn - can be in the
+    cache together, and a texture walked down a triangle misses all the time.
+    Simulated over Tekken 3 frames: 16.7% of texel fetches and 10.7% of frame
+    buffer writes missed, 2.8% and 6.6% with the padded rows (three times fewer
+    line fills). The padding is never drawn to nor shown.
+*/
+#ifndef PSX_GPU_VRAM_PITCH
+#ifdef PSX_GPU_STANDALONE
+#define PSX_GPU_VRAM_PITCH 1024
+#else
+#define PSX_GPU_VRAM_PITCH 1040
+#endif
+#endif
 
-// 0x100000 * 2
-#define PSX_GPU_VRAM_SIZE (0x100000)
+#define PSX_VRAM_AT(x, y) ((x) + ((y) * PSX_GPU_VRAM_PITCH))
+
+// Use this when updating your texture: bytes from one VRAM row to the next
+#define PSX_GPU_FB_STRIDE (PSX_GPU_VRAM_PITCH * 2)
+
+#define PSX_GPU_VRAM_SIZE (PSX_GPU_VRAM_PITCH * PSX_GPU_FB_HEIGHT * 2)
 
 #define PSX_GPU_CLOCK_NTSC 536932       // 53.693175 MHz
 #define PSX_GPU_CLOCK_FREQ_NTSC 1.0739f // Closer to original working values
@@ -200,6 +220,28 @@ struct psx_gpu_t
        row is drawn. See gpu_update_field in gpu.c. */
     int32_t field;
     int32_t skip_rows;
+
+    /*
+        The share of the drawing area this board rasterizes, when two boards
+        divide the work: band_share is 0 to 256 (256 = all of it) and band_top
+        says which end it takes. The split follows the drawing area rather than
+        fixed rows of VRAM, so a game that draws into two buffers in turn splits
+        the same way in either of them. Uploads and VRAM copies ignore it: both
+        boards keep every texture, only drawing is divided.
+        draw_ry1/draw_ry2 are the drawing area narrowed to this board's share -
+        what the rasterizer clips to. The game reads back its own draw_y1/draw_y2.
+    */
+    /* an upload into a frame buffer is colour, one into the texture area is
+       palette indices: only the first is converted (see gpu_upload_is_image) */
+    int32_t upload_img;
+
+    /* the two frame buffer rectangles an upload or a read back is judged
+       against, pixel by pixel: [x0, x1) x [y0, y1), the display window and the
+       drawing area, empty when x0 == x1 (see gpu_img_rects in gpu.c) */
+    uint16_t img_rect[2][4];
+
+    int32_t band_share, band_top;
+    int32_t draw_ry1, draw_ry2;
 };
 
 psx_gpu_t *psx_gpu_create(void);
@@ -221,6 +263,9 @@ uint32_t psx_gpu_cycles_to_edge(const psx_gpu_t *);
    goes on screen now. What gpu_hblank_event does at the blank, without the
    interrupt and the callbacks. */
 void psx_gpu_set_field(psx_gpu_t *, uint32_t field);
+
+/* the share of the drawing area this board draws (see band_share in psx_gpu_t) */
+void psx_gpu_set_band(psx_gpu_t *, int32_t share, int32_t top);
 
 /* Copies whole rows of a CPU -> VRAM transfer straight into VRAM, bypassing the
    per word command path. Returns the 32 bit words consumed (possibly zero, in
