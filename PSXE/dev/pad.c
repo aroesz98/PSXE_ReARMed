@@ -6,6 +6,42 @@
 #include "../log.h"
 
 #define JOY_IRQ_DELAY 512
+#define MCD_ACK_DELAY 1024
+
+/*
+    One byte with the memory card, the way the port exchanges it: the card
+    answers while the byte goes out, so its answer is made here, when the byte
+    is written, and waits in the receive buffer until the game reads it; and
+    the card acknowledges every byte - the interrupt, JOY_STAT bits 7 and 9 -
+    except the last one of its command. The card's answer used to be made when
+    the game read it, and the last byte was acknowledged like any other: the
+    stray interrupt after every sector could land in the BIOS's card driver as
+    the answer to its next byte, and a game that deselected the card before
+    reading the final "G" got FFh (the transfer was reset) - either way the
+    BIOS took the write for a failed one.
+*/
+static void pad_mcd_transfer(psx_pad_t *pad, int32_t slot, psx_mcd_t *mcd, uint8_t data)
+{
+    psx_mcd_write(mcd, data);
+
+    pad->mcd_rx = psx_mcd_read(mcd);
+    pad->mcd_rx_full = 1;
+
+    if (psx_mcd_query(mcd))
+    {
+        if (pad->ctrl & CTRL_ACIE)
+        {
+            pad->irq_bit = 1;
+            pad->ack_bit = 1;
+            pad->cycles_until_irq = (data == DEST_MCD) ? JOY_IRQ_DELAY : MCD_ACK_DELAY;
+        }
+    }
+    else
+    {
+        /* the card has let go: the next byte picks a device again */
+        pad->dest[slot] = 0;
+    }
+}
 
 uint32_t pad_read_rx(psx_pad_t *pad)
 {
@@ -13,6 +49,15 @@ uint32_t pad_read_rx(psx_pad_t *pad)
 
     psx_input_t *joy = pad->joy_slot[slot];
     psx_mcd_t *mcd = pad->mcd_slot[slot];
+
+    /* the memory card's answer to the byte sent last, even after the card
+       has been deselected */
+    if (pad->mcd_rx_full)
+    {
+        pad->mcd_rx_full = 0;
+
+        return pad->mcd_rx;
+    }
 
     if (!pad->dest[slot])
         return 0xffffffff;
@@ -42,19 +87,11 @@ uint32_t pad_read_rx(psx_pad_t *pad)
 
     case DEST_MCD:
     {
+        /* the answer has been read already (above): an empty buffer reads FFh */
         if (!mcd)
-        {
             pad->dest[slot] = 0;
 
-            return 0xffffffff;
-        }
-
-        uint8_t data = psx_mcd_read(mcd);
-
-        if (!psx_mcd_query(mcd))
-            pad->dest[slot] = 0;
-
-        return data;
+        return 0xffffffff;
     }
     break;
     }
@@ -72,6 +109,10 @@ void pad_write_tx(psx_pad_t *pad, uint16_t data)
     if (!(pad->ctrl & CTRL_TXEN))
         return;
 
+    /* every byte sent brings its own answer: whatever the card's last one was,
+       it is not what this byte gets */
+    pad->mcd_rx_full = 0;
+
     if (!pad->dest[slot])
     {
         if ((data == DEST_JOY) || (data == DEST_MCD))
@@ -81,8 +122,13 @@ void pad_write_tx(psx_pad_t *pad, uint16_t data)
             if ((data == DEST_JOY) && !joy)
                 return;
 
-            if ((data == DEST_MCD) && !mcd)
+            if (data == DEST_MCD)
+            {
+                if (mcd)
+                    pad_mcd_transfer(pad, slot, mcd, (uint8_t)data);
+
                 return;
+            }
 
             if (pad->ctrl & CTRL_ACIE)
                 pad->cycles_until_irq = JOY_IRQ_DELAY;
@@ -117,20 +163,10 @@ void pad_write_tx(psx_pad_t *pad, uint16_t data)
                 return;
             }
 
-            psx_mcd_write(mcd, data);
+            pad_mcd_transfer(pad, slot, mcd, (uint8_t)data);
 
-            if (pad->ctrl & CTRL_ACIE)
-            {
-                pad->irq_bit = 1;
-                pad->cycles_until_irq = 1024;
-
-                return;
-            }
-
-            if (!psx_mcd_query(mcd))
-                pad->dest[slot] = 0;
+            return;
         }
-        break;
         }
 
         if (pad->ctrl & CTRL_ACIE)
@@ -143,7 +179,12 @@ void pad_write_tx(psx_pad_t *pad, uint16_t data)
 
 uint32_t pad_handle_stat_read(psx_pad_t *pad)
 {
-    return pad->stat | 7;
+    const uint32_t v = pad->stat | 7;
+
+    /* /ACK is a pulse: seen once */
+    pad->stat &= (uint16_t)~STAT_ACKL;
+
+    return v;
 }
 
 void pad_handle_ctrl_write(psx_pad_t *pad, uint32_t value)
@@ -432,6 +473,11 @@ int32_t psx_pad_attach_mcd(psx_pad_t *pad, int32_t slot, const char *path)
     return 0;
 }
 
+psx_mcd_t *psx_pad_get_mcd(psx_pad_t *pad, int32_t slot)
+{
+    return pad->mcd_slot[slot];
+}
+
 void psx_pad_detach_mcd(psx_pad_t *pad, int32_t slot)
 {
     if (!pad->mcd_slot[slot])
@@ -456,6 +502,12 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_pad_update(psx_pad_t *pa
             {
                 pad->stat |= STAT_IRQ7;
                 pad->irq_bit = 0;
+            }
+
+            if (pad->ack_bit)
+            {
+                pad->stat |= STAT_ACKL;
+                pad->ack_bit = 0;
             }
 
             pad->cycles_until_irq = 0;

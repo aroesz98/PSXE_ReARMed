@@ -234,30 +234,59 @@ static inline void __attribute__((always_inline)) psx_cpu_branch(psx_cpu_t *cpu,
 
 #define BRANCH(offset) psx_cpu_branch(cpu, (offset))
 
+/*
+    What the console prints: the BIOS's putchar / puts (A(09h), A(3Ch), A(3Eh),
+    B(3Bh), B(3Dh), B(3Fh)), which games and the BIOS use for debug text, and
+    the expansion port's TTY. It went to the C library's putchar - and in this
+    build the C library writes by semihosting, a BKPT 0xABh for a debugger to
+    answer. After a power cycle the hard fault handler (semihost_hardfault.c)
+    skips it; but after the probe has flashed the board its debug enable stays
+    on, and the first character a game printed halted the core for good:
+    Atlantis did not start from the picker. Now: to the debug UART with
+    PSXE_TTY=1, nowhere otherwise (87 us a character on the UART would slow a
+    chatty game down).
+*/
+#ifndef PSXE_TTY
+#define PSXE_TTY 0
+#endif
+
+void psx_tty_putchar(int c)
+{
+#if PSXE_TTY
+    PRINTF("%c", c);
+#else
+    (void)c;
+#endif
+}
+
+static void cpu_tty_puts(psx_cpu_t *cpu, uint32_t src)
+{
+#if PSXE_TTY
+    char c = psx_bus_fast_read8(cpu->bus, src++);
+
+    while (c)
+    {
+        psx_tty_putchar(c);
+
+        c = psx_bus_fast_read8(cpu->bus, src++);
+    }
+#else
+    (void)cpu;
+    (void)src;
+#endif
+}
+
 void cpu_a_kcall_hook(psx_cpu_t *cpu)
 {
     switch (cpu->r[9])
     {
     case 0x09:
-        putc(R_A0, stdout);
-        break;
     case 0x3c:
-        putchar(R_A0);
+        psx_tty_putchar((int)(uint8_t)R_A0);
         break;
     case 0x3e:
-    {
-        uint32_t src = R_A0;
-
-        char c = psx_bus_fast_read8(cpu->bus, src++);
-
-        while (c)
-        {
-            putchar(c);
-
-            c = psx_bus_fast_read8(cpu->bus, src++);
-        }
-    }
-    break;
+        cpu_tty_puts(cpu, R_A0);
+        break;
     }
 }
 
@@ -266,25 +295,12 @@ void cpu_b_kcall_hook(psx_cpu_t *cpu)
     switch (cpu->r[9])
     {
     case 0x3b:
-        putc(R_A0, stdout);
-        break;
     case 0x3d:
-        putchar(R_A0);
+        psx_tty_putchar((int)(uint8_t)R_A0);
         break;
     case 0x3f:
-    {
-        uint32_t src = R_A0;
-
-        char c = psx_bus_fast_read8(cpu->bus, src++);
-
-        while (c)
-        {
-            putchar(c);
-
-            c = psx_bus_fast_read8(cpu->bus, src++);
-        }
-    }
-    break;
+        cpu_tty_puts(cpu, R_A0);
+        break;
     }
 }
 

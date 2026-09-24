@@ -120,6 +120,12 @@ typedef struct
   int32_t dest[2];
   int32_t irq_bit;
 
+  /* the memory card's side of the port (pad.c, pad_mcd_transfer): its answer
+     to the last byte sent, and the /ACK that comes with the interrupt */
+  uint8_t mcd_rx;
+  int32_t mcd_rx_full;
+  int32_t ack_bit;
+
   uint16_t mode, ctrl, baud, stat;
 } psx_pad_t;
 
@@ -138,6 +144,8 @@ void psx_pad_analog_change(psx_pad_t *, int32_t, uint32_t, uint16_t);
 void psx_pad_attach_joy(psx_pad_t *, int32_t, psx_input_t *);
 void psx_pad_detach_joy(psx_pad_t *, int32_t);
 int32_t psx_pad_attach_mcd(psx_pad_t *, int32_t, const char *);
+/* the memory card in a slot, NULL if there is none */
+psx_mcd_t *psx_pad_get_mcd(psx_pad_t *, int32_t);
 
 /* Saves memory card changes to the SD card once the game is done writing (psx_mcd_tick) */
 void psx_pad_tick_mcd(psx_pad_t *, uint32_t now_ms);

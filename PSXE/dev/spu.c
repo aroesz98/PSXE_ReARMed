@@ -10,6 +10,10 @@
 
 #define VOICE_COUNT 24
 
+/* The mixing runs 44100 times a second: from OCRAM rather than XIP flash, where
+   it fought the translated code for the instruction cache. */
+#define SPU_FAST __attribute__((section(".ramfunc.$SRAM_OC")))
+
 #if PSXE_SOUND >= 2
 static const int32_t g_spu_pos_adpcm_table[] = {
     0, +60, +115, +98, +122};
@@ -17,7 +21,8 @@ static const int32_t g_spu_pos_adpcm_table[] = {
 static const int32_t g_spu_neg_adpcm_table[] = {
     0, 0, -52, -55, -60};
 
-static const int16_t g_spu_gauss_table[] = {
+/* four reads per voice and sample: in DTCM, not in flash behind the data cache */
+static const int16_t __attribute__((section(".data.$SRAM_DTC"), aligned(4))) g_spu_gauss_table[] = {
     -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001,
     -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001,
     0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0001,
@@ -86,6 +91,8 @@ static const int16_t g_spu_gauss_table[] = {
 #endif
 
 static psx_spu_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) g_spu_instance;
+
+_Static_assert((offsetof(psx_spu_t, data) & 3u) == 0, "psx_spu_t.data on a word boundary");
 
 psx_spu_t *psx_spu_create(void)
 {
@@ -187,7 +194,7 @@ static inline void spu_read_block_flags(psx_spu_t *spu, int32_t v)
 }
 
 #if PSXE_SOUND >= 2
-void spu_read_block(psx_spu_t *spu, int32_t v)
+void SPU_FAST spu_read_block(psx_spu_t *spu, int32_t v)
 {
     uint32_t addr = spu->data[v].current_addr & SPU_RAM_MASK;
 
@@ -218,20 +225,27 @@ void spu_read_block(psx_spu_t *spu, int32_t v)
     int32_t f0 = g_spu_pos_adpcm_table[filter];
     int32_t f1 = g_spu_neg_adpcm_table[filter];
 
+    /* the filter's history in registers rather than in the voice */
+    int16_t h0 = spu->data[v].h[0];
+    int16_t h1 = spu->data[v].h[1];
+
     for (int32_t j = 0; j < 28; j++)
     {
         uint16_t n = (block[2 + (j >> 1)] >> ((j & 1) * 4)) & 0xf;
 
         // Sign extend t
         int16_t t = (int16_t)(n << 12) >> 12;
-        int16_t s = (t << shift) + (((spu->data[v].h[0] * f0) + (spu->data[v].h[1] * f1) + 32) / 64);
+        int16_t s = (t << shift) + (((h0 * f0) + (h1 * f1) + 32) / 64);
 
         s = (s < INT16_MIN) ? INT16_MIN : ((s > INT16_MAX) ? INT16_MAX : s);
 
-        spu->data[v].h[1] = spu->data[v].h[0];
-        spu->data[v].h[0] = s;
+        h1 = h0;
+        h0 = s;
         spu->data[v].buf[j] = s;
     }
+
+    spu->data[v].h[0] = h0;
+    spu->data[v].h[1] = h1;
 }
 #endif
 
@@ -276,7 +290,8 @@ enum
     ADSR_END
 };
 
-void adsr_calculate_values(psx_spu_t *spu, int32_t v)
+/* called by every envelope step: next to the mixer, not in flash */
+void SPU_FAST adsr_calculate_values(psx_spu_t *spu, int32_t v)
 {
     CYCLES = 1 << MAX(0, SHIFT - 11);
     LEVEL_STEP = STEP << MAX(0, 11 - SHIFT);
@@ -290,7 +305,7 @@ void adsr_calculate_values(psx_spu_t *spu, int32_t v)
     spu->data[v].adsr_cycles_reload = CYCLES;
 }
 
-void adsr_load_attack(psx_spu_t *spu, int32_t v)
+void SPU_FAST adsr_load_attack(psx_spu_t *spu, int32_t v)
 {
     EXPONENTIAL = spu->data[v].envctl >> 15;
     DECREASE = 0;
@@ -302,7 +317,7 @@ void adsr_load_attack(psx_spu_t *spu, int32_t v)
     adsr_calculate_values(spu, v);
 }
 
-void adsr_load_decay(psx_spu_t *spu, int32_t v)
+void SPU_FAST adsr_load_decay(psx_spu_t *spu, int32_t v)
 {
     EXPONENTIAL = 1;
     DECREASE = 1;
@@ -314,7 +329,7 @@ void adsr_load_decay(psx_spu_t *spu, int32_t v)
     adsr_calculate_values(spu, v);
 }
 
-void adsr_load_sustain(psx_spu_t *spu, int32_t v)
+void SPU_FAST adsr_load_sustain(psx_spu_t *spu, int32_t v)
 {
     EXPONENTIAL = spu->data[v].envctl >> 31;
     DECREASE = (spu->data[v].envctl >> 30) & 1;
@@ -327,7 +342,7 @@ void adsr_load_sustain(psx_spu_t *spu, int32_t v)
     adsr_calculate_values(spu, v);
 }
 
-void adsr_load_release(psx_spu_t *spu, int32_t v)
+void SPU_FAST adsr_load_release(psx_spu_t *spu, int32_t v)
 {
     EXPONENTIAL = (spu->data[v].envctl >> 21) & 1;
     DECREASE = 1;
@@ -340,7 +355,7 @@ void adsr_load_release(psx_spu_t *spu, int32_t v)
     adsr_calculate_values(spu, v);
 }
 
-void spu_handle_adsr(psx_spu_t *spu, int32_t v)
+void SPU_FAST spu_handle_adsr(psx_spu_t *spu, int32_t v)
 {
     if (CYCLES)
     {
@@ -425,8 +440,9 @@ void spu_kon(psx_spu_t *spu, uint32_t value)
             spu->data[i].playing = 1;
             spu->data[i].current_addr = spu->voice[i].adsaddr << 3;
             spu->data[i].repeat_addr = spu->voice[i].adraddr << 3;
-            spu->data[i].lvol = ((float)(spu->voice[i].volumel) / 32767.0f) * 2.0f;
-            spu->data[i].rvol = ((float)(spu->voice[i].volumer) / 32767.0f) * 2.0f;
+            /* fixed volume: bits 14-0 are half the signed volume (sweeps are not emulated) */
+            spu->data[i].lvol = (int16_t)(spu->voice[i].volumel << 1);
+            spu->data[i].rvol = (int16_t)(spu->voice[i].volumer << 1);
             spu->data[i].adsr_sustain_level = ((spu->voice[i].envctl1 & 0xf) + 1) * 0x800;
             spu->data[i].envctl = (((uint32_t)spu->voice[i].envctl2) << 16) |
                                   (uint32_t)spu->voice[i].envctl1;
@@ -584,274 +600,434 @@ void psx_spu_destroy(psx_spu_t *spu)
 }
 
 #if PSXE_SOUND >= 2
-// To-do: Optimize reverb
-
-int16_t spu_read_reverb(psx_spu_t *spu, uint32_t addr)
+/*
+    The reverb, run for every other sample. Its work area is SPU RAM from mbase to
+    the end, a ring the current address (revbaddr) moves through; every tap is an
+    offset from it. This used to take a division (the modulo of the wrap) for
+    each of its ~40 reads and writes and did its arithmetic in float: about 1300
+    cycles a sample, as much as all the voices together. The same arithmetic in
+    integers, the wrap a subtraction (an offset is less than the area but for
+    odd settings, which still get the modulo).
+*/
+static inline __attribute__((always_inline)) uint32_t spu_rv_addr(uint32_t base_rel, uint32_t size, uint32_t mbase,
+                                                                  uint32_t off)
 {
-    uint32_t mbase = spu->mbase << 3;
+    /* base_rel is the current address in the area plus one area, so that taps
+       below the current address (off "negative") stay above zero: an ordinary
+       tap is at most two areas on, an odd one gets the modulo */
+    uint32_t rel = base_rel + off;
 
-    uint32_t relative = (addr + spu->revbaddr - mbase) % (0x80000 - mbase);
-    uint32_t wrapped = (mbase + relative) & 0x7fffe;
+    if (rel >= size)
+        rel -= size;
 
-    return *(int16_t *)(spu->ram + wrapped);
+    if (rel >= size)
+        rel -= size;
+
+    if (rel >= size)
+        rel %= size;
+
+    return (mbase + rel) & 0x7fffe;
 }
 
-void spu_write_reverb(psx_spu_t *spu, uint32_t addr, int16_t value)
-{
-    uint32_t mbase = spu->mbase << 3;
-
-    uint32_t relative = (addr + spu->revbaddr - mbase) % (0x80000 - mbase);
-    uint32_t wrapped = (mbase + relative) & 0x7fffe;
-
-    *(int16_t *)(spu->ram + wrapped) = value;
-}
-
-#define R16(addr) (spu_read_reverb(spu, addr))
-#define W16(addr, value) spu_write_reverb(spu, addr, value)
-
+#define R16(off) (*(const int16_t *)(ram + spu_rv_addr(base_rel, size, mbase, (off))))
+#define W16(off, value) (*(int16_t *)(ram + spu_rv_addr(base_rel, size, mbase, (off))) = (int16_t)(value))
 #define SAT(v) CLAMP(v, INT16_MIN, INT16_MAX)
+#define MUL(a, b) (((int32_t)(a) * (int32_t)(b)) >> 15)
 
-void spu_get_reverb_sample(psx_spu_t *spu, int32_t inl, int32_t inr, int32_t *outl, int32_t *outr)
+void SPU_FAST spu_get_reverb_sample(psx_spu_t *spu, int32_t inl, int32_t inr, int32_t *outl, int32_t *outr)
 {
-    uint32_t mbase = spu->mbase << 3;
-    uint32_t dapf1 = spu->dapf1 << 3;
-    uint32_t dapf2 = spu->dapf2 << 3;
-    uint32_t mlsame = spu->mlsame << 3;
-    uint32_t mrsame = spu->mrsame << 3;
-    uint32_t dlsame = spu->dlsame << 3;
-    uint32_t drsame = spu->drsame << 3;
-    uint32_t mldiff = spu->mldiff << 3;
-    uint32_t mrdiff = spu->mrdiff << 3;
-    uint32_t dldiff = spu->dldiff << 3;
-    uint32_t drdiff = spu->drdiff << 3;
-    uint32_t mlcomb1 = spu->mlcomb1 << 3;
-    uint32_t mlcomb2 = spu->mlcomb2 << 3;
-    uint32_t mlcomb3 = spu->mlcomb3 << 3;
-    uint32_t mlcomb4 = spu->mlcomb4 << 3;
-    uint32_t mrcomb1 = spu->mrcomb1 << 3;
-    uint32_t mrcomb2 = spu->mrcomb2 << 3;
-    uint32_t mrcomb3 = spu->mrcomb3 << 3;
-    uint32_t mrcomb4 = spu->mrcomb4 << 3;
-    uint32_t mlapf1 = spu->mlapf1 << 3;
-    uint32_t mlapf2 = spu->mlapf2 << 3;
-    uint32_t mrapf1 = spu->mrapf1 << 3;
-    uint32_t mrapf2 = spu->mrapf2 << 3;
+    uint8_t *const ram = spu->ram;
+    const uint32_t mbase = spu->mbase << 3;
+    const uint32_t size = 0x80000u - mbase;
+    /* offsets of taps below the current address wrap through the top of the area */
+    const uint32_t base_rel = (spu->revbaddr - mbase) + size;
 
-    float vlin = (float)spu->vlin;
-    float vrin = (float)spu->vrin;
-    float viir = (float)spu->viir;
-    float vwall = (float)spu->vwall;
-    float vcomb1 = (float)spu->vcomb1;
-    float vcomb2 = (float)spu->vcomb2;
-    float vcomb3 = (float)spu->vcomb3;
-    float vcomb4 = (float)spu->vcomb4;
-    float vapf1 = (float)spu->vapf1;
-    float vapf2 = (float)spu->vapf2;
-    float vlout = (float)spu->vlout;
-    float vrout = (float)spu->vrout;
+    const uint32_t dapf1 = spu->dapf1 << 3;
+    const uint32_t dapf2 = spu->dapf2 << 3;
+    const uint32_t mlsame = spu->mlsame << 3;
+    const uint32_t mrsame = spu->mrsame << 3;
+    const uint32_t dlsame = spu->dlsame << 3;
+    const uint32_t drsame = spu->drsame << 3;
+    const uint32_t mldiff = spu->mldiff << 3;
+    const uint32_t mrdiff = spu->mrdiff << 3;
+    const uint32_t dldiff = spu->dldiff << 3;
+    const uint32_t drdiff = spu->drdiff << 3;
+    const uint32_t mlapf1 = spu->mlapf1 << 3;
+    const uint32_t mlapf2 = spu->mlapf2 << 3;
+    const uint32_t mrapf1 = spu->mrapf1 << 3;
+    const uint32_t mrapf2 = spu->mrapf2 << 3;
 
-    int32_t lin = (vlin * inl) / 32768.0f;
-    int32_t rin = (vrin * inr) / 32768.0f;
+    const int32_t viir = spu->viir;
+    const int32_t vwall = spu->vwall;
+    const int32_t vapf1 = spu->vapf1;
+    const int32_t vapf2 = spu->vapf2;
+
+    const int32_t lin = MUL(spu->vlin, inl);
+    const int32_t rin = MUL(spu->vrin, inr);
 
     // same side reflection ltol and rtor
-    int16_t mlsamev = SAT(lin + ((R16(dlsame) * vwall) / 32768.0f) - ((R16(mlsame - 2) * viir) / 32768.0f) + R16(mlsame - 2));
-    int16_t mrsamev = SAT(rin + ((R16(drsame) * vwall) / 32768.0f) - ((R16(mrsame - 2) * viir) / 32768.0f) + R16(mrsame - 2));
-    W16(mlsame, mlsamev);
-    W16(mrsame, mrsamev);
+    const int32_t mls2 = R16(mlsame - 2u);
+    const int32_t mrs2 = R16(mrsame - 2u);
+    W16(mlsame, SAT(lin + MUL(R16(dlsame), vwall) - MUL(mls2, viir) + mls2));
+    W16(mrsame, SAT(rin + MUL(R16(drsame), vwall) - MUL(mrs2, viir) + mrs2));
 
     // different side reflection ltor and rtol
-    int16_t mldiffv = SAT(lin + ((R16(drdiff) * vwall) / 32768.0f) - ((R16(mldiff - 2) * viir) / 32768.0f) + R16(mldiff - 2));
-    int16_t mrdiffv = SAT(rin + ((R16(dldiff) * vwall) / 32768.0f) - ((R16(mrdiff - 2) * viir) / 32768.0f) + R16(mrdiff - 2));
-    W16(mldiff, mldiffv);
-    W16(mrdiff, mrdiffv);
+    const int32_t mld2 = R16(mldiff - 2u);
+    const int32_t mrd2 = R16(mrdiff - 2u);
+    W16(mldiff, SAT(lin + MUL(R16(drdiff), vwall) - MUL(mld2, viir) + mld2));
+    W16(mrdiff, SAT(rin + MUL(R16(dldiff), vwall) - MUL(mrd2, viir) + mrd2));
 
     // early echo (comb filter with input from buffer)
-    int16_t l = SAT((vcomb1 * R16(mlcomb1) / 32768.0f) + (vcomb2 * R16(mlcomb2) / 32768.0f) + (vcomb3 * R16(mlcomb3) / 32768.0f) + (vcomb4 * R16(mlcomb4) / 32768.0f));
-    int16_t r = SAT((vcomb1 * R16(mrcomb1) / 32768.0f) + (vcomb2 * R16(mrcomb2) / 32768.0f) + (vcomb3 * R16(mrcomb3) / 32768.0f) + (vcomb4 * R16(mrcomb4) / 32768.0f));
+    int32_t l = SAT(MUL(spu->vcomb1, R16(spu->mlcomb1 << 3)) + MUL(spu->vcomb2, R16(spu->mlcomb2 << 3)) +
+                    MUL(spu->vcomb3, R16(spu->mlcomb3 << 3)) + MUL(spu->vcomb4, R16(spu->mlcomb4 << 3)));
+    int32_t r = SAT(MUL(spu->vcomb1, R16(spu->mrcomb1 << 3)) + MUL(spu->vcomb2, R16(spu->mrcomb2 << 3)) +
+                    MUL(spu->vcomb3, R16(spu->mrcomb3 << 3)) + MUL(spu->vcomb4, R16(spu->mrcomb4 << 3)));
 
     // late reverb apf1 (all pass filter 1 with input from comb)
-    l = SAT(l - SAT((vapf1 * R16(mlapf1 - dapf1)) / 32768.0f));
-    r = SAT(r - SAT((vapf1 * R16(mrapf1 - dapf1)) / 32768.0f));
+    const int32_t la1 = R16(mlapf1 - dapf1);
+    const int32_t ra1 = R16(mrapf1 - dapf1);
+
+    l = SAT(l - SAT(MUL(vapf1, la1)));
+    r = SAT(r - SAT(MUL(vapf1, ra1)));
 
     W16(mlapf1, l);
     W16(mrapf1, r);
 
-    l = SAT((l * vapf1 / 32768.0f) + R16(mlapf1 - dapf1));
-    r = SAT((r * vapf1 / 32768.0f) + R16(mrapf1 - dapf1));
+    l = SAT(MUL(l, vapf1) + la1);
+    r = SAT(MUL(r, vapf1) + ra1);
 
     // late reverb apf2 (all pass filter 2 with input from apf1)
-    l = SAT(l - SAT((vapf2 * R16(mlapf2 - dapf2)) / 32768.0f));
-    r = SAT(r - SAT((vapf2 * R16(mrapf2 - dapf2)) / 32768.0f));
+    const int32_t la2 = R16(mlapf2 - dapf2);
+    const int32_t ra2 = R16(mrapf2 - dapf2);
+
+    l = SAT(l - SAT(MUL(vapf2, la2)));
+    r = SAT(r - SAT(MUL(vapf2, ra2)));
 
     W16(mlapf2, l);
     W16(mrapf2, r);
 
-    l = SAT((l * vapf2 / 32768.0f) + R16(mlapf2 - dapf2));
-    r = SAT((r * vapf2 / 32768.0f) + R16(mrapf2 - dapf2));
+    l = SAT(MUL(l, vapf2) + la2);
+    r = SAT(MUL(r, vapf2) + ra2);
 
     // output to mixer (output volume multiplied with input from apf2)
-    *outl = SAT(l * vlout / 32768.0f);
-    *outr = SAT(r * vrout / 32768.0f);
+    *outl = SAT(MUL(l, (int16_t)spu->vlout));
+    *outr = SAT(MUL(r, (int16_t)spu->vrout));
 
     spu->revbaddr = MAX(mbase, (spu->revbaddr + 2) & 0x7fffe);
 }
 
 #undef R16
 #undef W16
+#undef MUL
 
-uint32_t psx_spu_get_sample(psx_spu_t *spu)
+/*
+    The reverb's work area is in SDRAM, and in the time between two batches the
+    translated code and the rasterizer push its lines out of the data cache: a
+    batch found every tap cold, ~30 line fills of ~100 cycles, more than the
+    arithmetic. Their addresses for the whole batch are known in advance (each
+    tap moves 2 bytes a reverb step, n/2 steps a batch), so they are preloaded -
+    a few before each voice is mixed, so that they arrive while it is.
+*/
+#define SPU_RV_TAPS 28u
+#define SPU_RV_PRELOADS (2u * SPU_RV_TAPS)
+
+static uint32_t SPU_FAST spu_reverb_preloads(const psx_spu_t *spu, uint32_t n, const uint8_t **out)
 {
-    spu->even_cycle ^= 1;
+    const uint8_t *const ram = spu->ram;
+    const uint32_t mbase = spu->mbase << 3;
+    const uint32_t size = 0x80000u - mbase;
+    const uint32_t base_rel = (spu->revbaddr - mbase) + size;
+    const uint32_t dapf1 = spu->dapf1 << 3;
+    const uint32_t dapf2 = spu->dapf2 << 3;
+    const uint32_t mlapf1 = spu->mlapf1 << 3;
+    const uint32_t mrapf1 = spu->mrapf1 << 3;
+    const uint32_t mlapf2 = spu->mlapf2 << 3;
+    const uint32_t mrapf2 = spu->mrapf2 << 3;
 
-    int32_t left = 0;
-    int32_t right = 0;
-    int32_t revl = 0;
-    int32_t revr = 0;
+    /* where the batch's reverb steps read and write, first step */
+    const uint32_t taps[SPU_RV_TAPS] = {
+        (spu->mlsame << 3) - 2u, (spu->mrsame << 3) - 2u, spu->dlsame << 3, spu->drsame << 3,
+        (spu->mldiff << 3) - 2u, (spu->mrdiff << 3) - 2u, spu->dldiff << 3, spu->drdiff << 3,
+        spu->mlcomb1 << 3, spu->mrcomb1 << 3, spu->mlcomb2 << 3, spu->mrcomb2 << 3,
+        spu->mlcomb3 << 3, spu->mrcomb3 << 3, spu->mlcomb4 << 3, spu->mrcomb4 << 3,
+        mlapf1 - dapf1, mrapf1 - dapf1, mlapf2 - dapf2, mrapf2 - dapf2,
+        mlapf1, mrapf1, mlapf2, mrapf2,
+        spu->mlsame << 3, spu->mrsame << 3, spu->mldiff << 3, spu->mrdiff << 3,
+    };
 
-    spu->koff = 0;
-    spu->kon = 0;
+    /* the last step of the batch is n - 2 bytes on (n/2 steps, the first one now) */
+    const uint32_t last = (n > 2u) ? (n - 2u) : 0u;
 
-    for (int32_t v = 0; v < VOICE_COUNT; v++)
+    for (uint32_t t = 0; t < SPU_RV_TAPS; t++)
     {
-        if (!spu->data[v].playing)
-            continue;
+        out[2u * t] = ram + spu_rv_addr(base_rel, size, mbase, taps[t]);
+        out[2u * t + 1u] = ram + spu_rv_addr(base_rel, size, mbase, taps[t] + last);
+    }
 
-        spu_handle_adsr(spu, v);
+    return SPU_RV_PRELOADS;
+}
 
-        uint32_t sample_index = spu->data[v].counter >> 12;
+uint32_t SPU_FAST psx_spu_get_sample(psx_spu_t *spu)
+{
+    uint32_t sample;
+
+    psx_spu_get_samples(spu, &sample, 1);
+
+    return sample;
+}
+
+/*
+    The mixing, a batch at a time (psx.c makes 32 samples at once). Each playing
+    voice runs through the whole batch on its own - its position, interpolation
+    history and envelope count-down in registers instead of loaded and stored
+    for every sample - and adds itself into the batch's sums; then the reverb
+    and the main volume go through the batch sample by sample. The result is that
+    of the one-sample-at-a-time loop this replaces: no voice depends on another,
+    and what they share (ENDX, SPUSTAT, the IRQ) comes out the same in whatever
+    order they run.
+*/
+#define SPU_MIX_MAX 32u
+
+#define VD spu->data[v]
+
+static void SPU_FAST spu_mix_voice(psx_spu_t *spu, int32_t v, uint32_t n, int32_t *dry, int32_t *wet)
+{
+    const uint32_t step = spu->voice[v].adsampr;
+    const int32_t lvol = VD.lvol;
+    const int32_t rvol = VD.rvol;
+
+    uint32_t counter = VD.counter;
+    uint32_t prev = VD.prev_sample_index;
+    int32_t cycles = VD.adsr_cycles;
+    int32_t env = (int32_t)spu->voice[v].envcvol;
+    int16_t s0 = VD.s[0];
+    int16_t s1 = VD.s[1];
+    int16_t s2 = VD.s[2];
+    int16_t s3 = VD.s[3];
+
+    /* the next block, most likely the next one decoded */
+    __builtin_prefetch(&spu->ram[(VD.current_addr + 16u) & SPU_RAM_MASK]);
+
+    for (uint32_t i = 0; i < n; i++)
+    {
+        /* the envelope counts down most samples; the step itself is a call */
+        if (cycles)
+        {
+            cycles--;
+        }
+        else
+        {
+            VD.adsr_cycles = 0;
+            spu_handle_adsr(spu, v);
+            cycles = VD.adsr_cycles;
+            env = (int32_t)spu->voice[v].envcvol;
+        }
+
+        uint32_t sample_index = counter >> 12;
 
         if (sample_index > 27)
         {
             sample_index -= 28;
 
-            spu->data[v].counter &= 0xfff;
-            spu->data[v].counter |= sample_index << 12;
+            counter = (counter & 0xfffu) | (sample_index << 12);
 
-            if (spu->data[v].block_flags & 4)
-                spu->data[v].repeat_addr = spu->data[v].current_addr;
+            if (VD.block_flags & 4)
+                VD.repeat_addr = VD.current_addr;
 
-            switch (spu->data[v].block_flags & 3)
+            switch (VD.block_flags & 3)
             {
             case 0:
             case 2:
             {
-                spu_irq_check(spu, spu->data[v].current_addr);
+                spu_irq_check(spu, VD.current_addr);
 
-                spu->data[v].current_addr = (spu->data[v].current_addr + 0x10) & SPU_RAM_MASK;
+                VD.current_addr = (VD.current_addr + 0x10) & SPU_RAM_MASK;
 
-                spu_irq_check(spu, spu->data[v].current_addr);
+                spu_irq_check(spu, VD.current_addr);
             }
             break;
 
             case 1:
             {
-                spu->data[v].current_addr = spu->data[v].repeat_addr;
-                spu->data[v].playing = 0;
+                VD.current_addr = VD.repeat_addr;
+                VD.playing = 0;
                 spu->voice[v].envcvol = 0;
+                env = 0;
 
                 adsr_load_release(spu, v);
+
+                cycles = VD.adsr_cycles;
             }
             break;
 
             case 3:
             {
                 spu->endx |= 1 << v;
-                spu->data[v].current_addr = spu->data[v].repeat_addr;
+                VD.current_addr = VD.repeat_addr;
 
-                spu_irq_check(spu, spu->data[v].current_addr);
+                spu_irq_check(spu, VD.current_addr);
             }
             break;
             }
 
             spu_read_block(spu, v);
+
+            __builtin_prefetch(&spu->ram[(VD.current_addr + 16u) & SPU_RAM_MASK]);
         }
 
         //  Fetch ADPCM sample
-        if (spu->data[v].prev_sample_index != sample_index)
+        if (prev != sample_index)
         {
-            spu->data[v].s[3] = spu->data[v].s[2];
-            spu->data[v].s[2] = spu->data[v].s[1];
-            spu->data[v].s[1] = spu->data[v].s[0];
+            s3 = s2;
+            s2 = s1;
+            s1 = s0;
         }
 
-        spu->data[v].s[0] = spu->data[v].buf[sample_index];
+        s0 = VD.buf[sample_index];
 
         // Apply 4-point Gaussian interpolation
-        uint8_t gauss_index = (spu->data[v].counter >> 4) & 0xff;
-        int16_t g0 = g_spu_gauss_table[0x0ff - gauss_index];
-        int16_t g1 = g_spu_gauss_table[0x1ff - gauss_index];
-        int16_t g2 = g_spu_gauss_table[0x100 + gauss_index];
-        int16_t g3 = g_spu_gauss_table[0x000 + gauss_index];
-        int16_t out = spu->data[v].s[0];
+        const uint32_t gauss_index = (counter >> 4) & 0xffu;
+        int16_t out;
 
-        // out = interpolate_hermite(
-        //     spu->data[v].s[3],
-        //     spu->data[v].s[2],
-        //     spu->data[v].s[1],
-        //     spu->data[v].s[0],
-        //     (spu->data[v].counter & 0xfff) / 4096.0f
-        // );
+        out = (g_spu_gauss_table[0x0ff - gauss_index] * s3) >> 15;
+        out += (g_spu_gauss_table[0x1ff - gauss_index] * s2) >> 15;
+        out += (g_spu_gauss_table[0x100 + gauss_index] * s1) >> 15;
+        out += (g_spu_gauss_table[0x000 + gauss_index] * s0) >> 15;
 
-        out = (g0 * spu->data[v].s[3]) >> 15;
-        out += (g1 * spu->data[v].s[2]) >> 15;
-        out += (g2 * spu->data[v].s[1]) >> 15;
-        out += (g3 * spu->data[v].s[0]) >> 15;
+        /* envelope, then the voice's volume (1.15 each) */
+        const int32_t enved = ((int32_t)out * env) >> 15;
+        const int32_t samplel = (enved * lvol) >> 15;
+        const int32_t sampler = (enved * rvol) >> 15;
 
-        float adsr_vol = (float)spu->voice[v].envcvol / 32767.0f;
+        dry[2u * i] += samplel;
+        dry[2u * i + 1u] += sampler;
 
-        float samplel = (out * spu->data[v].lvol) * adsr_vol;
-        float sampler = (out * spu->data[v].rvol) * adsr_vol;
-
-        left += samplel;
-        right += sampler;
-
-        if (spu->eon & (1 << v))
+        if (wet)
         {
-            revl += samplel;
-            revr += sampler;
+            wet[2u * i] += samplel;
+            wet[2u * i + 1u] += sampler;
         }
-
-        uint16_t step = spu->voice[v].adsampr;
 
         /* To-do: Do pitch modulation here */
 
-        spu->data[v].prev_sample_index = spu->data[v].counter >> 12;
-        spu->data[v].counter += step;
+        prev = sample_index;
+        counter += step;
+
+        /* stopped by its envelope or its block: this sample was its last */
+        if (!VD.playing)
+            break;
     }
 
-    int16_t clamprl = CLAMP(revl, INT16_MIN, INT16_MAX);
-    int16_t clamprr = CLAMP(revr, INT16_MIN, INT16_MAX);
-    int16_t clampsl = CLAMP(left, INT16_MIN, INT16_MAX);
-    int16_t clampsr = CLAMP(right, INT16_MIN, INT16_MAX);
+    VD.counter = counter;
+    VD.prev_sample_index = prev;
+    VD.adsr_cycles = cycles;
+    VD.s[0] = s0;
+    VD.s[1] = s1;
+    VD.s[2] = s2;
+    VD.s[3] = s3;
+}
 
-    if ((spu->spucnt & 0x4000) == 0)
-        return 0;
+#undef VD
 
-    uint16_t clampl;
-    uint16_t clampr;
+static void SPU_FAST spu_mix_batch(psx_spu_t *spu, uint32_t *samples, uint32_t n)
+{
+    int32_t dry[2u * SPU_MIX_MAX];
+    int32_t wet[2u * SPU_MIX_MAX];
+    const uint8_t *pre[SPU_RV_PRELOADS];
+    uint32_t pre_n = 0;
+    uint32_t pre_i = 0;
 
-    if (spu->spucnt & 0x0080)
+    memset(dry, 0, 8u * n);
+    memset(wet, 0, 8u * n);
+
+    spu->koff = 0;
+    spu->kon = 0;
+
+    if ((spu->spucnt & 0x4080) == 0x4080)
+        pre_n = spu_reverb_preloads(spu, n, pre);
+
+    uint32_t playing = 0;
+
+    for (int32_t v = 0; v < VOICE_COUNT; v++)
+        playing += spu->data[v].playing ? 1u : 0u;
+
+    /* the preloads spread over the voices, the rest before the reverb */
+    const uint32_t per_voice = playing ? ((pre_n + playing - 1u) / playing) : 0u;
+
+    for (int32_t v = 0; v < VOICE_COUNT; v++)
     {
-        if (spu->even_cycle)
+        if (!spu->data[v].playing)
+            continue;
+
+        for (uint32_t k = 0; (k < per_voice) && (pre_i < pre_n); k++)
+            __builtin_prefetch(pre[pre_i++]);
+
+        spu_mix_voice(spu, v, n, dry, (spu->eon & (1 << v)) ? wet : NULL);
+    }
+
+    while (pre_i < pre_n)
+        __builtin_prefetch(pre[pre_i++]);
+
+    for (uint32_t i = 0; i < n; i++)
+    {
+        spu->even_cycle ^= 1;
+
+        int16_t clamprl = CLAMP(wet[2u * i], INT16_MIN, INT16_MAX);
+        int16_t clamprr = CLAMP(wet[2u * i + 1u], INT16_MIN, INT16_MAX);
+        int16_t clampsl = CLAMP(dry[2u * i], INT16_MIN, INT16_MAX);
+        int16_t clampsr = CLAMP(dry[2u * i + 1u], INT16_MIN, INT16_MAX);
+
+        if ((spu->spucnt & 0x4000) == 0)
         {
-            /* Use local variables to avoid taking address of packed members */
-            int32_t temp_lrsl, temp_lrsr;
-            spu_get_reverb_sample(spu, clamprl, clamprr, &temp_lrsl, &temp_lrsr);
-            spu->lrsl = temp_lrsl;
-            spu->lrsr = temp_lrsr;
+            samples[i] = 0;
+
+            continue;
         }
 
-        clampl = CLAMP((clampsl + spu->lrsl), INT16_MIN, INT16_MAX) * (float)spu->mainlvol / 32767.0f;
-        clampr = CLAMP((clampsr + spu->lrsr), INT16_MIN, INT16_MAX) * (float)spu->mainrvol / 32767.0f;
-    }
-    else
-    {
-        clampl = CLAMP(clampsl, INT16_MIN, INT16_MAX) * (float)spu->mainlvol / 32767.0f;
-        clampr = CLAMP(clampsr, INT16_MIN, INT16_MAX) * (float)spu->mainrvol / 32767.0f;
-    }
+        /* signed: a negative float converted to uint16_t is undefined, and on the
+           Cortex-M7 (vcvt.u32) it is 0 - every negative half wave was cut off */
+        int32_t clampl;
+        int32_t clampr;
 
-    return clampl | (((uint32_t)clampr) << 16);
+        if (spu->spucnt & 0x0080)
+        {
+            if (spu->even_cycle)
+            {
+                /* Use local variables to avoid taking address of packed members */
+                int32_t temp_lrsl, temp_lrsr;
+                spu_get_reverb_sample(spu, clamprl, clamprr, &temp_lrsl, &temp_lrsr);
+                spu->lrsl = temp_lrsl;
+                spu->lrsr = temp_lrsr;
+            }
+
+            clampl = (CLAMP((clampsl + spu->lrsl), INT16_MIN, INT16_MAX) * (int32_t)(int16_t)(spu->mainlvol << 1)) >> 15;
+            clampr = (CLAMP((clampsr + spu->lrsr), INT16_MIN, INT16_MAX) * (int32_t)(int16_t)(spu->mainrvol << 1)) >> 15;
+        }
+        else
+        {
+            /* the main volume as the hardware reads it: half the signed volume
+               (it was taken as the whole, 6 dB too quiet) */
+            clampl = (CLAMP(clampsl, INT16_MIN, INT16_MAX) * (int32_t)(int16_t)(spu->mainlvol << 1)) >> 15;
+            clampr = (CLAMP(clampsr, INT16_MIN, INT16_MAX) * (int32_t)(int16_t)(spu->mainrvol << 1)) >> 15;
+        }
+
+        samples[i] = (uint32_t)(uint16_t)clampl | ((uint32_t)(uint16_t)clampr << 16);
+    }
 }
+
+void SPU_FAST psx_spu_get_samples(psx_spu_t *spu, uint32_t *samples, uint32_t n)
+{
+    while (n)
+    {
+        const uint32_t k = (n > SPU_MIX_MAX) ? SPU_MIX_MAX : n;
+
+        spu_mix_batch(spu, samples, k);
+
+        samples += k;
+        n -= k;
+    }
+}
+
 #endif
 
 #if PSXE_SOUND >= 1

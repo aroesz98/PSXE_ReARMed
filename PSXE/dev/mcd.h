@@ -61,6 +61,10 @@ typedef struct
     uint32_t dirty_frames;
     int32_t written;  /* a frame was written since the last tick */
     uint32_t last_ms; /* when the last write was seen */
+
+    /* for the status on screen */
+    uint32_t saves;      /* saves to the file that went through */
+    int32_t save_failed; /* the last one did not */
 } psx_mcd_t;
 
 psx_mcd_t *psx_mcd_create(void);

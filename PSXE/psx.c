@@ -3,6 +3,7 @@
 #include "jit/jit.h"
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include "fsl_debug_console.h"
 #include "core_cm7.h"
 #include "FreeRTOS.h"
@@ -542,6 +543,61 @@ static inline uint32_t __attribute__((always_inline)) psx_cycles_to_event(const 
     return (n < PSX_DEV_SLICE_MIN) ? PSX_DEV_SLICE_MIN : n;
 }
 
+#if PSXE_SOUND == 2
+/*
+    The sound: every 768 emulated CPU cycles (33.8688 MHz / 44.1 kHz) one stereo
+    sample of the SPU's voices mixed with the CD's (XA or CD audio), made 32 at
+    a time and handed to the output. Making them also runs the voices -
+    envelopes, ENDX, the SPU interrupt - which psx_spu_update does silently when
+    nothing plays them (PSXE_SOUND 1).
+
+    32 (0.73 ms): the SPU mixes a batch voice by voice, and what it costs per
+    batch - every voice's state loaded once, the reverb's cold cache lines - is
+    spread over twice the samples of the 16 it was. The voices' state (ENDX,
+    envelopes, the IRQ) still moves every 0.73 ms, where a game looks at it once
+    a frame.
+*/
+#define PSX_AUDIO_CYCLES 768u
+#define PSX_AUDIO_BATCH 32u
+
+static inline int16_t psx_clamp16(int32_t v)
+{
+    return (int16_t)((v < -32768) ? -32768 : ((v > 32767) ? 32767 : v));
+}
+
+static void __attribute__((noinline, section(".ramfunc.$SRAM_OC"))) psx_audio_batch(psx_t *psx)
+{
+    int16_t buf[2u * PSX_AUDIO_BATCH];
+    uint32_t spu[PSX_AUDIO_BATCH];
+
+    memset(buf, 0, sizeof(buf));
+    psx_cdrom_get_audio_samples(psx->cdrom, buf, sizeof(buf));
+    psx_spu_get_samples(psx->spu, spu, PSX_AUDIO_BATCH);
+
+    for (uint32_t i = 0; i < PSX_AUDIO_BATCH; i++)
+    {
+        const uint32_t s = spu[i];
+
+        buf[2u * i] = psx_clamp16((int32_t)buf[2u * i] + (int16_t)(s & 0xffffu));
+        buf[2u * i + 1u] = psx_clamp16((int32_t)buf[2u * i + 1u] + (int16_t)(s >> 16));
+    }
+
+    psx_platform_audio_out(buf, PSX_AUDIO_BATCH);
+}
+
+static inline __attribute__((always_inline)) void psx_audio_update(psx_t *psx, uint32_t cycles)
+{
+    psx->audio_acc += cycles;
+
+    while (psx->audio_acc >= (PSX_AUDIO_CYCLES * PSX_AUDIO_BATCH))
+    {
+        psx->audio_acc -= PSX_AUDIO_CYCLES * PSX_AUDIO_BATCH;
+
+        psx_audio_batch(psx);
+    }
+}
+#endif
+
 void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_update(psx_t *psx)
 {
     psx_cpu_t *const cpu = psx->cpu;
@@ -620,6 +676,10 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_update(psx_t *psx)
     PROF_T0(t_d6);
     /* the voices run although nothing plays them: games wait on them */
     psx_spu_update(psx->spu, acc);
+    PROF_ADD(d_spu, t_d6);
+#elif PSXE_SOUND == 2
+    PROF_T0(t_d6);
+    psx_audio_update(psx, acc);
     PROF_ADD(d_spu, t_d6);
 #endif
 
@@ -706,7 +766,9 @@ float psx_get_display_aspect(psx_t *psx)
 
 void atcons_tx(void *udata, unsigned char c)
 {
-    putchar(c);
+    (void)udata;
+
+    psx_tty_putchar(c);
 }
 
 int32_t psx_init(psx_t *psx, const char *bios_path, const char *exp_path)

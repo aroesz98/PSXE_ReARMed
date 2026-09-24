@@ -35,6 +35,8 @@
 #include "overclock.h"
 #include "osd.h"
 #include "ui_draw.h"
+#include "audio_out.h"
+#include "../sound_switch.h"
 #include "../prof.h"
 #include "../jit/jit.h"
 #include "gamepad.h"
@@ -708,9 +710,36 @@ void psxe_screen_update(psxe_screen_t *screen)
                 osd_line(1, UI_RGB(200, 200, 200), "%u vbl", (unsigned)vblanks);
                 osd_line(2, UI_RGB(200, 200, 200), "%u fps", (unsigned)g_presented_frames);
                 osd_line(3, (temp >= 75) ? UI_RGB(240, 110, 90) : UI_RGB(200, 200, 200), "%d C", (int)temp);
+#if PSXE_SOUND == 2
+                {
+                    /* the sound: gaps in the last second (the emulation behind), or none */
+                    const uint32_t gaps = audio_out_underruns();
+
+                    if (!audio_out_ok())
+                        osd_line(4, UI_RGB(150, 150, 150), "no snd");
+                    else if (gaps)
+                        osd_line(4, UI_RGB(240, 210, 90), "snd -%u", (unsigned)gaps);
+                    else
+                        osd_line(4, UI_RGB(200, 200, 200), "snd ok");
+                }
+#endif
 #if PSXE_GPU_REMOTE
                 osd_line(5, UI_RGB(150, 150, 150), "%s", gpu_remote_state());
 #endif
+                {
+                    /* memory card 1: none, a save waiting to go to the SD card, the
+                       last save failed, or fine and how many saves went through */
+                    const psx_mcd_t *mcd = psx_pad_get_mcd(psx_get_pad(screen->psx), 0);
+
+                    if (!mcd)
+                        osd_line(6, UI_RGB(150, 150, 150), "mc -");
+                    else if (mcd->save_failed)
+                        osd_line(6, UI_RGB(240, 110, 90), "mc ERR");
+                    else if (mcd->dirty_frames)
+                        osd_line(6, UI_RGB(240, 210, 90), "mc wr");
+                    else
+                        osd_line(6, UI_RGB(200, 200, 200), "mc ok %u", (unsigned)mcd->saves);
+                }
             }
 
 #if PSX_JIT_HIST

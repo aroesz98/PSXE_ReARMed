@@ -122,7 +122,11 @@ int32_t psx_mcd_flush(psx_mcd_t *mcd)
     FIL file;
 
     if (f_open(&file, mcd->path, FA_WRITE | FA_OPEN_ALWAYS) != FR_OK)
+    {
+        mcd->save_failed = 1;
+
         return -1;
+    }
 
     int32_t saved = 0;
     int32_t err = 0;
@@ -158,10 +162,16 @@ int32_t psx_mcd_flush(psx_mcd_t *mcd)
         err = 1;
 
     if (err)
+    {
+        mcd->save_failed = 1;
+
         return -1;
+    }
 
     memset(mcd->dirty, 0, sizeof(mcd->dirty));
     mcd->dirty_frames = 0;
+    mcd->save_failed = 0;
+    mcd->saves++;
 
     return saved;
 }
@@ -200,6 +210,16 @@ uint8_t psx_mcd_read(psx_mcd_t *mcd)
         /* bit 3: no write since the card was inserted - cleared by the first
            good write (below), not by reading it */
         mcd->tx_data = mcd->flag;
+
+        /* not a command a card knows: the FLAG byte, then it goes quiet (no
+           acknowledge) */
+        if ((mcd->mode != 'R') && (mcd->mode != 'W') && (mcd->mode != 'S'))
+        {
+            mcd->tx_data_ready = 0;
+            mcd->state = MCD_STATE_TX_HIZ;
+
+            return mcd->tx_data;
+        }
         break;
     case MCD_STATE_TX_ID1:
         mcd->tx_data = 0x5a;
@@ -306,8 +326,11 @@ uint8_t psx_mcd_read(psx_mcd_t *mcd)
         mcd->tx_data = 0x00;
         break;
     case MCD_W_STATE_RX_LSB:
+        /* 128 data bytes follow, as for a read: with 127 the last byte of every
+           frame was never stored and the card's acknowledge came a byte early,
+           which the BIOS takes for a failed write */
         mcd->tx_data = mcd->msb;
-        mcd->pending_bytes = 127;
+        mcd->pending_bytes = 128;
         break;
     case MCD_W_STATE_RX_DATA:
     {

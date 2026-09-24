@@ -2,9 +2,10 @@
 #define PSXE_SOUND_SWITCH_H
 
 /*
-    How much of the sound hardware is emulated. This board has no audio output,
-    so no sound is ever heard; what is left to choose is how much of the SPU the
-    games can still see:
+    How much of the sound hardware is emulated. 2 (the default since the EVKB's
+    headphone jack plays it, source/audio_out.c) makes the sound; 0 and 1 are
+    for running without it - what is left to choose then is how much of the SPU
+    the games can still see:
 
       0  nothing beyond its registers and its sound RAM: a voice that is keyed
          on never plays and never ends. Saves psx_spu_update, some 2% of the
@@ -16,12 +17,11 @@
          (psx_spu_update, spu.c). Nothing that makes sound is built.
       2  sound is made as well: mixing, reverb, XA and CD audio decoding
          (psx_spu_get_sample, psx_cdrom_get_audio_samples) with their buffers,
-         about 115 KB of SDRAM. For a board with an audio output, which has to
-         call those for every sample and then drives the voices itself; here
-         nothing does, and the voices stand still as with 0.
+         about 115 KB of SDRAM - 44100 samples a second of emulated time
+         (psx_audio_update in psx.c), played by source/audio_out.c.
 */
 #ifndef PSXE_SOUND
-#define PSXE_SOUND 0
+#define PSXE_SOUND 2
 #endif
 
 #endif

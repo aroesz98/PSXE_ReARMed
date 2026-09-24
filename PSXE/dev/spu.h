@@ -122,6 +122,7 @@ typedef struct __attribute__((__packed__))
     int32_t lrsl;
     int32_t lrsr;
     int32_t even_cycle;
+    uint16_t align_data; /* data[] on a word boundary: its words are read 44100 times a second */
 
     struct
     {
@@ -134,8 +135,8 @@ typedef struct __attribute__((__packed__))
         int32_t block_flags;
         int16_t buf[28];
         int16_t h[2];
-        float lvol;
-        float rvol;
+        int32_t lvol; /* the volume at key on, signed 1.15 */
+        int32_t rvol;
         int32_t cvol;
         int32_t eon;
         int32_t reverbl;
@@ -190,6 +191,8 @@ void psx_spu_destroy(psx_spu_t *);
 #if PSXE_SOUND >= 2
 void psx_spu_update_cdda_buffer(psx_spu_t *, void *);
 uint32_t psx_spu_get_sample(psx_spu_t *);
+/* n samples as n calls of psx_spu_get_sample would make them, left in the low half */
+void psx_spu_get_samples(psx_spu_t *, uint32_t *out, uint32_t n);
 #endif
 
 #if PSXE_SOUND >= 1

@@ -28,6 +28,8 @@
 #include "pin_mux.h"
 #include "clock_config.h"
 #include "overclock.h"
+#include "audio_out.h"
+#include "sound_switch.h"
 #include "board.h"
 #include "fsl_gpio.h"
 #include "MIMXRT1052.h"
@@ -243,6 +245,9 @@ uint8_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) ucHeap[configTOTA
 
 /* PSX Emulator global variables */
 static psx_t *g_psx = NULL;
+
+/* how far the start got, for the probe (see the psxe_boot_stage calls below) */
+volatile int g_boot_stage;
 static psxe_screen_t *g_screen = NULL;
 static bool g_psxInitialized = false;
 
@@ -372,10 +377,14 @@ static void psx_emulator_task(void *pvParameters)
     {
         static char chosen_path[192];
 
+        g_boot_stage = 1; /* the picker */
+
         if (psxe_menu_pick(chosen_path, sizeof(chosen_path)))
             g_psxConfig.cd_path = chosen_path;
         else
             PRINTF("menu: no disc images found, keeping %s\r\n", g_psxConfig.cd_path);
+
+        g_boot_stage = 2; /* a game chosen */
     }
 
     /* Set PSX emulator log level to reduce verbosity */
@@ -393,6 +402,7 @@ static void psx_emulator_task(void *pvParameters)
 #endif
 
     /* Initialize PSX emulator */
+    g_boot_stage = 3; /* the console */
     PRINTF("Creating PSX emulator instance...\r\n");
     g_psx = psx_create();
     if (!g_psx)
@@ -418,6 +428,7 @@ static void psx_emulator_task(void *pvParameters)
     }
 
     /* Get CDROM handle */
+    g_boot_stage = 4; /* the disc */
     psx_cdrom_t *cdrom = psx_get_cdrom(g_psx);
     if (cdrom)
     {
@@ -439,6 +450,7 @@ static void psx_emulator_task(void *pvParameters)
     }
 
     /* Initialize screen/display */
+    g_boot_stage = 5; /* the screen */
     PRINTF("Creating PSX screen/display system...\r\n");
     g_screen = psxe_screen_create();
     if (!g_screen)
@@ -514,6 +526,8 @@ static void psx_emulator_task(void *pvParameters)
         PRINTF("Input system initialized\r\n");
     }
 
+    g_boot_stage = 6; /* the memory card */
+
     /* Memory cards: files on the SD card, 128 KB raw images (the .mcd / .mcr
        format other emulators use). A missing file becomes a new, formatted
        card; what a game saves reaches the file half a second after it stops
@@ -529,6 +543,14 @@ static void psx_emulator_task(void *pvParameters)
             PRINTF("Memory card 2 (%s) not available\r\n", PSXE_MCD2_PATH);
 #endif
     }
+
+    g_boot_stage = 7; /* the sound */
+
+#if PSXE_SOUND == 2
+    /* sound to the headphone jack (audio_out.c); without it the game runs silently */
+    if (audio_out_init())
+        PRINTF("audio: no sound output\r\n");
+#endif
 
     g_psxInitialized = true;
     PRINTF("PSX Emulator fully initialized!\r\n");
@@ -578,6 +600,7 @@ static void psx_emulator_task(void *pvParameters)
 //    }
 
     /* Main emulation loop */
+    g_boot_stage = 8; /* running */
     PRINTF("Starting PSX emulation loop...\r\n");
 
     psx_prof_init();
@@ -628,13 +651,31 @@ static void psx_emulator_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+/* Where the system stopped, for the probe: configASSERT (FreeRTOSConfig.h) and
+   the malloc failed hook come here. Interrupts off and a loop, as before -
+   but the place is kept and printed (the debug console writes without them). */
+volatile const char *g_assert_file;
+volatile int g_assert_line;
+
+void psxe_assert_failed(const char *file, int line)
+{
+    taskDISABLE_INTERRUPTS();
+
+    g_assert_file = file;
+    g_assert_line = line;
+
+    PRINTF("\r\nASSERT failed: %s:%d\r\n", file, line);
+
+    for (;;)
+        ;
+}
+
 /*!
  * @brief Malloc failed hook.
  */
 void vApplicationMallocFailedHook(void)
 {
-    for (;;)
-        ;
+    psxe_assert_failed("FreeRTOS heap: out of memory", (int)xPortGetFreeHeapSize());
 }
 
 void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer,

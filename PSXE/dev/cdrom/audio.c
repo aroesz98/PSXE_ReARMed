@@ -275,40 +275,30 @@ static const int32_t pos_adpcm_table[] = {
 static const int32_t neg_adpcm_table[] = {
     0, 0, -52, -55, -60};
 
+/*
+    37.8 or 18.9 kHz to 44.1: 7 of every 6 (or 3) samples. This used to spread
+    the sector out 7 times into a 56 KB buffer and take every 6th (3rd) sample of
+    that - its "linear" step was (k + 1) / 8 in integers, 0 for all k, so each
+    group of 7 was one sample repeated, the first group the previous sector's
+    last sample. Output sample i is group (i * m) / 7 of that, which is what is
+    taken here directly.
+*/
 void cdrom_resample_xa_buf(psx_cdrom_t *cdrom, int16_t *dst, int16_t *src, int32_t stereo, int16_t ls)
 {
     int32_t f18khz = ((cdrom->xa_buf[0x13] >> 2) & 1) == 1;
-    int32_t sample_count = stereo ? XA_STEREO_SAMPLES : XA_MONO_SAMPLES;
     int32_t resample_count = stereo ? XA_STEREO_RESAMPLE_SIZE : XA_MONO_RESAMPLE_SIZE;
 
     resample_count *= f18khz + 1;
 
-    // Nearest neighbor
-    // for (int32_t i = 0; i < sample_count; i++)
-    //     for (int32_t k = 0; k < 7; k++)
-    //         cdrom->xa_upsample_buf[(i*7)+k] = src[i];
+    const uint32_t m = f18khz ? 3u : 6u;
+    uint32_t pos = 0; /* i * m */
 
-    // Linear Upsampling
-    int16_t a = ls;
-    int16_t b = src[0];
-
-    for (int32_t k = 0; k < 7; k++)
-        cdrom->xa_upsample_buf[k] = a + ((k + 1) / 8) * (b - a);
-
-    for (int32_t i = 1; i < sample_count; i++)
+    for (int32_t i = 0; i < resample_count; i++, pos += m)
     {
-        a = b;
-        b = src[i];
+        const uint32_t group = pos / 7u;
 
-        for (int32_t k = 0; k < 7; k++)
-            cdrom->xa_upsample_buf[(i * 7) + k] =
-                a + ((k + 1) / 8) * (b - a);
+        dst[i] = group ? src[group - 1u] : ls;
     }
-
-    int32_t m = f18khz ? 3 : 6;
-
-    for (int32_t i = 0; i < resample_count; i++)
-        dst[i] = cdrom->xa_upsample_buf[i * m];
 
     cdrom->xa_remaining_samples = resample_count;
 }
@@ -429,7 +419,19 @@ int32_t cdrom_fetch_xa_sector(psx_cdrom_t *cdrom)
     }
 }
 
-int32_t cdrom_get_xa_samples(psx_cdrom_t *cdrom, void *buf, uint32_t size)
+/*
+    The CD's volume matrix as the hardware applies it: 80h is 100 % (FFh almost
+    200 %), the sum saturated. It was taken as value / 255 in floats - half the
+    volume, and a float multiply and conversion for every sample.
+*/
+static inline __attribute__((always_inline)) int16_t cdrom_mix_vol(int32_t a, int32_t va, int32_t b, int32_t vb)
+{
+    const int32_t v = (a * va + b * vb) >> 7;
+
+    return (int16_t)((v < INT16_MIN) ? INT16_MIN : ((v > INT16_MAX) ? INT16_MAX : v));
+}
+
+int32_t __attribute__((section(".ramfunc.$SRAM_OC"))) cdrom_get_xa_samples(psx_cdrom_t *cdrom, void *buf, uint32_t size)
 {
     if ((!cdrom->xa_playing) || !(cdrom->mode & MODE_XA_ADPCM))
     {
@@ -441,10 +443,10 @@ int32_t cdrom_get_xa_samples(psx_cdrom_t *cdrom, void *buf, uint32_t size)
         return 0;
     }
 
-    float ll_vol = (((float)cdrom->vol[0]) / 255.0f);
-    float lr_vol = (((float)cdrom->vol[1]) / 255.0f);
-    float rr_vol = (((float)cdrom->vol[2]) / 255.0f);
-    float rl_vol = (((float)cdrom->vol[3]) / 255.0f);
+    const int32_t ll_vol = cdrom->vol[0];
+    const int32_t lr_vol = cdrom->vol[1];
+    const int32_t rr_vol = cdrom->vol[2];
+    const int32_t rl_vol = cdrom->vol[3];
 
     int16_t *ptr = (int16_t *)buf;
 
@@ -510,15 +512,15 @@ int32_t cdrom_get_xa_samples(psx_cdrom_t *cdrom, void *buf, uint32_t size)
             cdrom->xa_prev_left_sample = cdrom->xa_left_resample_buf[cdrom->xa_sample_index];
             cdrom->xa_prev_right_sample = cdrom->xa_right_resample_buf[cdrom->xa_sample_index++];
 
-            *ptr++ = (cdrom->xa_prev_left_sample * ll_vol) + (cdrom->xa_prev_right_sample * rl_vol);
-            *ptr++ = (cdrom->xa_prev_left_sample * lr_vol) + (cdrom->xa_prev_right_sample * rr_vol);
+            *ptr++ = cdrom_mix_vol(cdrom->xa_prev_left_sample, ll_vol, cdrom->xa_prev_right_sample, rl_vol);
+            *ptr++ = cdrom_mix_vol(cdrom->xa_prev_left_sample, lr_vol, cdrom->xa_prev_right_sample, rr_vol);
         }
         else
         {
             cdrom->xa_prev_left_sample = cdrom->xa_mono_resample_buf[cdrom->xa_sample_index++];
 
-            *ptr++ = cdrom->xa_prev_left_sample * ll_vol;
-            *ptr++ = cdrom->xa_prev_left_sample * rr_vol;
+            *ptr++ = cdrom_mix_vol(cdrom->xa_prev_left_sample, ll_vol, 0, 0);
+            *ptr++ = cdrom_mix_vol(cdrom->xa_prev_left_sample, rr_vol, 0, 0);
         }
 
         --cdrom->xa_remaining_samples;
@@ -607,11 +609,6 @@ void cdrom_send_report_irq(psx_cdrom_t *cdrom)
     int32_t ss = (diff % (60 * 75)) / 75;
     int32_t ff = (diff % (60 * 75)) % 75;
 
-    PRINTF("report: track %u %02u:%02u:%02u relative=%d\r\n",
-           track,
-           mm, ss, ff,
-           relative);
-
     queue_push(cdrom->response, cdrom_get_stat(cdrom));
     queue_push(cdrom->response, ITOB(track));
     queue_push(cdrom->response, 1);
@@ -624,7 +621,7 @@ void cdrom_send_report_irq(psx_cdrom_t *cdrom)
     psx_ic_irq(cdrom->ic, IC_CDROM);
 }
 
-void psx_cdrom_get_audio_samples(psx_cdrom_t *cdrom, void *buf, uint32_t size)
+void __attribute__((section(".ramfunc.$SRAM_OC"))) psx_cdrom_get_audio_samples(psx_cdrom_t *cdrom, void *buf, uint32_t size)
 {
     if (!cdrom->disc)
         return;
@@ -642,10 +639,10 @@ void psx_cdrom_get_audio_samples(psx_cdrom_t *cdrom, void *buf, uint32_t size)
 
     int16_t *ptr = buf;
 
-    float ll_vol = (((float)cdrom->vol[0]) / 255.0f);
-    float lr_vol = (((float)cdrom->vol[1]) / 255.0f);
-    float rr_vol = (((float)cdrom->vol[2]) / 255.0f);
-    float rl_vol = (((float)cdrom->vol[3]) / 255.0f);
+    const int32_t ll_vol = cdrom->vol[0];
+    const int32_t lr_vol = cdrom->vol[1];
+    const int32_t rr_vol = cdrom->vol[2];
+    const int32_t rl_vol = cdrom->vol[3];
 
     for (int32_t i = 0; i < (size >> 1);)
     {
@@ -679,8 +676,8 @@ void psx_cdrom_get_audio_samples(psx_cdrom_t *cdrom, void *buf, uint32_t size)
         int16_t right = cdrom->cdda_buf[cdrom->cdda_sample_index++];
 
         // Apply volume settings to CDDA
-        ptr[i++] = left * ll_vol + right * rl_vol;
-        ptr[i++] = right * rr_vol + left * lr_vol;
+        ptr[i++] = cdrom_mix_vol(left, ll_vol, right, rl_vol);
+        ptr[i++] = cdrom_mix_vol(right, rr_vol, left, lr_vol);
 
         cdrom->cdda_remaining_samples -= 2;
     }

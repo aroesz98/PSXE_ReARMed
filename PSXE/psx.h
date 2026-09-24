@@ -35,7 +35,14 @@ typedef struct
     psx_cdrom_t *cdrom;
     psx_pad_t *pad;
     psx_mdec_t *mdec;
+
+    /* emulated CPU cycles not yet turned into samples (PSXE_SOUND 2, psx_audio_update) */
+    uint32_t audio_acc;
 } psx_t;
+
+/* PSXE_SOUND 2: the platform's sound output takes count stereo frames (left,
+   right, ...) at 44.1 kHz of emulated time (source/audio_out.c) */
+void psx_platform_audio_out(const int16_t *frames, uint32_t count);
 
 psx_t *psx_create(void);
 int32_t psx_init(psx_t *, const char *, const char *);

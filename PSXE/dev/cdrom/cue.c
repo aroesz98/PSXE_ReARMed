@@ -29,6 +29,7 @@
 
 /* FATFS includes */
 #include "ff.h"
+#include "diskio.h"
 #include "fsl_debug_console.h"
 
 #define CUE_RAW_BYTES 2352u
@@ -52,64 +53,206 @@ static cue_t CUE_SDRAM sCue;
     block aligned windows instead: one transaction serves about fourteen sectors,
     data and the XA audio interleaved with it alike.
 
-    The window is its own cache line aligned buffer because the card driver runs
+    A window is its own cache line aligned buffer because the card driver runs
     its DMA into it and invalidates the data cache over exactly that range.
+
+    There are two windows, the one used longest ago refilled: a game that
+    streams XA audio has two readers in the image - the drive's data reads and
+    the audio's own, which runs ahead through the interleaved sectors - and with
+    one window each refill threw out what the other one was about to read.
+
+    A window is filled in one card transfer where it can be (cue_ra_fill_direct),
+    so what a fill costs is mostly the card's latency: 64 KB, 27 sectors, per fill.
 */
 #define CUE_RA_BLOCK 512u
-#define CUE_RA_SIZE (64u * CUE_RA_BLOCK)
+#define CUE_RA_SIZE (128u * CUE_RA_BLOCK)
+#define CUE_RA_WINDOWS 2u
 
-static uint8_t CUE_SDRAM g_cue_ra_buf[CUE_RA_SIZE];
-static FIL *g_cue_ra_file = NULL; /* the image the window belongs to */
-static uint32_t g_cue_ra_pos = 0; /* file offset of its first byte   */
-static uint32_t g_cue_ra_len = 0; /* valid bytes in it               */
+static uint8_t CUE_SDRAM g_cue_ra_buf[CUE_RA_WINDOWS][CUE_RA_SIZE];
+
+static struct
+{
+    FIL *file;     /* the image the window belongs to */
+    uint32_t pos;  /* file offset of its first byte   */
+    uint32_t len;  /* valid bytes in it               */
+    uint32_t used; /* when it was last read from      */
+} g_cue_ra[CUE_RA_WINDOWS];
+
+static uint32_t g_cue_ra_clock = 0;
 
 static void cue_ra_drop(void)
 {
-    g_cue_ra_file = NULL;
-    g_cue_ra_len = 0;
+    for (uint32_t w = 0; w < CUE_RA_WINDOWS; w++)
+    {
+        g_cue_ra[w].file = NULL;
+        g_cue_ra[w].len = 0;
+    }
 }
 
-/* `left` bytes at `offset` of an image file, through the window */
+/*
+    A window straight from the card, when the image is one run of clusters over
+    its whole length - as a file copied onto a card nearly always is. f_read
+    splits a read at every cluster boundary into a card transfer of its own, and
+    each has the card's latency: with the 4 KB clusters of a card formatted with
+    the defaults, a 32 KB window was eight transfers, 1.6 ms - 21 MB/s from a card
+    the bus runs at SDR104 (~100 MB/s). Where the window lies on the card comes
+    from FatFs's cluster link map (cue_fast_seek); without one, or across two
+    fragments, f_read it is.
+*/
+static int32_t cue_ra_fill_direct(FIL *fp, uint32_t pos, uint8_t *dst, uint32_t *got)
+{
+#if FF_USE_FASTSEEK
+    const DWORD *tbl = fp->cltbl;
+    FATFS *const fs = fp->obj.fs;
+
+    if (!tbl || ((FSIZE_t)pos >= fp->obj.objsize))
+        return 0;
+
+    const FSIZE_t left = fp->obj.objsize - (FSIZE_t)pos;
+    const uint32_t len = (left < (FSIZE_t)CUE_RA_SIZE) ? (uint32_t)left : CUE_RA_SIZE;
+    const uint32_t bcs = (uint32_t)fs->csize * CUE_RA_BLOCK; /* bytes a cluster */
+
+    /* the file's clusters the window spans, then the fragment they are in */
+    DWORD first = pos / bcs;
+    DWORD last = (pos + len - 1u) / bcs;
+
+    tbl++;
+
+    for (;;)
+    {
+        const DWORD ncl = *tbl++;
+
+        if (!ncl)
+            return 0;
+
+        if (first < ncl)
+        {
+            if (last >= ncl)
+                return 0; /* into the next fragment */
+
+            break;
+        }
+
+        first -= ncl;
+        last -= ncl;
+        tbl++;
+    }
+
+    const DWORD clst = *tbl + first;
+    const LBA_t sect = fs->database + (LBA_t)fs->csize * (clst - 2u) + (LBA_t)((pos % bcs) / CUE_RA_BLOCK);
+
+    if (disk_read(fs->pdrv, dst, sect, (UINT)((len + CUE_RA_BLOCK - 1u) / CUE_RA_BLOCK)) != RES_OK)
+        return 0;
+
+    *got = len;
+
+    return 1;
+#else
+    (void)fp;
+    (void)pos;
+    (void)dst;
+    (void)got;
+
+    return 0;
+#endif
+}
+
+/* the window holding `offset` of the image, filled from the card if none does;
+   CUE_RA_WINDOWS when the image has nothing there */
+static uint32_t cue_ra_window(FIL *fp, uint32_t offset)
+{
+    uint32_t oldest = 0;
+
+    for (uint32_t w = 0; w < CUE_RA_WINDOWS; w++)
+    {
+        if ((fp == g_cue_ra[w].file) && (offset >= g_cue_ra[w].pos) && (offset < (g_cue_ra[w].pos + g_cue_ra[w].len)))
+            return w;
+
+        if (g_cue_ra[w].used < g_cue_ra[oldest].used)
+            oldest = w;
+    }
+
+    UINT got = 0;
+    const uint32_t w = oldest;
+
+    g_cue_ra[w].file = fp;
+    g_cue_ra[w].pos = offset & ~(CUE_RA_BLOCK - 1u);
+    g_cue_ra[w].len = 0;
+
+    uint32_t direct = 0;
+
+    if (cue_ra_fill_direct(fp, g_cue_ra[w].pos, g_cue_ra_buf[w], &direct))
+        got = direct;
+    else if ((f_lseek(fp, g_cue_ra[w].pos) != FR_OK) || (f_read(fp, g_cue_ra_buf[w], CUE_RA_SIZE, &got) != FR_OK))
+        got = 0;
+
+    if ((got == 0) || (offset >= (g_cue_ra[w].pos + got)))
+    {
+        g_cue_ra[w].file = NULL;
+
+        return CUE_RA_WINDOWS;
+    }
+
+    g_cue_ra[w].len = got;
+
+    return w;
+}
+
+/* `left` bytes at `offset` of an image file, through the windows */
 static void cue_ra_read(FIL *fp, uint32_t offset, uint8_t *dst, uint32_t left)
 {
     while (left)
     {
-        if ((fp != g_cue_ra_file) || (offset < g_cue_ra_pos) || (offset >= (g_cue_ra_pos + g_cue_ra_len)))
+        const uint32_t w = cue_ra_window(fp, offset);
+
+        if (w >= CUE_RA_WINDOWS)
         {
-            UINT got = 0;
+            /* past the end of the image, or a card error: reads as zeroes,
+               like the short read this replaces */
+            memset(dst, 0, left);
 
-            g_cue_ra_file = fp;
-            g_cue_ra_pos = offset & ~(CUE_RA_BLOCK - 1u);
-            g_cue_ra_len = 0;
-
-            if ((f_lseek(fp, g_cue_ra_pos) != FR_OK) ||
-                (f_read(fp, g_cue_ra_buf, CUE_RA_SIZE, &got) != FR_OK) || (got == 0) ||
-                (offset >= (g_cue_ra_pos + got)))
-            {
-                /* past the end of the image, or a card error: reads as zeroes,
-                   like the short read this replaces */
-                cue_ra_drop();
-                memset(dst, 0, left);
-
-                return;
-            }
-
-            g_cue_ra_len = got;
+            return;
         }
 
-        const uint32_t at = offset - g_cue_ra_pos;
+        g_cue_ra[w].used = ++g_cue_ra_clock;
 
-        uint32_t n = g_cue_ra_len - at;
+        const uint32_t at = offset - g_cue_ra[w].pos;
+
+        uint32_t n = g_cue_ra[w].len - at;
 
         if (n > left)
             n = left;
 
-        memcpy(dst, &g_cue_ra_buf[at], n);
+        memcpy(dst, &g_cue_ra_buf[w][at], n);
 
         dst += n;
         offset += n;
         left -= n;
     }
+}
+
+/*
+    Fast seek (FatFs's cluster link map) for the open image: seeking back - which
+    the two readers do all the time - otherwise follows the file's cluster chain
+    from its first cluster, reading the FAT from the card on the way. The map is
+    made once when the image is opened; one entry pair per fragment of the file.
+    Too fragmented for it, and the image is read as before.
+*/
+#define CUE_CLMT_WORDS 256u
+
+static DWORD CUE_SDRAM g_cue_clmt[CUE_CLMT_WORDS];
+
+static void cue_fast_seek(FIL *fp)
+{
+#if FF_USE_FASTSEEK
+    g_cue_clmt[0] = CUE_CLMT_WORDS;
+    fp->cltbl = g_cue_clmt;
+
+    if (f_lseek(fp, CREATE_LINKMAP) != FR_OK)
+        fp->cltbl = NULL;
+#else
+    (void)fp;
+#endif
 }
 
 /* what is beyond 4 GB of a file is of no use to a CD */
@@ -732,6 +875,8 @@ static FIL *cue_file_handle(cue_t *cue, uint32_t file)
 
     if (f_open(&cue->fil, cue->files[file].name, FA_READ) != FR_OK)
         return NULL;
+
+    cue_fast_seek(&cue->fil);
 
     cue->open_file = (int32_t)file;
 

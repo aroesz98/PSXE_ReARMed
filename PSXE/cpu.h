@@ -254,6 +254,8 @@ void psx_cpu_load_state(psx_cpu_t *, FIL *);
 void psx_cpu_save_state(psx_cpu_t *, FIL *);
 void psx_cpu_fetch(psx_cpu_t *);
 void psx_cpu_set_a_kcall_hook(psx_cpu_t *, psx_cpu_kcall_hook_t);
+/* a character the console prints (cpu.c: to the debug UART with PSXE_TTY=1) */
+void psx_tty_putchar(int c);
 void psx_cpu_set_b_kcall_hook(psx_cpu_t *, psx_cpu_kcall_hook_t);
 int32_t psx_cpu_execute(psx_cpu_t *);
 

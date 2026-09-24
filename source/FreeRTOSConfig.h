@@ -98,13 +98,23 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define configTIMER_QUEUE_LENGTH 10
 #define configTIMER_TASK_STACK_DEPTH (configMINIMAL_STACK_SIZE * 2)
 
-/* Define to trap errors during development. */
-#define configASSERT(x)           \
-    if ((x) == 0)                 \
-    {                             \
-        taskDISABLE_INTERRUPTS(); \
-        for (;;)                  \
-            ;                     \
+/* Define to trap errors during development. It stops everything, as it did,
+   but first says where (main.c: g_assert_file / g_assert_line for the probe,
+   and a line on the UART) - a stopped board used to give no clue at all. */
+#if !defined(__ASSEMBLER__)
+#ifdef __cplusplus
+extern "C" {
+#endif
+void psxe_assert_failed(const char *file, int line) __attribute__((noreturn));
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+#define configASSERT(x)                          \
+    if ((x) == 0)                                \
+    {                                            \
+        psxe_assert_failed(__FILE__, __LINE__);  \
     }
 
 /* Optional functions - most linkers will remove unused functions anyway. */

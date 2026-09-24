@@ -688,7 +688,7 @@ int32_t psxe_menu_pick(char *path, uint32_t path_size)
     if (g_count <= 0)
         return 0;
 
-    const int32_t touch_ok = psxe_touch_init();
+    (void)psxe_touch_init();
 
 
     int32_t selected = 0;
@@ -727,10 +727,9 @@ int32_t psxe_menu_pick(char *path, uint32_t path_size)
 
         lower[k] = 0;
 
-        if (strstr(lower, PSXE_AUTOTEST_GAME))
+        /* started the way a tap starts it, the image looked at first */
+        if (strstr(lower, PSXE_AUTOTEST_GAME) && menu_start(i, 0, path, path_size))
         {
-            snprintf(path, path_size, "%s", g_entries[i].path);
-
             PRINTF("menu: autotest, starting %s\r\n", g_entries[i].path);
 
             return 1;
@@ -746,7 +745,9 @@ int32_t psxe_menu_pick(char *path, uint32_t path_size)
     {
         int32_t tx = 0;
         int32_t ty = 0;
-        const int32_t down = touch_ok ? psxe_touch_read(&tx, &ty) : 0;
+        /* read even when the panel did not answer at first: psxe_touch_read
+           tries to bring it up again */
+        const int32_t down = psxe_touch_read(&tx, &ty);
 
         if (warmup > 0)
         {
