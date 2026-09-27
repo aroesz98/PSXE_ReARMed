@@ -431,7 +431,7 @@ void SPU_FAST spu_handle_adsr(psx_spu_t *spu, int32_t v)
 #undef STEP
 #undef PENDING_STEP
 
-void spu_kon(psx_spu_t *spu, uint32_t value)
+void SPU_FAST spu_kon(psx_spu_t *spu, uint32_t value)
 {
     for (int32_t i = 0; i < VOICE_COUNT; i++)
     {

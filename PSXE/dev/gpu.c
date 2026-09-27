@@ -611,10 +611,51 @@ static inline void gpu_update_field(psx_gpu_t *gpu)
     gpu_update_hidden(gpu);
 }
 
+/*
+    The frontend's scaler may still be reading the picture it was handed at the
+    last blank straight out of VRAM (screen.c gives a 15 bpp picture to the PXP
+    without a copy): rows [y0, y1) of it, in g_psx_vram_reader as y0 | y1 << 16,
+    0 while nothing reads. A game that puts its other buffer on screen right
+    after the blank and clears the one that was shown - Atlantis - cleared it
+    under the scaler's feet now and then: the frame came out with a band of the
+    clear colour from where the scaler had got to down to the bottom. So what is
+    about to write those rows waits for the scaler first. That is rare: mostly
+    it is done long before.
+*/
+volatile uint32_t g_psx_vram_reader;
+
+/* the frontend's wait (screen.c); without one there is nobody to wait for */
+void __attribute__((weak)) psx_platform_vram_reader_wait(void)
+{
+    g_psx_vram_reader = 0u;
+}
+
+static inline void gpu_reader_guard(uint32_t y0, uint32_t y1)
+{
+    const uint32_t r = g_psx_vram_reader;
+
+    if (r && (y0 < (r >> 16)) && (y1 > (r & 0xffffu)))
+        psx_platform_vram_reader_wait();
+}
+
+/* rows y .. y + h - 1 of a rectangle that wraps around the bottom of VRAM */
+static inline void gpu_reader_guard_rows(uint32_t y, uint32_t h)
+{
+    if (!g_psx_vram_reader)
+        return;
+
+    if ((y + h) > 512u)
+        gpu_reader_guard(0u, 512u);
+    else
+        gpu_reader_guard(y, y + h);
+}
+
 /* A polygon or a rectangle is about to draw into rows [y0, y1) of VRAM, which
    are inside the drawing area already */
 static inline void gpu_prim_rows(psx_gpu_t *gpu, int32_t y0, int32_t y1)
 {
+    gpu_reader_guard((uint32_t)y0, (uint32_t)y1);
+
     /* vis_y0 .. vis_y1 are the rows of the window, margin included */
     if ((y0 >= (int32_t)gpu->vis_y1) || (y1 <= (int32_t)gpu->vis_y0))
         return;
@@ -929,7 +970,7 @@ static inline __attribute__((always_inline)) uint16_t gpu_fetch_texel(psx_gpu_t 
     }
 }
 
-PSX_GPU_RAS uint16_t gpu_fetch_texel_bilinear(psx_gpu_t *gpu, float tx, float ty, uint32_t tpx, uint32_t tpy, const uint16_t *clut, int depth)
+uint16_t gpu_fetch_texel_bilinear(psx_gpu_t *gpu, float tx, float ty, uint32_t tpx, uint32_t tpy, const uint16_t *clut, int depth)
 {
     float txf = floorf(tx);
     float tyf = floorf(ty);
@@ -1205,30 +1246,50 @@ static inline __attribute__((always_inline)) void gpu_span_clip(int32_t e, int32
     }
 }
 
+/*
+    A run of one colour. The body goes out in 64 bit stores (STRD): measured on
+    the board, 240 rows of 512 pixels into VRAM take 75 core cycles per cache
+    line that way against 146 with 32 bit stores - the core sees whole lines
+    written and does not read them from SDRAM first (write allocate), which it
+    does for the 32 bit ones. But only one STRD per loop round: eight of them
+    back to back (the loop unrolled) are as slow as the 32 bit stores again.
+*/
 static inline void gpu_fill_span(uint16_t *dst, uint16_t color, int count)
 {
     if (count <= 0)
         return;
 
-    if (((uintptr_t)dst & 0x2) && count)
+    /* halfwords up to 8 byte alignment */
+    while (((uintptr_t)dst & 6u) && count)
     {
         *dst++ = color;
         --count;
     }
 
-    uint32_t packed = (uint32_t)color | ((uint32_t)color << 16);
+    const uint32_t packed = (uint32_t)color | ((uint32_t)color << 16);
     uint32_t *dst32 = (uint32_t *)dst;
-    while (count >= 2)
-    {
-        *dst32++ = packed;
-        count -= 2;
-    }
 
-    if (count)
+#if defined(__arm__)
+#pragma GCC unroll 1
+    while (count >= 4)
     {
-        uint16_t *tail = (uint16_t *)dst32;
-        *tail = color;
+        __asm__ volatile("strd %1, %1, [%0], #8" : "+r"(dst32) : "r"(packed) : "memory");
+        count -= 4;
     }
+#else
+    while (count >= 4)
+    {
+        dst32[0] = packed;
+        dst32[1] = packed;
+        dst32 += 2;
+        count -= 4;
+    }
+#endif
+
+    dst = (uint16_t *)dst32;
+
+    while (count-- > 0)
+        *dst++ = color;
 }
 
 //void gpu_render_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, poly_data_t data, int edge)
@@ -1766,18 +1827,37 @@ typedef struct
     uint32_t mr, mg, mb;  /* modulation colour (flat) */
     uint32_t dither;      /* the span's dither values from its first pixel on, a signed byte each */
     int transp_mode;
+    int exact;            /* the polygon covers its own texture page: no read ahead (page_hit) */
 } gpu_span_t;
 
 typedef void (*gpu_span_fn_t)(const gpu_span_t *s, uint16_t *dst, int n, uint32_t u, uint32_t v,
                               int32_t r, int32_t g, int32_t b);
 
+/*
+    x >> s saturated to 0 .. 2^bits - 1: one USAT with its shift. Written out,
+    because GCC does not make that instruction of a clamp whose lower bound it
+    can prove never applies - it leaves a compare, an IT and a move per channel.
+*/
+#if defined(__arm__) && defined(__ARM_ARCH_7EM__)
+#define GPU_USAT_ASR(x, bits, s)                                                   \
+    __extension__({                                                                \
+        uint32_t usat_r_;                                                          \
+        __asm__("usat %0, #" #bits ", %1, asr #" #s : "=r"(usat_r_) : "r"((int32_t)(x))); \
+        usat_r_;                                                                   \
+    })
+#else
+#define GPU_USAT_ASR(x, bits, s)                                                   \
+    __extension__({                                                                \
+        const int32_t usat_v_ = (int32_t)(x) >> (s);                               \
+        (usat_v_ < 0) ? 0u : ((usat_v_ > ((1 << (bits)) - 1)) ? (uint32_t)((1 << (bits)) - 1) : (uint32_t)usat_v_); \
+    })
+#endif
+
 /* one channel of modulate_bgr555: ((t5 << 3) * m) >> 7 saturated to 8 bits, back to 5 bits - which
    is (t5 * m) >> 7 saturated to 5 bits, one USAT with its shift (the lower clamp never applies) */
 __attribute__((always_inline)) static inline uint32_t gpu_mod_ch(uint32_t t5, uint32_t m)
 {
-    const int32_t p = (int32_t)(t5 * m) >> 7;
-
-    return (p < 0) ? 0u : ((p > 31) ? 31u : (uint32_t)p);
+    return GPU_USAT_ASR(t5 * m, 5, 7);
 }
 
 __attribute__((always_inline)) static inline uint32_t gpu_mod_px(uint32_t t, uint32_t mr, uint32_t mg, uint32_t mb)
@@ -1807,6 +1887,38 @@ __attribute__((always_inline)) static inline uint32_t gpu_span_ch(int32_t v, int
     const int32_t c = (v >> ATTR_FRAC_BITS) + d;
 
     return (c < 0) ? 0u : ((c > 255) ? 255u : (uint32_t)c);
+}
+
+/*
+    Cache line fills asked for ahead of a 4 bit span: the texture lines along it, every 8th
+    pixel's, and when it blends the destination's lines, which it reads. The core fills one
+    line at a time and a PLD waits for the one before it (measured: a PLD alone costs nothing,
+    each further one about a line fill), so this only moves the stalls out of the span - where a
+    missing line stalls longer, the load waiting behind it - unless there is work to do in the
+    meantime (gpu_span_g4's colour pass). Right in front of a short span it did not pay; spread
+    over the colour pass one per 8 pixels, the pass itself got slower than the stalls saved.
+*/
+__attribute__((always_inline)) static inline void gpu_span_prefetch4(const uint16_t *tex, const uint16_t *dst, int n,
+                                                                     uint32_t u, uint32_t v, uint32_t du, uint32_t dv,
+                                                                     const int TRANSP)
+{
+#pragma GCC unroll 1
+    for (int i = 0; i < n; i += 8)
+    {
+        const uint32_t pu = u + du * (uint32_t)i, pv = v + dv * (uint32_t)i;
+
+        __builtin_prefetch(
+            &tex[((pv >> ATTR_FRAC_BITS) & 0xffu) * PSX_GPU_VRAM_PITCH + ((pu >> (ATTR_FRAC_BITS + 2)) & 0x3fu)]);
+    }
+
+    if (TRANSP)
+    {
+        const uintptr_t last = (uintptr_t)(dst + n - 1);
+
+#pragma GCC unroll 1
+        for (uintptr_t p = (uintptr_t)dst & ~(uintptr_t)31; p <= last; p += 32u)
+            __builtin_prefetch((const void *)p);
+    }
 }
 
 __attribute__((always_inline)) static inline void gpu_span_tex(const gpu_span_t *s, uint16_t *dst, int n,
@@ -1851,7 +1963,10 @@ __attribute__((always_inline)) static inline void gpu_span_tex(const gpu_span_t 
 
     while (n > 0)
     {
-        uint32_t col[64];
+        /* red and green of a pixel in one word, red in the low half, and blue 64
+           words further on: the modulation multiplies 16 bit halves (SMULBB,
+           SMULBT), so nothing has to be taken apart per pixel */
+        uint32_t col[128];
         const int chunk = (n < 64) ? n : 64;
 
         for (int i = 0; i < chunk; i++)
@@ -1860,34 +1975,375 @@ __attribute__((always_inline)) static inline void gpu_span_tex(const gpu_span_t 
 
             dither = (dither >> 8) | (dither << 24);
 
-            col[i] = gpu_span_ch(r, d) | (gpu_span_ch(g, d) << 8) | (gpu_span_ch(b, d) << 16);
+            col[i] = gpu_span_ch(r, d) | (gpu_span_ch(g, d) << 16);
+            col[64 + i] = gpu_span_ch(b, d);
 
             r += dr;
             g += dg;
             b += db;
         }
 
+        const uint32_t *c = col;
+        uint16_t *const end = dst + chunk;
+
 #pragma GCC unroll 1
-        for (int i = 0; i < chunk; i++)
+        do
         {
             const uint32_t t = gpu_span_texel(tex, clut, u, v, F);
-
-            if (t)
-            {
-                const uint32_t c = col[i];
-                const uint32_t out = gpu_mod_px(t, c & 0xffu, (c >> 8) & 0xffu, c >> 16);
-
-                dst[i] = (uint16_t)((TRANSP && (t & 0x8000u)) ? gpu_blend_bgr555(out, dst[i], transp_mode) : out);
-            }
+            const int32_t rg = (int32_t)c[0];
+            const int32_t bl = (int32_t)c[64];
 
             u += du;
             v += dv;
-        }
+            c++;
 
-        dst += chunk;
+            if (t)
+            {
+                uint32_t out = GPU_USAT_ASR((int32_t)(int16_t)(t & 0x1fu) * (int32_t)(int16_t)rg, 5, 7) |
+                               (GPU_USAT_ASR((int32_t)(int16_t)((t >> 5) & 0x1fu) * (rg >> 16), 5, 7) << 5) |
+                               (GPU_USAT_ASR((int32_t)((t >> 10) & 0x1fu) * bl, 5, 7) << 10);
+
+                /* the mask bit goes through unless the pixel is blended, which drops it -
+                   and with semi transparency a texel with the bit set is always blended */
+                if (TRANSP && (t & 0x8000u))
+                    *dst = gpu_blend_bgr555(out, *dst, transp_mode);
+                else
+                    *dst = (uint16_t)(TRANSP ? out : (out | (t & 0x8000u)));
+            }
+
+            dst++;
+        }
+        while (dst != end);
+
         n -= chunk;
     }
 }
+
+/*
+    Gouraud shading with a 4 bit texture, the general case (the colour changes
+    across the polygon - Atlantis' lit walls and floors).
+
+    The palette is taken apart once per polygon (gpu_split_make): per entry red
+    and green in the two halves of one word, blue in the top half of another,
+    whose low half keeps the mask bit (bit 0) and a "drawn" bit (1) - so a
+    pixel's three products are SMULBB, SMULTT and SMULTB straight from the
+    words, with nothing unpacked per pixel, and a texel of 0 is a zero word.
+
+    CL 0: the span's colours stay within 4 .. 251 (checked at both ends - the
+    colour is linear along it), so colour + dither needs no clamping and red and
+    green go into one word with a PKHBT. The arithmetic is gpu_span_tex's, bit
+    for bit.
+
+    Two passes over up to 64 pixels: the colours into g_gpu_g4_col (red | green
+    and blue of a pixel side by side, one LDRD), then texel and shading. The
+    chunk's colours end at the end of the buffer, which is 512 byte aligned: the
+    shading loop ends when its pointer gets there and needs no end register.
+*/
+static uint32_t PSX_GPU_DTCM_BSS __attribute__((aligned(8))) g_gpu_split[16][2];
+static uint32_t PSX_GPU_DTCM_BSS g_gpu_split_key[9]; /* valid, then the 16 palette entries */
+static uint32_t PSX_GPU_DTCM_BSS __attribute__((aligned(512))) g_gpu_g4_col[128];
+
+/* a palette's 16 entries as 8 words, and whether two such are the same - by hand: the project builds
+   with -fno-builtin, so memcpy and memcmp are calls, into flash */
+typedef uint32_t __attribute__((may_alias, aligned(2))) gpu_u32_16_t;
+
+static inline void gpu_pal_load(uint32_t *pal, const uint16_t *clut)
+{
+    const gpu_u32_16_t *c = (const gpu_u32_16_t *)clut;
+
+    for (uint32_t i = 0; i < 8u; i++)
+        pal[i] = c[i];
+}
+
+static inline int gpu_pal_same(const uint32_t *a, const uint32_t *b)
+{
+    uint32_t d = 0;
+
+    for (uint32_t i = 0; i < 8u; i++)
+        d |= a[i] ^ b[i];
+
+    return !d;
+}
+
+static PSX_GPU_RAS void gpu_split_make(const uint16_t *clut)
+{
+    uint32_t pal[8];
+
+    gpu_pal_load(pal, clut);
+
+    if (g_gpu_split_key[0] && gpu_pal_same(&g_gpu_split_key[1], pal))
+        return;
+
+    g_gpu_split_key[0] = 1u;
+    gpu_pal_load(&g_gpu_split_key[1], clut);
+
+    for (uint32_t i = 0; i < 16u; i++)
+    {
+        const uint32_t t = clut[i];
+
+        g_gpu_split[i][0] = (t & 0x1fu) | (((t >> 5) & 0x1fu) << 16);
+        g_gpu_split[i][1] = t ? ((((t >> 10) & 0x1fu) << 16) | 2u | (t >> 15)) : 0u;
+    }
+}
+
+#if defined(__arm__) && (PSX_GPU_VRAM_PITCH == 1040)
+#define GPU_G4_ASM 1
+
+typedef struct
+{
+    uint32_t u, v, du, dv;
+    const uint16_t *tex;
+    const uint32_t *split; /* g_gpu_split */
+    const uint32_t *col;   /* the chunk's first pixel in g_gpu_g4_col */
+    uint16_t *dst;
+} gpu_g4_loop_t;
+
+/*
+    The shading pass of gpu_span_g4 without blending, scheduled by hand: GCC's
+    version stalled on nearly every result (the texel load, each product before
+    its USAT) and ran at under one instruction per cycle. Here the next pixel's
+    texel is loaded a whole pixel ahead and the three products are started back
+    to back. Registers: r0 u, r1 v, r2 du, r3 dv, r4 texture page, r5 palette
+    words, r6 colours, r7 destination, r8 the texel word ahead, r9-r12 / lr work.
+*/
+static PSX_GPU_RAS __attribute__((naked, noinline)) void gpu_g4_loop_o(const gpu_g4_loop_t *p)
+{
+    (void)p;
+
+    __asm__ volatile(
+        "push   {r4-r11, lr}\n\t"
+        "ldm    r0, {r0-r7}\n\t"
+        /* the first pixel's texel word */
+        "ubfx   r9, r1, #12, #8\n\t"
+        "ubfx   r8, r0, #14, #6\n\t"
+        "add    r9, r9, r9, lsl #6\n\t"
+        "add    r8, r8, r9, lsl #4\n\t"
+        "ldrh   r8, [r4, r8, lsl #1]\n\t"
+        "1:\n\t"
+        /* this pixel's palette words; the next pixel's coordinates */
+        "lsr    r9, r0, #10\n\t"
+        "and    r9, r9, #12\n\t"
+        "lsr    r9, r8, r9\n\t"
+        "add    r0, r0, r2\n\t"
+        "and    r9, r9, #15\n\t"
+        "add    r1, r1, r3\n\t"
+        "add    r9, r5, r9, lsl #3\n\t"
+        "ubfx   r11, r1, #12, #8\n\t"
+        "ldrd   r12, lr, [r9]\n\t"
+        "ubfx   r8, r0, #14, #6\n\t"
+        "add    r11, r11, r11, lsl #6\n\t"
+        "ldrd   r9, r10, [r6], #8\n\t"
+        "add    r8, r8, r11, lsl #4\n\t"
+        /* the next pixel's texel word (in the page: the coordinates are masked) */
+        "ldrh   r8, [r4, r8, lsl #1]\n\t"
+        "cmp    lr, #0\n\t"
+        "beq    2f\n\t"
+        "smultb r10, lr, r10\n\t"
+        "smulbb r11, r12, r9\n\t"
+        "smultt r9, r12, r9\n\t"
+        "usat   r10, #5, r10, asr #7\n\t"
+        "usat   r11, #5, r11, asr #7\n\t"
+        "usat   r9, #5, r9, asr #7\n\t"
+        "bfi    r10, lr, #5, #1\n\t"
+        "orr    r11, r11, r9, lsl #5\n\t"
+        "orr    r11, r11, r10, lsl #10\n\t"
+        "strh   r11, [r7]\n\t"
+        "2:\n\t"
+        "adds   r7, r7, #2\n\t"
+        "lsls   r9, r6, #23\n\t"
+        "bne    1b\n\t"
+        "pop    {r4-r11, pc}\n\t");
+}
+
+/* The same with blending mode 1 (B + F: Atlantis' light and glow) or 3 (B + F / 4: QUARTER takes F
+   down to a quarter per field first, (F >> 2) & 0x1ce7 as in gpu_blend_bgr555): a texel with its mask
+   bit is added to the destination, per 5 bit field saturated; one without is stored as it is, without
+   the mask bit */
+#define GPU_G4_LOOP_T(NAME, QUARTER)                                                      \
+    static PSX_GPU_RAS __attribute__((naked, noinline)) void NAME(const gpu_g4_loop_t *p) \
+    {                                                                                     \
+        (void)p;                                                                          \
+                                                                                          \
+        __asm__ volatile(                                                                 \
+            "push   {r4-r11, lr}\n\t"                                                     \
+            "ldm    r0, {r0-r7}\n\t"                                                      \
+            "ubfx   r9, r1, #12, #8\n\t"                                                  \
+            "ubfx   r8, r0, #14, #6\n\t"                                                  \
+            "add    r9, r9, r9, lsl #6\n\t"                                               \
+            "add    r8, r8, r9, lsl #4\n\t"                                               \
+            "ldrh   r8, [r4, r8, lsl #1]\n\t"                                             \
+            "1:\n\t"                                                                      \
+            "lsr    r9, r0, #10\n\t"                                                      \
+            "and    r9, r9, #12\n\t"                                                      \
+            "lsr    r9, r8, r9\n\t"                                                       \
+            "add    r0, r0, r2\n\t"                                                       \
+            "and    r9, r9, #15\n\t"                                                      \
+            "add    r1, r1, r3\n\t"                                                       \
+            "add    r9, r5, r9, lsl #3\n\t"                                               \
+            "ubfx   r11, r1, #12, #8\n\t"                                                 \
+            "ldrd   r12, lr, [r9]\n\t"                                                    \
+            "ubfx   r8, r0, #14, #6\n\t"                                                  \
+            "add    r11, r11, r11, lsl #6\n\t"                                            \
+            "ldrd   r9, r10, [r6], #8\n\t"                                                \
+            "add    r8, r8, r11, lsl #4\n\t"                                              \
+            "ldrh   r8, [r4, r8, lsl #1]\n\t"                                             \
+            "cmp    lr, #0\n\t"                                                           \
+            "beq    3f\n\t"                                                               \
+            "smultb r10, lr, r10\n\t"                                                     \
+            "smulbb r11, r12, r9\n\t"                                                     \
+            "smultt r9, r12, r9\n\t"                                                      \
+            "usat   r10, #5, r10, asr #7\n\t"                                             \
+            "usat   r11, #5, r11, asr #7\n\t"                                             \
+            "usat   r9, #5, r9, asr #7\n\t"                                               \
+            "orr    r11, r11, r9, lsl #5\n\t"                                             \
+            "orr    r11, r11, r10, lsl #10\n\t"                                           \
+            "tst    lr, #1\n\t"                                                           \
+            "beq    2f\n\t"                                                               \
+            /* sum = F + B; carry = (sum - ((F ^ B) & 0x8421)) & 0x8420;                  \
+               out = ((sum - carry) | (carry - (carry >> 5))) & 0x7fff */                 \
+            "ldrh   r9, [r7]\n\t"                                                         \
+            QUARTER                                                                       \
+            "movw   lr, #0x8421\n\t"                                                      \
+            "ubfx   r9, r9, #0, #15\n\t"                                                  \
+            "eor    r10, r11, r9\n\t"                                                     \
+            "add    r12, r11, r9\n\t"                                                     \
+            "and    r10, r10, lr\n\t"                                                     \
+            "sub    r10, r12, r10\n\t"                                                    \
+            "sub    lr, lr, #1\n\t"                                                       \
+            "and    r10, r10, lr\n\t"                                                     \
+            "sub    r12, r12, r10\n\t"                                                    \
+            "sub    r10, r10, r10, lsr #5\n\t"                                            \
+            "orr    r11, r12, r10\n\t"                                                    \
+            "bfc    r11, #15, #17\n\t"                                                    \
+            "2:\n\t"                                                                      \
+            "strh   r11, [r7]\n\t"                                                        \
+            "3:\n\t"                                                                      \
+            "adds   r7, r7, #2\n\t"                                                       \
+            "lsls   r9, r6, #23\n\t"                                                      \
+            "bne    1b\n\t"                                                               \
+            "pop    {r4-r11, pc}\n\t");                                                   \
+    }
+
+GPU_G4_LOOP_T(gpu_g4_loop_t1, "")
+GPU_G4_LOOP_T(gpu_g4_loop_t3, "lsr    r11, r11, #2\n\t" "bic    r11, r11, #0x318\n\t")
+
+#undef GPU_G4_LOOP_T
+#else
+#define GPU_G4_ASM 0
+#endif
+
+__attribute__((always_inline)) static inline void gpu_span_g4(const gpu_span_t *s, uint16_t *dst, int n, uint32_t u,
+                                                              uint32_t v, int32_t r, int32_t g, int32_t b,
+                                                              const int TRANSP, const int CL)
+{
+    const uint16_t *const tex = s->tex;
+    const uint32_t du = (uint32_t)s->du;
+    const uint32_t dv = (uint32_t)s->dv;
+    const int transp_mode = s->transp_mode;
+    const int32_t dr = s->dr, dg = s->dg, db = s->db;
+    uint32_t dither = s->dither;
+
+    while (n > 0)
+    {
+        const int chunk = (n < 64) ? n : 64;
+        uint32_t *const col = &g_gpu_g4_col[2 * (64 - chunk)];
+
+        /* the lines arrive while the colours are worked out */
+        gpu_span_prefetch4(tex, dst, chunk, u, v, du, dv, TRANSP);
+
+        for (int i = 0; i < chunk; i++)
+        {
+            const int32_t d = (int32_t)(int8_t)(dither & 0xffu);
+
+            dither = (dither >> 8) | (dither << 24);
+
+            if (CL)
+            {
+                col[2 * i] = gpu_span_ch(r, d) | (gpu_span_ch(g, d) << 16);
+                col[2 * i + 1] = gpu_span_ch(b, d);
+            }
+            else
+            {
+                col[2 * i] = (uint32_t)(uint16_t)((r >> ATTR_FRAC_BITS) + d) | ((uint32_t)((g >> ATTR_FRAC_BITS) + d) << 16);
+                col[2 * i + 1] = (uint32_t)((b >> ATTR_FRAC_BITS) + d);
+            }
+
+            r += dr;
+            g += dg;
+            b += db;
+        }
+
+#if GPU_G4_ASM
+        if (!s->exact && (!TRANSP || (transp_mode == 1) || (transp_mode == 3)))
+        {
+            const gpu_g4_loop_t p = { u, v, du, dv, tex, &g_gpu_split[0][0], col, dst };
+
+            if (!TRANSP)
+                gpu_g4_loop_o(&p);
+            else if (transp_mode == 1)
+                gpu_g4_loop_t1(&p);
+            else
+                gpu_g4_loop_t3(&p);
+
+            u += du * (uint32_t)chunk;
+            v += dv * (uint32_t)chunk;
+            dst += chunk;
+            n -= chunk;
+            continue;
+        }
+#endif
+
+        const uint32_t *c = col;
+        uint16_t *const end = dst + chunk;
+
+#pragma GCC unroll 1
+        do
+        {
+            const uint32_t idx =
+                (tex[((v >> ATTR_FRAC_BITS) & 0xffu) * PSX_GPU_VRAM_PITCH + ((u >> (ATTR_FRAC_BITS + 2)) & 0x3fu)] >>
+                 ((u >> (ATTR_FRAC_BITS - 2)) & 0xcu)) & 0xfu;
+            const int32_t w0 = (int32_t)g_gpu_split[idx][0];
+            const int32_t w1 = (int32_t)g_gpu_split[idx][1];
+            const int32_t rg = (int32_t)c[0];
+            const int32_t bl = (int32_t)c[1];
+
+            u += du;
+            v += dv;
+            c += 2;
+
+            if (w1)
+            {
+                const uint32_t out = GPU_USAT_ASR((int32_t)(int16_t)w0 * (int32_t)(int16_t)rg, 5, 7) |
+                                     (GPU_USAT_ASR((w0 >> 16) * (rg >> 16), 5, 7) << 5) |
+                                     (GPU_USAT_ASR((w1 >> 16) * (int32_t)(int16_t)bl, 5, 7) << 10);
+
+                if (TRANSP && (w1 & 1))
+                    *dst = gpu_blend_bgr555(out, *dst, transp_mode);
+                else
+                    *dst = (uint16_t)(TRANSP ? out : (out | (((uint32_t)w1 & 1u) << 15)));
+            }
+
+            dst++;
+        }
+        while (dst != end);
+
+        n -= chunk;
+    }
+}
+
+#define GPU_SPAN_G4_FN(T, CL)                                                                                  \
+    static PSX_GPU_RAS __attribute__((noinline)) void gpu_span_g4_##T##CL(                                      \
+        const gpu_span_t *s, uint16_t *dst, int n, uint32_t u, uint32_t v, int32_t r, int32_t g, int32_t b)     \
+    {                                                                                                          \
+        gpu_span_g4(s, dst, n, u, v, r, g, b, T, CL);                                                          \
+    }
+
+GPU_SPAN_G4_FN(0, 0) GPU_SPAN_G4_FN(0, 1) GPU_SPAN_G4_FN(1, 0) GPU_SPAN_G4_FN(1, 1)
+
+#undef GPU_SPAN_G4_FN
+
+/* transparency * 2 + clamping */
+static gpu_span_fn_t const g_gpu_span_g4_fns[4] = { gpu_span_g4_00, gpu_span_g4_01, gpu_span_g4_10, gpu_span_g4_11 };
 
 #define GPU_SPAN_FN(F, SH, T)                                                                             \
     static PSX_GPU_RAS __attribute__((noinline)) void gpu_span_##F##SH##T(                                 \
@@ -1896,7 +2352,7 @@ __attribute__((always_inline)) static inline void gpu_span_tex(const gpu_span_t 
         gpu_span_tex(s, dst, n, u, v, r, g, b, F, SH, T);                                                  \
     }
 
-GPU_SPAN_FN(0, 0, 0) GPU_SPAN_FN(0, 0, 1) GPU_SPAN_FN(0, 1, 0) GPU_SPAN_FN(0, 1, 1) GPU_SPAN_FN(0, 2, 0) GPU_SPAN_FN(0, 2, 1)
+GPU_SPAN_FN(0, 0, 0) GPU_SPAN_FN(0, 0, 1) GPU_SPAN_FN(0, 1, 0) GPU_SPAN_FN(0, 1, 1)
 GPU_SPAN_FN(1, 0, 0) GPU_SPAN_FN(1, 0, 1) GPU_SPAN_FN(1, 1, 0) GPU_SPAN_FN(1, 1, 1) GPU_SPAN_FN(1, 2, 0) GPU_SPAN_FN(1, 2, 1)
 GPU_SPAN_FN(2, 0, 0) GPU_SPAN_FN(2, 0, 1) GPU_SPAN_FN(2, 1, 0) GPU_SPAN_FN(2, 1, 1) GPU_SPAN_FN(2, 2, 0) GPU_SPAN_FN(2, 2, 1)
 
@@ -1904,7 +2360,7 @@ GPU_SPAN_FN(2, 0, 0) GPU_SPAN_FN(2, 0, 1) GPU_SPAN_FN(2, 1, 0) GPU_SPAN_FN(2, 1,
 
 /* indexed fetch * 6 + shade * 2 + transparency, as the switch of the general loops */
 static gpu_span_fn_t const g_gpu_span_fns[18] = {
-    gpu_span_000, gpu_span_001, gpu_span_010, gpu_span_011, gpu_span_020, gpu_span_021,
+    gpu_span_000, gpu_span_001, gpu_span_010, gpu_span_011, gpu_span_g4_01, gpu_span_g4_11, /* (4 bit Gouraud: gpu_span_g4) */
     gpu_span_100, gpu_span_101, gpu_span_110, gpu_span_111, gpu_span_120, gpu_span_121,
     gpu_span_200, gpu_span_201, gpu_span_210, gpu_span_211, gpu_span_220, gpu_span_221,
 };
@@ -1916,6 +2372,377 @@ static inline uint32_t gpu_dither_row_word(uint32_t row)
 {
     return g_gpu_dither_rows[row & 3u];
 }
+
+/*
+    Gouraud shading without a texture, opaque. A channel is clamp((v >> 12) + d, 0, 255) >> 3
+    (PSXE_CH, then 5 bits), which is (v + d * 4096) >> 15 saturated to 0 .. 31: one ADD and one
+    USAT. Four pixels a round, so that the row's four dither values (s->dither, from the span's
+    first pixel on) stay in registers, already in the colour's 8.12 scale.
+*/
+#if GPU_G4_ASM
+typedef struct
+{
+    int32_t r, g, b, dr, dg, db;
+    uint32_t dither;
+    uint16_t *dst;
+    int n;
+} gpu_gouraud_loop_t;
+
+/* gpu_span_gouraud_o's loop by hand (GCC merged the stores into words with BFIs and ran out of
+   registers): r0-r2 colours, r3-r5 steps, r6-r9 the four dither values, r10 destination, r11 count */
+static PSX_GPU_RAS __attribute__((naked, noinline)) void gpu_gouraud_loop_o(const gpu_gouraud_loop_t *p)
+{
+    (void)p;
+
+#define GPU_GOURAUD_PX_ASM(D)                  \
+        "add    r12, r0, " D "\n\t"            \
+        "add    lr, r1, " D "\n\t"             \
+        "usat   r12, #5, r12, asr #15\n\t"     \
+        "usat   lr, #5, lr, asr #15\n\t"       \
+        "orr    r12, r12, lr, lsl #5\n\t"      \
+        "add    lr, r2, " D "\n\t"             \
+        "usat   lr, #5, lr, asr #15\n\t"       \
+        "add    r0, r0, r3\n\t"                \
+        "orr    r12, r12, lr, lsl #10\n\t"     \
+        "add    r1, r1, r4\n\t"                \
+        "strh   r12, [r10], #2\n\t"            \
+        "add    r2, r2, r5\n\t"
+
+    __asm__ volatile(
+        "push   {r4-r11, lr}\n\t"
+        "ldm    r0, {r0-r8}\n\t"
+        "mov    r10, r7\n\t"
+        "mov    r11, r8\n\t"
+        "sbfx   r7, r6, #8, #8\n\t"
+        "sbfx   r8, r6, #16, #8\n\t"
+        "asr    r9, r6, #24\n\t"
+        "sbfx   r6, r6, #0, #8\n\t"
+        "lsl    r7, r7, #12\n\t"
+        "lsl    r8, r8, #12\n\t"
+        "lsl    r9, r9, #12\n\t"
+        "lsl    r6, r6, #12\n\t"
+        "subs   r11, r11, #4\n\t"
+        "blt    2f\n\t"
+        "1:\n\t"
+        GPU_GOURAUD_PX_ASM("r6")
+        GPU_GOURAUD_PX_ASM("r7")
+        GPU_GOURAUD_PX_ASM("r8")
+        GPU_GOURAUD_PX_ASM("r9")
+        "subs   r11, r11, #4\n\t"
+        "bge    1b\n\t"
+        "2:\n\t"
+        "adds   r11, r11, #4\n\t"
+        "beq    3f\n\t"
+        GPU_GOURAUD_PX_ASM("r6")
+        "subs   r11, r11, #1\n\t"
+        "beq    3f\n\t"
+        GPU_GOURAUD_PX_ASM("r7")
+        "subs   r11, r11, #1\n\t"
+        "beq    3f\n\t"
+        GPU_GOURAUD_PX_ASM("r8")
+        "3:\n\t"
+        "pop    {r4-r11, pc}\n\t");
+
+#undef GPU_GOURAUD_PX_ASM
+}
+#endif
+
+static PSX_GPU_RAS __attribute__((noinline)) void gpu_span_gouraud_o(const gpu_span_t *s, uint16_t *dst, int n,
+                                                                      int32_t r, int32_t g, int32_t b)
+{
+#if GPU_G4_ASM
+    const gpu_gouraud_loop_t p = { r, g, b, s->dr, s->dg, s->db, s->dither, dst, n };
+
+    gpu_gouraud_loop_o(&p);
+#else
+    const int32_t dr = s->dr, dg = s->dg, db = s->db;
+    const uint32_t w = s->dither;
+    const int32_t d0 = (int32_t)(int8_t)w * (1 << ATTR_FRAC_BITS);
+    const int32_t d1 = (int32_t)(int8_t)(w >> 8) * (1 << ATTR_FRAC_BITS);
+    const int32_t d2 = (int32_t)(int8_t)(w >> 16) * (1 << ATTR_FRAC_BITS);
+    const int32_t d3 = (int32_t)(int8_t)(w >> 24) * (1 << ATTR_FRAC_BITS);
+
+#define GPU_GOURAUD_PX(D)                                                                              \
+    do                                                                                                 \
+    {                                                                                                  \
+        *dst++ = (uint16_t)(GPU_USAT_ASR(r + (D), 5, 15) | (GPU_USAT_ASR(g + (D), 5, 15) << 5) |        \
+                            (GPU_USAT_ASR(b + (D), 5, 15) << 10));                                      \
+        r += dr;                                                                                       \
+        g += dg;                                                                                       \
+        b += db;                                                                                       \
+    } while (0)
+
+#pragma GCC unroll 1
+    for (; n >= 4; n -= 4)
+    {
+        GPU_GOURAUD_PX(d0);
+        GPU_GOURAUD_PX(d1);
+        GPU_GOURAUD_PX(d2);
+        GPU_GOURAUD_PX(d3);
+    }
+
+    if (n > 0)
+    {
+        GPU_GOURAUD_PX(d0);
+
+        if (n > 1)
+        {
+            GPU_GOURAUD_PX(d1);
+
+            if (n > 2)
+                GPU_GOURAUD_PX(d2);
+        }
+    }
+
+#undef GPU_GOURAUD_PX
+#endif
+}
+
+/*
+    Gouraud shading with one colour.
+
+    A Gouraud shaded polygon whose three vertices have the same colour is shaded
+    in that colour everywhere - the planes are flat, every pixel's colour is the
+    vertex colour plus its dither offset, clamped. Games draw most of their
+    lit geometry that way (Disney's Atlantis: 699 of 746 textured Gouraud
+    triangles, and all of the big semi transparent ones behind its menu), and
+    the general loops still interpolate three channels, dither and clamp them
+    and multiply every texel by them, pixel after pixel.
+
+    With a 4 bit texture a pixel can only come out as one of 16 palette
+    entries modulated by one of the 16 dithered colours of the 4x4 kernel. So
+    those 256 values are made once per polygon - and kept for the next one when
+    colour, transparency and palette are the same, which along a lit mesh they
+    mostly are - and a pixel is a texel fetch and a table lookup. The values
+    are the ones the general loop makes, bit for bit (gpu_mod_px of the texel
+    by clamp(colour + dither)).
+
+    An entry: the pixel as it goes into VRAM, bit 16 "drawn" (the texel is not
+    0), bit 17 "blended" (semi transparent primitive, texel mask bit set).
+    Laid out [kernel row][texel][kernel column], so that a span of one row
+    reads a single 256 byte block - and only kernel rows 0 and 1 are made:
+    rows 2 and 3 are rows 0 and 1 turned by two columns (-4 0 -3 1 / -3 1 -4 0,
+    2 -2 3 -1 / 3 -1 2 -2), so a span of row 2 or 3 reads row 0 or 1 starting
+    two columns on. The 8 (row, column) cells of rows 0 and 1 hold the 8 dither
+    values -4 .. 3 once each: 128 entries, each made once, where it is read.
+
+    Flat lit models change colour from polygon to polygon (the table is made
+    for each of them), so the entries are made from the palette words of
+    gpu_split_make - three products and three USATs, gpu_mod_px bit for bit.
+
+    Blending mode 3 (B + F / 4): its blended entries hold F / 4 already, the
+    quarter gpu_blend_bgr555 takes, so that mode 1's span (B + F) draws it. An
+    opaque polygon's entries are never "blended", so mode 1's span draws those
+    too: one loop for all three (by hand on the M7, gpu_span_mtab_t1).
+
+    Making the table costs about as much as drawing 200 of its pixels, and most
+    such polygons are small (Atlantis in game: 918 of 1433 draw under 16 pixels,
+    299 of the 536 tables were made for one of those). A small polygon whose
+    table is not there already is left to the Gouraud span loops instead, which
+    draw the same pixels (build 0 below: nothing made, the old table kept) -
+    unless the small polygon before it wanted the same table: small polygons
+    come in runs of one colour, and a run gets its table on the second one.
+*/
+static uint32_t PSX_GPU_DTCM_BSS __attribute__((aligned(8))) g_gpu_mtab[2][16][4];
+static uint32_t PSX_GPU_DTCM_BSS g_gpu_mtab_key[9]; /* colour | transparency | valid, then the 16 palette entries */
+static uint32_t PSX_GPU_DTCM_BSS g_gpu_mtab_want[9]; /* the same of the last table left unmade */
+
+/* polygons with twice their area (gpu_render_triangle_impl's `area`) under this get a table only
+   when it is already made */
+#ifndef GPU_MTAB_MIN_AREA
+#define GPU_MTAB_MIN_AREA 128
+#endif
+
+/* 1: g_gpu_mtab is the table of this palette, colour and blending; 0: it is not, and `build` was 0 */
+static PSX_GPU_RAS __attribute__((noinline)) int gpu_mtab_make(const uint16_t *clut, uint32_t color, int transp,
+                                                                int mode, int build)
+{
+    const uint32_t key = (color & 0xffffffu) | (transp ? (0x1000000u | ((uint32_t)mode << 26)) : 0u) | 0x2000000u;
+
+    uint32_t pal[8];
+
+    gpu_pal_load(pal, clut);
+
+    if ((g_gpu_mtab_key[0] == key) && gpu_pal_same(&g_gpu_mtab_key[1], pal))
+        return 1;
+
+    if (!build && ((g_gpu_mtab_want[0] != key) || !gpu_pal_same(&g_gpu_mtab_want[1], pal)))
+    {
+        g_gpu_mtab_want[0] = key;
+        gpu_pal_load(&g_gpu_mtab_want[1], clut);
+        return 0;
+    }
+
+    g_gpu_mtab_key[0] = key;
+    gpu_pal_load(&g_gpu_mtab_key[1], clut);
+
+    gpu_split_make(clut);
+
+    /* per texel what goes on top of the colour: drawn, its mask bit, blended - or 0, not drawn */
+    uint32_t fl[16];
+
+    for (uint32_t i = 0; i < 16u; i++)
+    {
+        const uint32_t w1 = g_gpu_split[i][1];
+
+        fl[i] = w1 ? (0x10000u | ((w1 & 1u) << 15) | ((transp && (w1 & 1u)) ? 0x20000u : 0u)) : 0u;
+    }
+
+    const int32_t r = (int32_t)(color & 0xffu), g = (int32_t)((color >> 8) & 0xffu), b = (int32_t)((color >> 16) & 0xffu);
+
+    for (uint32_t ry = 0; ry < 2u; ry++)
+        for (uint32_t cx = 0; cx < 4u; cx++)
+        {
+            const int32_t d = g_psx_gpu_dither_kernel[(ry << 2) | cx];
+            const int32_t mrg = (int32_t)(gpu_span_ch(r << ATTR_FRAC_BITS, d) | (gpu_span_ch(g << ATTR_FRAC_BITS, d) << 16));
+            const int32_t mb = (int32_t)gpu_span_ch(b << ATTR_FRAC_BITS, d);
+
+            for (uint32_t i = 0; i < 16u; i++)
+            {
+                const int32_t w0 = (int32_t)g_gpu_split[i][0];
+                const int32_t w1 = (int32_t)g_gpu_split[i][1];
+                const uint32_t px = GPU_USAT_ASR((int32_t)(int16_t)w0 * (int32_t)(int16_t)mrg, 5, 7) |
+                                    (GPU_USAT_ASR((w0 >> 16) * (mrg >> 16), 5, 7) << 5) |
+                                    (GPU_USAT_ASR((w1 >> 16) * mb, 5, 7) << 10);
+
+                const uint32_t f = (transp && (mode == 3) && (fl[i] & 0x20000u)) ? ((px >> 2) & 0x1ce7u) : px;
+
+                g_gpu_mtab[ry][i][cx] = fl[i] ? (f | fl[i]) : 0u;
+            }
+        }
+
+    return 1;
+}
+
+/* One span of such a polygon with a 4 bit texture: `tab` is its kernel row's block, `col` the kernel
+   column of its first pixel. TRANSP and MODE are constants: the blend is inlined for its mode. */
+__attribute__((always_inline)) static inline void gpu_span_mtab(const uint32_t *tab, const uint16_t *tex,
+                                                                 uint16_t *dst, int n, uint32_t col, uint32_t u,
+                                                                 uint32_t v, uint32_t du, uint32_t dv,
+                                                                 const int TRANSP, const int MODE)
+{
+#pragma GCC unroll 1
+    do
+    {
+        const uint32_t idx =
+            (tex[((v >> ATTR_FRAC_BITS) & 0xffu) * PSX_GPU_VRAM_PITCH + ((u >> (ATTR_FRAC_BITS + 2)) & 0x3fu)] >>
+             ((u >> (ATTR_FRAC_BITS - 2)) & 0xcu)) & 0xfu;
+        const uint32_t e = tab[(idx << 2) | col];
+
+        col = (col + 1u) & 3u;
+        u += du;
+        v += dv;
+
+        if (e & 0x10000u)
+            *dst = (uint16_t)((TRANSP && (e & 0x20000u)) ? gpu_blend_bgr555(e, *dst, MODE) : e);
+
+        dst++;
+    }
+    while (--n > 0);
+}
+
+typedef void (*gpu_span_mtab_fn_t)(const uint32_t *tab, const uint16_t *tex, uint16_t *dst, int n, uint32_t col,
+                                   uint32_t u, uint32_t v, uint32_t du, uint32_t dv);
+
+#define GPU_SPAN_MTAB_FN(NAME, T, M)                                                                          \
+    static PSX_GPU_RAS __attribute__((noinline)) void NAME(const uint32_t *tab, const uint16_t *tex, uint16_t *dst, \
+                                                          int n, uint32_t col, uint32_t u, uint32_t v, uint32_t du, \
+                                                          uint32_t dv)                                          \
+    {                                                                                                          \
+        gpu_span_mtab(tab, tex, dst, n, col, u, v, du, dv, T, M);                                              \
+    }
+
+GPU_SPAN_MTAB_FN(gpu_span_mtab_t0, 1, 0)
+GPU_SPAN_MTAB_FN(gpu_span_mtab_t2, 1, 2)
+
+#if GPU_G4_ASM
+/*
+    Blending mode 1 (B + F), the kind Atlantis draws its light and glow with - three quarters of
+    those texels are transparent - and with it opaque polygons and mode 3 (see gpu_mtab_make),
+    scheduled by hand like gpu_g4_loop_o: the next pixel's texel is loaded a pixel ahead. The
+    arithmetic is gpu_span_mtab's with gpu_blend_bgr555's mode 1.
+    Registers: r0 table row, r1 texture page, r2 destination, r3 count, r4 kernel column,
+    r5 u, r6 v, r7 du, r8 dv, r9 the texel word ahead, r10-r12 / lr work.
+*/
+static PSX_GPU_RAS __attribute__((naked, noinline)) void gpu_span_mtab_t1(const uint32_t *tab, const uint16_t *tex,
+                                                                          uint16_t *dst, int n, uint32_t col,
+                                                                          uint32_t u, uint32_t v, uint32_t du,
+                                                                          uint32_t dv)
+{
+    (void)tab, (void)tex, (void)dst, (void)n, (void)col, (void)u, (void)v, (void)du, (void)dv;
+
+    __asm__ volatile(
+        "push   {r4-r11, lr}\n\t"
+        "ldrd   r4, r5, [sp, #36]\n\t"
+        "ldrd   r6, r7, [sp, #44]\n\t"
+        "ldr    r8, [sp, #52]\n\t"
+        "ubfx   r10, r6, #12, #8\n\t"
+        "ubfx   r9, r5, #14, #6\n\t"
+        "add    r10, r10, r10, lsl #6\n\t"
+        "add    r9, r9, r10, lsl #4\n\t"
+        "ldrh   r9, [r1, r9, lsl #1]\n\t"
+        "1:\n\t"
+        /* this pixel's table entry; the next pixel's coordinates and texel word */
+        "lsr    r10, r5, #10\n\t"
+        "and    r10, r10, #12\n\t"
+        "lsr    r10, r9, r10\n\t"
+        "add    r5, r5, r7\n\t"
+        "and    r10, r10, #15\n\t"
+        "add    r6, r6, r8\n\t"
+        "orr    r10, r4, r10, lsl #2\n\t"
+        "ubfx   r11, r6, #12, #8\n\t"
+        "ldr    r12, [r0, r10, lsl #2]\n\t"
+        "ubfx   r9, r5, #14, #6\n\t"
+        "add    r11, r11, r11, lsl #6\n\t"
+        "add    r4, r4, #1\n\t"
+        "add    r9, r9, r11, lsl #4\n\t"
+        "and    r4, r4, #3\n\t"
+        "ldrh   r9, [r1, r9, lsl #1]\n\t"
+        "tst    r12, #0x10000\n\t"
+        "beq    3f\n\t"
+        "tst    r12, #0x20000\n\t"
+        "beq    2f\n\t"
+        /* sum = F + B; carry = (sum - ((F ^ B) & 0x8421)) & 0x8420;
+           out = ((sum - carry) | (carry - (carry >> 5))) & 0x7fff */
+        "ldrh   r10, [r2]\n\t"
+        "ubfx   r12, r12, #0, #15\n\t"
+        "movw   lr, #0x8421\n\t"
+        "ubfx   r10, r10, #0, #15\n\t"
+        "eor    r11, r12, r10\n\t"
+        "add    r12, r12, r10\n\t"
+        "and    r11, r11, lr\n\t"
+        "sub    r11, r12, r11\n\t"
+        "sub    lr, lr, #1\n\t"
+        "and    r11, r11, lr\n\t"
+        "sub    r12, r12, r11\n\t"
+        "sub    r11, r11, r11, lsr #5\n\t"
+        "orr    r12, r12, r11\n\t"
+        "bfc    r12, #15, #17\n\t"
+        "2:\n\t"
+        "strh   r12, [r2]\n\t"
+        "3:\n\t"
+        "adds   r2, r2, #2\n\t"
+        "subs   r3, r3, #1\n\t"
+        "bne    1b\n\t"
+        "pop    {r4-r11, pc}\n\t");
+}
+
+/* the same in C, reading in order, for a polygon over its own texture page (page_hit) */
+GPU_SPAN_MTAB_FN(gpu_span_mtab_c1, 1, 1)
+#else
+GPU_SPAN_MTAB_FN(gpu_span_mtab_t1, 1, 1)
+#define gpu_span_mtab_c1 gpu_span_mtab_t1
+#endif
+
+#undef GPU_SPAN_MTAB_FN
+
+/* opaque, then semi transparent by mode (opaque and mode 3 through mode 1's span, see gpu_mtab_make) */
+static gpu_span_mtab_fn_t const g_gpu_span_mtab_fns[5] = {
+    gpu_span_mtab_t1, gpu_span_mtab_t0, gpu_span_mtab_t1, gpu_span_mtab_t2, gpu_span_mtab_t1,
+};
+static gpu_span_mtab_fn_t const g_gpu_span_mtab_exact[5] = {
+    gpu_span_mtab_c1, gpu_span_mtab_t0, gpu_span_mtab_c1, gpu_span_mtab_t2, gpu_span_mtab_c1,
+};
 
 #if PSX_PROFILE
 static uint32_t g_ras_last_bbox;
@@ -2073,8 +2900,60 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
 
             uint16_t *__restrict dst = &vram[vram_row + xmin + start];
 
-            for (int x = start; x <= end; ++x, ++dst)
-                *dst = gpu_blend_bgr555(src_color, *dst, transp_mode);
+            if ((transp_mode != 2) && (start <= end))
+            {
+                /*
+                    Modes 0, 1 and 3 on two pixels at a time, a word of VRAM: their
+                    carries never leave a pixel (two 15 bit pixels add up to at most
+                    0xfffe, and what is taken off is part of that sum), so the
+                    arithmetic of gpu_blend_bgr555 works on both halves at once.
+                    (Shadows: Atlantis draws them this way, mode 0.)
+                */
+                const uint32_t f = (transp_mode == 3) ? ((src_color & 0x7fffu) >> 2) & 0x1ce7u : (src_color & 0x7fffu);
+                const uint32_t f2 = f | (f << 16);
+                int n = end - start + 1;
+
+                if ((uintptr_t)dst & 2u)
+                {
+                    *dst = gpu_blend_bgr555(src_color, *dst, transp_mode);
+                    dst++;
+                    n--;
+                }
+
+                uint32_t *d2 = (uint32_t *)dst;
+
+                if (transp_mode == 0)
+                {
+                    for (; n >= 2; n -= 2, d2++)
+                    {
+                        const uint32_t b2 = *d2 & 0x7fff7fffu;
+
+                        *d2 = ((f2 + b2) - ((f2 ^ b2) & 0x04210421u)) >> 1;
+                    }
+                }
+                else
+                {
+                    for (; n >= 2; n -= 2, d2++)
+                    {
+                        const uint32_t b2 = *d2 & 0x7fff7fffu;
+                        const uint32_t sum = f2 + b2;
+                        const uint32_t carry = (sum - ((f2 ^ b2) & 0x84218421u)) & 0x84208420u;
+
+                        *d2 = ((sum - carry) | (carry - (carry >> 5))) & 0x7fff7fffu;
+                    }
+                }
+
+                if (n)
+                {
+                    dst = (uint16_t *)d2;
+                    *dst = gpu_blend_bgr555(src_color, *dst, transp_mode);
+                }
+            }
+            else
+            {
+                for (int x = start; x <= end; ++x, ++dst)
+                    *dst = gpu_blend_bgr555(src_color, *dst, transp_mode);
+            }
 
             e0_row += edge0_b;
             e1_row += edge1_b;
@@ -2150,40 +3029,156 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
                                                                                                        \
             if (start <= end)                                                                          \
             {                                                                                          \
-                /* the dither pattern is anchored at the corner of the bounding box */                 \
-                const int *const drow = &g_psx_gpu_dither_kernel[((y - ymin) & 3) << 2];               \
+                /* the dither pattern is anchored at the corner of the bounding box: the row's          \
+                   four values as signed bytes, turned so that the span's first pixel is lowest */     \
+                const uint32_t dw = gpu_dither_row_word((uint32_t)(y - ymin));                         \
+                const uint32_t drot = ((uint32_t)start & 3u) << 3;                                     \
+                uint32_t dither = drot ? ((dw >> drot) | (dw << (32u - drot))) : dw;                   \
                                                                                                        \
                 int32_t rv = (int32_t)((uint32_t)r_row + (uint32_t)r_dx * (uint32_t)start);            \
                 int32_t gv = (int32_t)((uint32_t)g_row + (uint32_t)g_dx * (uint32_t)start);            \
                 int32_t bv = (int32_t)((uint32_t)b_row + (uint32_t)b_dx * (uint32_t)start);            \
                 uint16_t *__restrict dst = &vram[vram_row + xmin + start];                             \
+                uint16_t *const dend = dst + (end - start) + 1;                                        \
                                                                                                        \
-                for (int x = start; x <= end; ++x, ++dst)                                              \
+                /* a channel is clamp((v >> 12) + d, 0, 255) >> 3, which is                             \
+                   clamp(((v >> 12) + d) >> 3, 0, 31): one add and one USAT */                          \
+                do                                                                                     \
                 {                                                                                      \
-                    const int d = drow[x & 3];                                                         \
-                    const uint16_t out = (uint16_t)((PSXE_CH(rv, d) >> 3) | ((PSXE_CH(gv, d) >> 3) << 5) | \
-                                                    ((PSXE_CH(bv, d) >> 3) << 10));                     \
+                    const int32_t d = (int32_t)(int8_t)(dither & 0xffu);                               \
                                                                                                        \
-                    *dst = (TRANSP) ? gpu_blend_bgr555(out, *dst, transp_mode) : out;                   \
+                    dither = (dither >> 8) | (dither << 24);                                           \
+                                                                                                       \
+                    const uint32_t out = GPU_USAT_ASR((rv >> ATTR_FRAC_BITS) + d, 5, 3) |              \
+                                         (GPU_USAT_ASR((gv >> ATTR_FRAC_BITS) + d, 5, 3) << 5) |       \
+                                         (GPU_USAT_ASR((bv >> ATTR_FRAC_BITS) + d, 5, 3) << 10);       \
+                                                                                                       \
+                    *dst = (uint16_t)((TRANSP) ? gpu_blend_bgr555(out, *dst, transp_mode) : out);       \
                                                                                                        \
                     rv += r_dx; gv += g_dx; bv += b_dx;                                                \
                 }                                                                                      \
+                while (++dst != dend);                                                                 \
             }                                                                                          \
                                                                                                        \
             e0_row += edge0_b; e1_row += edge1_b; e2_row += edge2_b;                                   \
             r_row += r_dy; g_row += g_dy; b_row += b_dy;                                               \
         }
 
-        if (transparency_enabled)
+/* In one colour (all three vertices alike, see gpu_mtab_make) a pixel is one of the 16 dithered
+   colours of the kernel - pat[kernel row][kernel column], made once - and TRANSP / MODE are constants */
+#define PSXE_GOURAUD_ONE_LOOP(TRANSP, MODE)                                                            \
+        for (int y = yfirst; y <= ymax; y += ystep, vram_row += row_stride)                            \
+        {                                                                                              \
+            int start = 0;                                                                             \
+            int end = row_px - 1;                                                                      \
+                                                                                                       \
+            gpu_span_clip(e0_row, edge0_a, &start, &end);                                              \
+            gpu_span_clip(e1_row, edge1_a, &start, &end);                                              \
+            gpu_span_clip(e2_row, edge2_a, &start, &end);                                              \
+                                                                                                       \
+            if (start <= end)                                                                          \
+            {                                                                                          \
+                const uint16_t *const p = pat[(uint32_t)(y - ymin) & 3u];                              \
+                uint32_t k = (uint32_t)start & 3u;                                                     \
+                uint16_t *__restrict dst = &vram[vram_row + xmin + start];                             \
+                uint16_t *const dend = dst + (end - start) + 1;                                        \
+                                                                                                       \
+                do                                                                                     \
+                {                                                                                      \
+                    *dst = (TRANSP) ? gpu_blend_bgr555(p[k], *dst, (MODE)) : p[k];                     \
+                    k = (k + 1u) & 3u;                                                                 \
+                }                                                                                      \
+                while (++dst != dend);                                                                 \
+            }                                                                                          \
+                                                                                                       \
+            e0_row += edge0_b; e1_row += edge1_b; e2_row += edge2_b;                                   \
+        }
+
+        if ((a.c == b.c) && (b.c == c.c))
+        {
+            const int32_t cr = (int32_t)(a.c & 0xffu), cg = (int32_t)((a.c >> 8) & 0xffu),
+                          cb = (int32_t)((a.c >> 16) & 0xffu);
+
+            uint16_t pat[4][4];
+
+            for (uint32_t i = 0; i < 16u; i++)
+            {
+                const int32_t d = g_psx_gpu_dither_kernel[i];
+
+                pat[i >> 2][i & 3u] = (uint16_t)(GPU_USAT_ASR(cr + d, 5, 3) | (GPU_USAT_ASR(cg + d, 5, 3) << 5) |
+                                                 (GPU_USAT_ASR(cb + d, 5, 3) << 10));
+            }
+
+            if (!transparency_enabled)
+            {
+                PSXE_GOURAUD_ONE_LOOP(0, 0)
+            }
+            else
+            {
+                switch (transp_mode)
+                {
+                case 0:
+                    PSXE_GOURAUD_ONE_LOOP(1, 0)
+                    break;
+                case 1:
+                    PSXE_GOURAUD_ONE_LOOP(1, 1)
+                    break;
+                case 2:
+                    PSXE_GOURAUD_ONE_LOOP(1, 2)
+                    break;
+                default:
+                    PSXE_GOURAUD_ONE_LOOP(1, 3)
+                    break;
+                }
+            }
+        }
+        else if (transparency_enabled)
         {
             PSXE_GOURAUD_LOOP(1)
         }
         else
         {
-            PSXE_GOURAUD_LOOP(0)
+            gpu_span_t sp;
+
+            sp.dr = r_dx;
+            sp.dg = g_dx;
+            sp.db = b_dx;
+
+            for (int y = yfirst; y <= ymax; y += ystep, vram_row += row_stride)
+            {
+                int start = 0;
+                int end = row_px - 1;
+
+                gpu_span_clip(e0_row, edge0_a, &start, &end);
+                gpu_span_clip(e1_row, edge1_a, &start, &end);
+                gpu_span_clip(e2_row, edge2_a, &start, &end);
+
+                if (start <= end)
+                {
+                    /* the dither pattern is anchored at the corner of the bounding box: the row's
+                       four values as signed bytes, turned so that the span's first pixel is lowest */
+                    const uint32_t dw = gpu_dither_row_word((uint32_t)(y - ymin));
+                    const uint32_t drot = ((uint32_t)start & 3u) << 3;
+
+                    sp.dither = drot ? ((dw >> drot) | (dw << (32u - drot))) : dw;
+
+                    gpu_span_gouraud_o(&sp, &vram[vram_row + xmin + start], end - start + 1,
+                                       (int32_t)((uint32_t)r_row + (uint32_t)r_dx * (uint32_t)start),
+                                       (int32_t)((uint32_t)g_row + (uint32_t)g_dx * (uint32_t)start),
+                                       (int32_t)((uint32_t)b_row + (uint32_t)b_dx * (uint32_t)start));
+                }
+
+                e0_row += edge0_b;
+                e1_row += edge1_b;
+                e2_row += edge2_b;
+                r_row += r_dy;
+                g_row += g_dy;
+                b_row += b_dy;
+            }
         }
 
 #undef PSXE_GOURAUD_LOOP
+#undef PSXE_GOURAUD_ONE_LOOP
 
         return 5;
     }
@@ -2338,7 +3333,59 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
        functions leave that to the general loops, whose fetch wraps. */
     const int page_wraps = (fetch != 0) && ((tpx + (256 >> (2 - fetch))) > 1024);
 
-    if (!gpu->texw_mx && !gpu->texw_my && !page_wraps)
+    /* A polygon that covers part of its own texture page: the hand-written span loops
+       (GPU_G4_ASM) load the next pixel's texel before they store this pixel, so a pixel
+       stored onto the texel the next one reads would be read too early - such a polygon
+       takes the C loops, which read in order. (Games keep what they draw clear of the
+       pages they draw with; a synthetic test did not.) */
+    const int page_hit = (xmax >= tpx) && (xmin < (tpx + (64 << fetch))) && (ymax >= tpy) && (ymin < (tpy + 256));
+
+    /* Gouraud shaded in one colour, 4 bit texture: the table of its pixels (gpu_mtab_make) - for a
+       small polygon only when it is there already */
+    if ((shade == 2) && (fetch == 0) && (a.c == b.c) && (b.c == c.c) && !gpu->texw_mx && !gpu->texw_my &&
+        gpu_mtab_make(clut, a.c, transparency_enabled, transp_mode, area >= GPU_MTAB_MIN_AREA))
+    {
+        const gpu_span_mtab_fn_t span =
+            (page_hit ? g_gpu_span_mtab_exact : g_gpu_span_mtab_fns)[transparency_enabled ? (1 + transp_mode) : 0];
+        const uint16_t *const tex = &vram[PSX_VRAM_AT(tpx, tpy)];
+
+        for (int y = yfirst; y <= ymax; y += ystep, vram_row += row_stride)
+        {
+            int start = 0;
+            int end = row_px - 1;
+
+            gpu_span_clip(e0_row, edge0_a, &start, &end);
+            gpu_span_clip(e1_row, edge1_a, &start, &end);
+            gpu_span_clip(e2_row, edge2_a, &start, &end);
+
+            if (start <= end)
+            {
+                const uint32_t txv = (uint32_t)tx_row + (uint32_t)tx_dx * (uint32_t)start;
+                const uint32_t tyv = (uint32_t)ty_row + (uint32_t)ty_dx * (uint32_t)start;
+
+                /* the texels the next scanline starts with (as the span functions below) */
+                {
+                    const uint32_t ntx = ((txv + (uint32_t)tx_dy) >> ATTR_FRAC_BITS) & 0xffu;
+                    const uint32_t nty = ((tyv + (uint32_t)ty_dy) >> ATTR_FRAC_BITS) & 0xffu;
+
+                    __builtin_prefetch(&tex[PSX_VRAM_AT(ntx >> 2, nty)]);
+                }
+
+                /* kernel rows 2 and 3: rows 0 and 1 from two columns on (gpu_mtab_make) */
+                const uint32_t krow = (uint32_t)(y - ymin) & 3u;
+
+                span(&g_gpu_mtab[krow & 1u][0][0], tex, &vram[vram_row + xmin + start], end - start + 1,
+                     ((uint32_t)start + (krow & 2u)) & 3u, txv, tyv, (uint32_t)tx_dx, (uint32_t)ty_dx);
+            }
+
+            e0_row += edge0_b;
+            e1_row += edge1_b;
+            e2_row += edge2_b;
+            tx_row += tx_dy;
+            ty_row += ty_dy;
+        }
+    }
+    else if (!gpu->texw_mx && !gpu->texw_my && !page_wraps)
     {
         /* no texture window: the span functions above */
         gpu_span_t sp;
@@ -2355,9 +3402,16 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
         sp.mb = mod_b;
         sp.dither = 0;
         sp.transp_mode = transp_mode;
+        sp.exact = page_hit;
 
         const gpu_span_fn_t span = g_gpu_span_fns[(fetch * 6) + (shade * 2) + (transparency_enabled ? 1 : 0)];
         const uint32_t pre_shift = (fetch == 0) ? 2u : ((fetch == 1) ? 1u : 0u);
+
+        /* Gouraud and a 4 bit texture: the palette taken apart (gpu_span_g4) */
+        const int g4 = (shade == 2) && (fetch == 0);
+
+        if (g4)
+            gpu_split_make(clut);
 
         for (int y = yfirst; y <= ymax; y += ystep, vram_row += row_stride)
         {
@@ -2392,10 +3446,30 @@ static inline __attribute__((always_inline)) int gpu_render_triangle_impl(psx_gp
                     sp.dither = rot ? ((w >> rot) | (w << (32u - rot))) : w;
                 }
 
-                span(&sp, &vram[vram_row + xmin + start], end - start + 1, txv, tyv,
-                     (int32_t)((uint32_t)r_row + (uint32_t)r_dx * (uint32_t)start),
-                     (int32_t)((uint32_t)g_row + (uint32_t)g_dx * (uint32_t)start),
-                     (int32_t)((uint32_t)b_row + (uint32_t)b_dx * (uint32_t)start));
+                const int32_t rs = (int32_t)((uint32_t)r_row + (uint32_t)r_dx * (uint32_t)start);
+                const int32_t gs = (int32_t)((uint32_t)g_row + (uint32_t)g_dx * (uint32_t)start);
+                const int32_t bs = (int32_t)((uint32_t)b_row + (uint32_t)b_dx * (uint32_t)start);
+
+                if (g4)
+                {
+                    /* no clamping when every colour of the span is within 4 .. 251 (its ends) */
+                    const uint32_t k = (uint32_t)(end - start);
+                    const int32_t re = (int32_t)((uint32_t)rs + (uint32_t)r_dx * k);
+                    const int32_t ge = (int32_t)((uint32_t)gs + (uint32_t)g_dx * k);
+                    const int32_t be = (int32_t)((uint32_t)bs + (uint32_t)b_dx * k);
+
+#define GPU_IN_4_251(x) (((uint32_t)(((x) >> ATTR_FRAC_BITS) - 4)) <= 247u)
+                    const int cl = !(GPU_IN_4_251(rs) && GPU_IN_4_251(gs) && GPU_IN_4_251(bs) && GPU_IN_4_251(re) &&
+                                     GPU_IN_4_251(ge) && GPU_IN_4_251(be));
+#undef GPU_IN_4_251
+
+                    g_gpu_span_g4_fns[(transparency_enabled ? 2 : 0) + cl](&sp, &vram[vram_row + xmin + start],
+                                                                         end - start + 1, txv, tyv, rs, gs, bs);
+                }
+                else
+                {
+                    span(&sp, &vram[vram_row + xmin + start], end - start + 1, txv, tyv, rs, gs, bs);
+                }
             }
 
             e0_row += edge0_b;
@@ -2487,6 +3561,12 @@ PSX_GPU_RAS void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
             return;
     }
 
+    /* whatever this rectangle writes, the last solid fill (fill_key) is no longer the last word
+       on VRAM - unless it is a solid fill that repeats it (below) */
+    const uint32_t fill_key = gpu->fill_key;
+
+    gpu->fill_key = 0u;
+
 #if PSX_GPU_EXTERNAL_RASTER
     if (data.width && data.height && psx_raster_rect(gpu, data))
     {
@@ -2546,11 +3626,28 @@ PSX_GPU_RAS void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
 
     if (!is_textured && !base_transp)
     {
+        /* inside the last solid fill, in its colour and rows, nothing written since: every
+           pixel already is this colour */
+        const uint32_t key = 0x80000000u | ((uint32_t)(gpu->skip_rows + 1) << 16) | solid_color;
+
+        if ((fill_key == key) && (x0 >= gpu->fill_x0) && (x1 <= gpu->fill_x1) && (yfirst >= gpu->fill_y0) &&
+            (y1 <= gpu->fill_y1))
+        {
+            gpu->fill_key = fill_key;
+            return;
+        }
+
         for (int32_t y = yfirst; y < y1; y += ystep)
         {
             uint16_t *dst = &gpu->vram[PSX_VRAM_AT(x0, y)];
             gpu_fill_span(dst, solid_color, rect_w);
         }
+
+        gpu->fill_key = key;
+        gpu->fill_x0 = x0;
+        gpu->fill_y0 = yfirst;
+        gpu->fill_x1 = x1;
+        gpu->fill_y1 = y1;
         return;
     }
 
@@ -2606,6 +3703,12 @@ PSX_GPU_RAS void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
         /* which halfword of a texture row a texel sits in */
         const int tshift = (depth == 0) ? 2 : ((depth == 1) ? 1 : 0);
 
+        /* whether the rectangle covers part of its own texture (4 bit texels are read
+           two at a time below, which is only the same when it does not) */
+        const int self = (depth == 0) && ((tpy + tex_y) < y1) && (y0 < (tpy + tex_y + (y1 - y0))) &&
+                         ((tpx + (tex_start_x >> 2)) < (x0 + rect_w)) &&
+                         (x0 <= (tpx + ((tex_start_x + rect_w - 1) >> 2)));
+
         tex_y += yfirst - y0;
 
         for (int32_t y = yfirst; y < y1; y += ystep, tex_y += ystep)
@@ -2625,29 +3728,84 @@ PSX_GPU_RAS void gpu_render_rect(psx_gpu_t *gpu, rect_data_t data)
                 __builtin_prefetch(trow + (PSX_GPU_VRAM_PITCH * ystep) + ((tex_start_x + rect_w - 1) >> tshift));
             }
 
-            int32_t tx = tex_start_x;
-
-            for (int32_t i = 0; i < rect_w; ++i, ++tx, ++dst)
-            {
-                uint16_t texel;
-
-                if (depth == 0)
-                    texel = clut[(trow[tx >> 2] >> ((tx & 3) << 2)) & 0xf];
-                else if (depth == 1)
-                    texel = clut[(trow[tx >> 1] >> ((tx & 1) << 3)) & 0xff];
-                else
-                    texel = trow[tx];
-
-                if (!texel)
-                    continue;
-
-                const uint16_t out = texel & keep;
-
-                if (__builtin_expect(base_transp && (texel & 0x8000), 0))
-                    *dst = gpu_blend_bgr555(out, *dst, transp_mode);
-                else
-                    *dst = out;
+            /* A texel is read where it lies in the row: an 8 bit one is the byte at its
+               x, a 4 bit one a nibble of the byte at x / 2 (low nibble first) - the
+               same texels as the halfword arithmetic, without it */
+#define GPU_SPRITE_PUT(i, texel)                                                   \
+            if (texel)                                                             \
+            {                                                                      \
+                const uint16_t out_ = (uint16_t)((texel) & keep);                  \
+                                                                                   \
+                if (__builtin_expect(base_transp && ((texel) & 0x8000u), 0))       \
+                    dst[i] = gpu_blend_bgr555(out_, dst[i], transp_mode);          \
+                else                                                               \
+                    dst[i] = out_;                                                 \
             }
+
+            if (depth == 1)
+            {
+                const uint8_t *const t8 = (const uint8_t *)trow + tex_start_x;
+
+                for (int32_t i = 0; i < rect_w; i++)
+                {
+                    const uint32_t texel = clut[t8[i]];
+
+                    GPU_SPRITE_PUT(i, texel)
+                }
+            }
+            else if ((depth == 0) && self)
+            {
+                /* drawing over its own texture: every texel read after the pixel before it is written */
+                for (int32_t i = 0, tx = tex_start_x; i < rect_w; i++, tx++)
+                {
+                    const uint32_t texel = clut[(trow[tx >> 2] >> ((tx & 3) << 2)) & 0xfu];
+
+                    GPU_SPRITE_PUT(i, texel)
+                }
+            }
+            else if (depth == 0)
+            {
+                const uint8_t *t4 = (const uint8_t *)trow + (tex_start_x >> 1);
+                int32_t i = 0;
+
+                if (tex_start_x & 1)
+                {
+                    const uint32_t texel = clut[*t4++ >> 4];
+
+                    GPU_SPRITE_PUT(0, texel)
+                    i = 1;
+                }
+
+                for (; (i + 1) < rect_w; i += 2)
+                {
+                    const uint32_t two = *t4++;
+                    const uint32_t texel0 = clut[two & 0xfu];
+                    const uint32_t texel1 = clut[two >> 4];
+
+                    GPU_SPRITE_PUT(i, texel0)
+                    GPU_SPRITE_PUT(i + 1, texel1)
+                }
+
+                if (i < rect_w)
+                {
+                    const uint32_t texel = clut[*t4 & 0xfu];
+
+                    GPU_SPRITE_PUT(i, texel)
+                }
+            }
+            else
+            {
+                const uint16_t *const t16 = trow + tex_start_x;
+
+                for (int32_t i = 0; i < rect_w; i++)
+                {
+                    const uint32_t texel = t16[i];
+
+                    GPU_SPRITE_PUT(i, texel)
+                }
+            }
+
+#undef GPU_SPRITE_PUT
         }
 
         return;
@@ -2817,7 +3975,7 @@ PSX_GPU_HOT void gpu_render_flat_line(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, 
     plotLine(gpu, v0.x, v0.y, v1.x, v1.y, color);
 }
 
-PSX_GPU_RAS void gpu_render_flat_rectangle(psx_gpu_t *gpu, vertex_t v, uint32_t w, uint32_t h, uint32_t color)
+void gpu_render_flat_rectangle(psx_gpu_t *gpu, vertex_t v, uint32_t w, uint32_t h, uint32_t color)
 {
     /* Offset coordinates */
     v.x += gpu->off_x;
@@ -2904,7 +4062,7 @@ PSX_GPU_RAS void gpu_render_flat_rectangle(psx_gpu_t *gpu, vertex_t v, uint32_t 
     }
 }
 
-PSX_GPU_RAS void gpu_render_textured_rectangle(psx_gpu_t *gpu, vertex_t v, uint32_t w, uint32_t h, uint16_t clutx, uint16_t cluty, uint32_t color)
+void gpu_render_textured_rectangle(psx_gpu_t *gpu, vertex_t v, uint32_t w, uint32_t h, uint16_t clutx, uint16_t cluty, uint32_t color)
 {
     vertex_t a = v;
 
@@ -2943,7 +4101,7 @@ PSX_GPU_RAS void gpu_render_textured_rectangle(psx_gpu_t *gpu, vertex_t v, uint3
     }
 }
 
-PSX_GPU_RAS void gpu_render_flat_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, uint32_t color)
+void gpu_render_flat_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, uint32_t color)
 {
     vertex_t a, b, c;
     uint16_t rgb = color & 0xFFFF;
@@ -2990,7 +4148,7 @@ PSX_GPU_RAS void gpu_render_flat_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t 
     }
 }
 
-PSX_GPU_RAS void gpu_render_shaded_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2)
+void gpu_render_shaded_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2)
 {
     vertex_t a, b, c, p;
 
@@ -3070,7 +4228,7 @@ PSX_GPU_RAS void gpu_render_shaded_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_
     }
 }
 
-PSX_GPU_RAS void gpu_render_textured_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, uint32_t tpx, uint32_t tpy, uint16_t clutx, uint16_t cluty, int depth)
+void gpu_render_textured_triangle(psx_gpu_t *gpu, vertex_t v0, vertex_t v1, vertex_t v2, uint32_t tpx, uint32_t tpy, uint16_t clutx, uint16_t cluty, int depth)
 {
     vertex_t a, b, c;
 
@@ -3418,6 +4576,7 @@ PSX_GPU_HOT void gpu_cmd_a0(psx_gpu_t *gpu)
            straddle a presented frame, and what arrives after that has to
            raise the flag again. One test while the flag is already up. */
         gpu_touch(gpu, gpu->xpos, gpu->ypos, gpu->xpos + gpu->xsiz, gpu->ypos + gpu->ysiz);
+        gpu_reader_guard_rows(gpu->ypos, gpu->ysiz);
 
         unsigned int xpos = (gpu->xpos + gpu->xcnt) & 0x3ff;
         unsigned int ypos = (gpu->ypos + gpu->ycnt) & 0x1ff;
@@ -3492,6 +4651,8 @@ uint32_t PSX_GPU_HOT psx_gpu_write_bulk(psx_gpu_t *gpu, const uint32_t *src, uin
     if (gpu->state != GPU_STATE_RECV_DATA)
         return 0;
 
+    gpu_reader_guard_rows(gpu->ypos, gpu->ysiz);
+
     uint32_t used = 0;
 
     while (words)
@@ -3546,7 +4707,7 @@ uint32_t PSX_GPU_HOT psx_gpu_write_bulk(psx_gpu_t *gpu, const uint32_t *src, uin
 }
 
 // Monochrome Opaque Quadrilateral
-PSX_GPU_HOT void gpu_cmd_28(psx_gpu_t *gpu)
+void gpu_cmd_28(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -3584,7 +4745,7 @@ PSX_GPU_HOT void gpu_cmd_28(psx_gpu_t *gpu)
 }
 
 // Monochrome Opaque Quadrilateral
-PSX_GPU_HOT void gpu_cmd_30(psx_gpu_t *gpu)
+void gpu_cmd_30(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -3621,7 +4782,7 @@ PSX_GPU_HOT void gpu_cmd_30(psx_gpu_t *gpu)
 }
 
 // Monochrome Opaque Quadrilateral
-PSX_GPU_HOT void gpu_cmd_38(psx_gpu_t *gpu)
+void gpu_cmd_38(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -3662,7 +4823,7 @@ PSX_GPU_HOT void gpu_cmd_38(psx_gpu_t *gpu)
 }
 
 // Monochrome Opaque Quadrilateral
-PSX_GPU_HOT void gpu_cmd_3c(psx_gpu_t *gpu)
+void gpu_cmd_3c(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -3716,7 +4877,7 @@ PSX_GPU_HOT void gpu_cmd_3c(psx_gpu_t *gpu)
 }
 
 // Monochrome Opaque Quadrilateral
-PSX_GPU_HOT void gpu_cmd_2c(psx_gpu_t *gpu)
+void gpu_cmd_2c(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -3770,7 +4931,7 @@ PSX_GPU_HOT void gpu_cmd_2c(psx_gpu_t *gpu)
 }
 
 // Monochrome Opaque Quadrilateral
-PSX_GPU_HOT void gpu_cmd_24(psx_gpu_t *gpu)
+void gpu_cmd_24(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -3820,7 +4981,7 @@ PSX_GPU_HOT void gpu_cmd_24(psx_gpu_t *gpu)
 }
 
 // Monochrome Opaque Quadrilateral
-PSX_GPU_HOT void gpu_cmd_2d(psx_gpu_t *gpu)
+void gpu_cmd_2d(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -3873,7 +5034,7 @@ PSX_GPU_HOT void gpu_cmd_2d(psx_gpu_t *gpu)
     }
 }
 
-PSX_GPU_HOT void gpu_cmd_64(psx_gpu_t *gpu)
+void gpu_cmd_64(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -3911,7 +5072,7 @@ PSX_GPU_HOT void gpu_cmd_64(psx_gpu_t *gpu)
     }
 }
 
-PSX_GPU_HOT void gpu_cmd_7c(psx_gpu_t *gpu)
+void gpu_cmd_7c(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -3949,7 +5110,7 @@ PSX_GPU_HOT void gpu_cmd_7c(psx_gpu_t *gpu)
     }
 }
 
-PSX_GPU_HOT void gpu_cmd_74(psx_gpu_t *gpu)
+void gpu_cmd_74(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -3987,7 +5148,7 @@ PSX_GPU_HOT void gpu_cmd_74(psx_gpu_t *gpu)
     }
 }
 
-PSX_GPU_HOT void gpu_cmd_60(psx_gpu_t *gpu)
+void gpu_cmd_60(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -4022,7 +5183,7 @@ PSX_GPU_HOT void gpu_cmd_60(psx_gpu_t *gpu)
     }
 }
 
-PSX_GPU_HOT void gpu_cmd_68(psx_gpu_t *gpu)
+void gpu_cmd_68(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -4055,7 +5216,7 @@ PSX_GPU_HOT void gpu_cmd_68(psx_gpu_t *gpu)
     }
 }
 
-PSX_GPU_HOT void gpu_cmd_40(psx_gpu_t *gpu)
+void gpu_cmd_40(psx_gpu_t *gpu)
 {
     switch (gpu->state)
     {
@@ -4176,19 +5337,22 @@ PSX_GPU_HOT void gpu_cmd_02(psx_gpu_t *gpu)
             }
 #endif
 
-            uint16_t color = rgb888_to_bgr555(gpu->color);
+            const uint16_t color = rgb888_to_bgr555(gpu->color);
 
-            for (int y = gpu->v0.y; y < (gpu->v0.y + gpu->ysiz); y++)
+            /* what lies inside VRAM, a row at a time */
+            const int x0 = gpu->v0.x;
+            const int x1 = ((x0 + (int)gpu->xsiz) < 1024) ? (x0 + (int)gpu->xsiz) : 1024;
+            const int y1 = ((gpu->v0.y + (int)gpu->ysiz) < 512) ? (gpu->v0.y + (int)gpu->ysiz) : 512;
+
+            gpu_reader_guard((uint32_t)gpu->v0.y, (uint32_t)y1);
+
+            for (int y = gpu->v0.y; y < y1; y++)
             {
                 /* the field on screen stays as it is, as for a polygon */
                 if ((y & 1) == gpu->skip_rows)
                     continue;
 
-                for (int x = gpu->v0.x; x < (gpu->v0.x + gpu->xsiz); x++)
-                {
-                    if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0))
-                        gpu->vram[PSX_VRAM_AT(x, y)] = color;
-                }
+                gpu_fill_span(&gpu->vram[PSX_VRAM_AT(x0, y)], color, x1 - x0);
             }
 
             gpu->state = GPU_STATE_RECV_CMD;
@@ -4227,7 +5391,26 @@ PSX_GPU_HOT void gpu_cmd_80(psx_gpu_t *gpu)
             if (xsiz && ysiz)
                 gpu_field_read(gpu, srcx, srcy, srcx + xsiz, srcy + ysiz);
 
+            /* The last solid fill (fill_key, gpu_render_rect) still holds when no pixel of its
+               rectangle can change: the copy writes outside it, or copies from inside it (the fill
+               colour onto the fill colour - Atlantis copies a 2x1 block onto itself between its two
+               clears). Only for a fill of every row. */
+            if (gpu->fill_key)
+            {
+                const int all_rows = !((gpu->fill_key >> 16) & 3u);
+                const int dst_out = (dstx >= (uint32_t)gpu->fill_x1) || ((dstx + xsiz) <= (uint32_t)gpu->fill_x0) ||
+                                    (dsty >= (uint32_t)gpu->fill_y1) || ((dsty + ysiz) <= (uint32_t)gpu->fill_y0);
+                const int src_in = (srcx >= (uint32_t)gpu->fill_x0) && ((srcx + xsiz) <= (uint32_t)gpu->fill_x1) &&
+                                   (srcy >= (uint32_t)gpu->fill_y0) && ((srcy + ysiz) <= (uint32_t)gpu->fill_y1);
+
+                if (!all_rows || !(dst_out || src_in))
+                    gpu->fill_key = 0u;
+            }
+
             PSX_VRAM_CPU_READ(gpu, srcy & 0x1ffu, ysiz);
+
+            if (dsty < 512u)
+                gpu_reader_guard(dsty, ((dsty + ysiz) < 512u) ? (dsty + ysiz) : 512u);
 
             for (int y = 0; y < ysiz; y++)
             {
@@ -4251,7 +5434,7 @@ PSX_GPU_HOT void gpu_cmd_80(psx_gpu_t *gpu)
 /* GP0(E1h..E6h): the drawing environment. One word each, and the only GP0
    commands whose effect the game can read back (GPUSTAT, GP1(10h)), so they
    are applied here even when the drawing itself is done on the other board. */
-static void gpu_env_cmd(psx_gpu_t *gpu, uint32_t w)
+static PSX_GPU_HOT void gpu_env_cmd(psx_gpu_t *gpu, uint32_t w)
 {
     switch (w >> 24)
     {
@@ -4319,12 +5502,17 @@ static PSX_GPU_HOT void psx_gpu_update_cmd_impl(psx_gpu_t *gpu)
 {
     int type = (gpu->buf[0] >> 29) & 7;
 
+    /* whatever writes VRAM ends the last solid fill's say over it (fill_key; rectangles keep it
+       themselves, gpu_render_rect) */
     switch (type)
     {
     case 1:
+        gpu->fill_key = 0u;
         gpu_poly(gpu);
         return;
     case 2:
+        gpu->fill_key = 0u;
+        gpu_reader_guard((uint32_t)gpu->draw_ry1, (uint32_t)gpu->draw_ry2 + 1u);
         gpu_line(gpu);
         return;
     case 3:
@@ -4339,105 +5527,17 @@ static PSX_GPU_HOT void psx_gpu_update_cmd_impl(psx_gpu_t *gpu)
     case 0x01: /* Cache clear */
         break;
     case 0x02:
+        gpu->fill_key = 0u;
         gpu_cmd_02(gpu);
         break;
-    case 0x24:
-        gpu_cmd_24(gpu);
-        break;
-    case 0x25:
-        gpu_cmd_24(gpu);
-        break;
-    case 0x26:
-        gpu_cmd_24(gpu);
-        break;
-    case 0x27:
-        gpu_cmd_24(gpu);
-        break;
-    case 0x28:
-        gpu_cmd_28(gpu);
-        break;
-    case 0x2a:
-        gpu_cmd_28(gpu);
-        break;
-    case 0x2c:
-        gpu_cmd_2d(gpu);
-        break;
-    case 0x2d:
-        gpu_cmd_2d(gpu);
-        break;
-    case 0x2e:
-        gpu_cmd_2d(gpu);
-        break;
-    case 0x2f:
-        gpu_cmd_2d(gpu);
-        break;
-    case 0x30:
-        gpu_cmd_30(gpu);
-        break;
-    case 0x32:
-        gpu_cmd_30(gpu);
-        break;
-    case 0x38:
-        gpu_cmd_38(gpu);
-        break;
-    case 0x3c:
-        gpu_cmd_3c(gpu);
-        break;
-    case 0x3e:
-        gpu_cmd_3c(gpu);
-        break;
-    case 0x40:
-        gpu_cmd_40(gpu);
-        break;
-    case 0x60:
-        gpu_cmd_60(gpu);
-        break;
-    case 0x62:
-        gpu_cmd_60(gpu);
-        break;
-    case 0x64:
-        gpu_cmd_64(gpu);
-        break;
-    case 0x65:
-        gpu_cmd_64(gpu);
-        break;
-    case 0x66:
-        gpu_cmd_64(gpu);
-        break;
-    case 0x67:
-        gpu_cmd_64(gpu);
-        break;
-    case 0x68:
-        gpu_cmd_68(gpu);
-        break;
-    case 0x74:
-        gpu_cmd_74(gpu);
-        break;
-    case 0x75:
-        gpu_cmd_74(gpu);
-        break;
-    case 0x76:
-        gpu_cmd_74(gpu);
-        break;
-    case 0x77:
-        gpu_cmd_74(gpu);
-        break;
-    case 0x7c:
-        gpu_cmd_7c(gpu);
-        break;
-    case 0x7d:
-        gpu_cmd_7c(gpu);
-        break;
-    case 0x7e:
-        gpu_cmd_7c(gpu);
-        break;
-    case 0x7f:
-        gpu_cmd_7c(gpu);
-        break;
+    /* 20h..7Fh (polygons, lines, rectangles) were handled above by type; the
+       gpu_cmd_24 .. gpu_cmd_7c functions below them are no longer called - and no
+       longer in OCRAM: the linker drops them */
     case 0x80:
-        gpu_cmd_80(gpu);
+        gpu_cmd_80(gpu); /* keeps fill_key itself */
         break;
     case 0xa0:
+        gpu->fill_key = 0u;
         gpu_cmd_a0(gpu);
         break;
     case 0xc0:

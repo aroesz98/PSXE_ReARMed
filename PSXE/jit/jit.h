@@ -27,9 +27,11 @@ extern "C" {
 #endif
 
 /* Hot tier, in ITCM: zero wait state fetch and no cache maintenance. Holds
-   copies of the blocks that run the most. */
+   copies of the blocks that run the most - as much as ITCM leaves: every KB of
+   it is worth about 0.06% of the speed in a 3D game (Atlantis: 88 -> 54 KB cost
+   2%). */
 #ifndef PSX_JIT_CODE_SIZE
-#define PSX_JIT_CODE_SIZE (88 * 1024)
+#define PSX_JIT_CODE_SIZE (92 * 1024)
 #endif
 
 /* Every translated block, in SDRAM. Sized so that a scene's whole working set

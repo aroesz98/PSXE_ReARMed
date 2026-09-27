@@ -166,13 +166,10 @@ void AUDIO_FAST audio_out_push(const int16_t *frames, uint32_t count)
     if (count > room)
         count = room;
 
+    /* a frame is two halfwords: memcpy would be a call into flash for each (-fno-builtin) */
     for (uint32_t i = 0; i < count; i++)
-    {
-        uint32_t f;
-
-        memcpy(&f, &frames[2u * i], 4);
-        s_ring[(wr + i) & (AUDIO_RING_FRAMES - 1u)] = f;
-    }
+        s_ring[(wr + i) & (AUDIO_RING_FRAMES - 1u)] =
+            (uint32_t)(uint16_t)frames[2u * i] | ((uint32_t)(uint16_t)frames[2u * i + 1u] << 16);
 
     __DMB();
     s_wr = wr + count;

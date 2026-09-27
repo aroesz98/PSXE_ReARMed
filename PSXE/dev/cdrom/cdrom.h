@@ -257,6 +257,11 @@ typedef struct
     int32_t cdda_playing;
     int32_t cdda_prev_track;
     int32_t read_ongoing;
+
+    /* A status command (GetlocP and the like, cdrom_write_cmd) came in while
+       reading: the cycles still left until the next sector, counting down while
+       the command is answered - the drive reads on meanwhile. 0: none. */
+    int32_t read_resume;
     uint8_t *xa_buf;
     int16_t *xa_left_buf;
     int16_t *xa_right_buf;

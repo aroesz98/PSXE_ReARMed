@@ -55,7 +55,7 @@
 /* 16.16 fixed point increments of the fractional clock sources */
 #define TIMER_FRAC_ONE 65536u
 
-uint16_t timer_get_mode(psx_timer_t *timer, int32_t index)
+uint16_t __attribute__((section(".ramfunc.$SRAM_ITC"))) timer_get_mode(psx_timer_t *timer, int32_t index)
 {
     uint16_t value = (timer->timer[index].sync_enable << 0) |
                      (timer->timer[index].sync_mode << 1) |
@@ -158,7 +158,7 @@ void psx_timer_init(psx_timer_t *timer, psx_ic_t *ic, psx_gpu_t *gpu)
     timer->gpu = gpu;
 }
 
-uint32_t psx_timer_read32(psx_timer_t *timer, uint32_t offset)
+uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_timer_read32(psx_timer_t *timer, uint32_t offset)
 {
     psx_timer_flush(timer);
 
@@ -180,7 +180,7 @@ uint32_t psx_timer_read32(psx_timer_t *timer, uint32_t offset)
     return 0x0;
 }
 
-uint16_t psx_timer_read16(psx_timer_t *timer, uint32_t offset)
+uint16_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_timer_read16(psx_timer_t *timer, uint32_t offset)
 {
     psx_timer_flush(timer);
 
@@ -466,7 +466,7 @@ static void timer_recompute_deadline(psx_timer_t *timer)
 }
 
 /* Applies the cycles accumulated since the last flush */
-void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_timer_flush(psx_timer_t *timer)
+void __attribute__((section(".ramfunc.$SRAM_ITC"), noinline)) psx_timer_flush(psx_timer_t *timer)
 {
     int32_t cyc = timer->pending_cycles;
 
@@ -492,7 +492,7 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_timer_update(psx_timer_t
     psx_timer_flush(timer);
 }
 
-void psxe_gpu_hblank_event_cb(psx_gpu_t *gpu)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psxe_gpu_hblank_event_cb(psx_gpu_t *gpu)
 {
     psx_timer_t *timer = gpu->udata[1];
 
@@ -533,7 +533,7 @@ void psxe_gpu_hblank_event_cb(psx_gpu_t *gpu)
     }
 }
 
-void psxe_gpu_hblank_end_event_cb(psx_gpu_t *gpu)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psxe_gpu_hblank_end_event_cb(psx_gpu_t *gpu)
 {
     psx_timer_t *timer = gpu->udata[1];
 
@@ -553,7 +553,7 @@ void psxe_gpu_hblank_end_event_cb(psx_gpu_t *gpu)
     }
 }
 
-void psxe_gpu_vblank_timer_event_cb(psx_gpu_t *gpu)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psxe_gpu_vblank_timer_event_cb(psx_gpu_t *gpu)
 {
     psx_timer_t *timer = gpu->udata[1];
 

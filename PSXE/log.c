@@ -38,7 +38,8 @@ typedef struct
     uint32_t last_printed_count;
 } rate_limit_entry_t;
 
-static rate_limit_entry_t rate_limit_table[MAX_RATE_LIMIT_ENTRIES];
+/* SDRAM: the default place for data is ITCM, which the recompiler's hot tier wants */
+static rate_limit_entry_t __attribute__((section(".bss.$BOARD_SDRAM"))) rate_limit_table[MAX_RATE_LIMIT_ENTRIES];
 static int32_t rate_limit_index = 0;
 
 typedef struct
@@ -55,7 +56,7 @@ static struct
     int32_t level;
     bool quiet;
     Callback callbacks[MAX_CALLBACKS];
-} L;
+} L __attribute__((section(".bss.$BOARD_SDRAM")));
 
 static const char *level_strings[] = {
     "trace", "debug", "info", "warn", "error", "fatal"};

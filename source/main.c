@@ -351,6 +351,31 @@ int main(void)
         ;
 }
 
+/* The emulation loop, in ITCM with psx_update: that returns after every slice of device time,
+   thousands of times a second, and each return to a loop in flash fetched it from there again
+   (what psx_update ran had pushed it out of the I-cache) - 0.7% of Atlantis in game. */
+static void __attribute__((section(".ramfunc.$SRAM_ITC"), noinline)) psx_emulator_loop(void)
+{
+    uint32_t pad_tick = 0;
+
+    while (psxe_screen_is_open(g_screen))
+    {
+        psx_update(g_psx);
+
+        /* A game reads the pad once per frame and the bridge sends at most a
+           few hundred frames a second, so looking every few hundred device
+           slices is plenty - and costs nothing when nothing has arrived. */
+        if ((++pad_tick & 0x1ffu) == 0u)
+        {
+            psxe_gamepad_poll();
+
+            /* memory card writes to the SD card, once a save is complete */
+            if ((pad_tick & 0x3fffu) == 0u)
+                psx_pad_tick_mcd(g_psx->pad, (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
+        }
+    }
+}
+
 static void psx_emulator_task(void *pvParameters)
 {
     PRINTF("=== PSX Emulator task starting ===\r\n");
@@ -375,7 +400,7 @@ static void psx_emulator_task(void *pvParameters)
     DEMO_InitLcd();
 
     {
-        static char chosen_path[192];
+        static char __attribute__((section(".bss.$BOARD_SDRAM"))) chosen_path[192];
 
         g_boot_stage = 1; /* the picker */
 
@@ -605,24 +630,7 @@ static void psx_emulator_task(void *pvParameters)
 
     psx_prof_init();
 
-    uint32_t pad_tick = 0;
-
-    while (psxe_screen_is_open(g_screen))
-    {
-        psx_update(g_psx);
-
-        /* A game reads the pad once per frame and the bridge sends at most a
-           few hundred frames a second, so looking every few hundred device
-           slices is plenty - and costs nothing when nothing has arrived. */
-        if ((++pad_tick & 0x1ffu) == 0u)
-        {
-            psxe_gamepad_poll();
-
-            /* memory card writes to the SD card, once a save is complete */
-            if ((pad_tick & 0x3fffu) == 0u)
-                psx_pad_tick_mcd(g_psx->pad, (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
-        }
-    }
+    psx_emulator_loop();
 
     /* Cleanup on exit */
     PRINTF("PSX Emulator shutting down...\r\n");
@@ -685,8 +693,9 @@ void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer,
     /* If the buffers to be provided to the Idle task are declared inside this
     function then they must be declared static - otherwise they will be allocated on
     the stack and so not exists after this function exits. */
-    static StaticTask_t xIdleTaskTCB;
-    static StackType_t uxIdleTaskStack[configMINIMAL_STACK_SIZE];
+    /* SDRAM: the default place for data is ITCM, which the recompiler's hot tier wants */
+    static StaticTask_t __attribute__((section(".bss.$BOARD_SDRAM"))) xIdleTaskTCB;
+    static StackType_t __attribute__((section(".bss.$BOARD_SDRAM"))) uxIdleTaskStack[configMINIMAL_STACK_SIZE];
 
     /* Pass out a pointer to the StaticTask_t structure in which the Idle task's
     state will be stored. */
@@ -712,8 +721,8 @@ void vApplicationGetTimerTaskMemory(StaticTask_t **ppxTimerTaskTCBBuffer,
     /* If the buffers to be provided to the Timer task are declared inside this
     function then they must be declared static - otherwise they will be allocated on
     the stack and so not exists after this function exits. */
-    static StaticTask_t xTimerTaskTCB;
-    static StackType_t uxTimerTaskStack[configTIMER_TASK_STACK_DEPTH];
+    static StaticTask_t __attribute__((section(".bss.$BOARD_SDRAM"))) xTimerTaskTCB;
+    static StackType_t __attribute__((section(".bss.$BOARD_SDRAM"))) uxTimerTaskStack[configTIMER_TASK_STACK_DEPTH];
 
     /* Pass out a pointer to the StaticTask_t structure in which the Timer
     task's state will be stored. */

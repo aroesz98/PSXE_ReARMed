@@ -136,14 +136,37 @@ static uint16_t __attribute__((section(".bss.$BOARD_SDRAM"), aligned(32)))
     ahead of the loop, and then written out in one run of nothing but stores.
     That is about a third cheaper than converting straight across.
 */
-static uint16_t __attribute__((section(".bss.$SRAM_DTC"), aligned(4))) g_repack_row[640];
+static uint16_t __attribute__((section(".bss.$SRAM_DTC"), aligned(8))) g_repack_row[640];
 
 #define SCREEN_PRELOAD_AHEAD 128 /* bytes, four cache lines */
 
+/*
+    The row goes out in 64 bit stores when the destination allows (it always
+    does for the widths the PSX has): the core then streams whole lines out
+    without reading them from SDRAM first - 75 core cycles a line against 146
+    with 32 bit stores (measured, see gpu_fill_span in gpu.c; not unrolled).
+*/
 static inline void screen_row_out(uint16_t *d, int32_t width)
 {
     const uint16_t *r = g_repack_row;
     int32_t x = 0;
+
+#if defined(__arm__)
+    if (!((uintptr_t)d & 7u))
+    {
+        const uint32_t *s = (const uint32_t *)r;
+        uint32_t *o = (uint32_t *)d;
+
+#pragma GCC unroll 1
+        for (; (x + 3) < width; x += 4)
+        {
+            uint32_t a, b;
+
+            __asm__ volatile("ldrd %0, %1, [%2], #8" : "=r"(a), "=r"(b), "+r"(s));
+            __asm__ volatile("strd %1, %2, [%0], #8" : "+r"(o) : "r"(a), "r"(b) : "memory");
+        }
+    }
+#endif
 
     for (; (x + 1) < width; x += 2)
     {
@@ -218,10 +241,10 @@ static void screen_repack_bgr555(const uint16_t *src, int32_t width, int32_t hei
 static void screen_test_pattern(int32_t width, int32_t height, uint16_t *dst)
 {
     const uint16_t white = 0xffffu;
-    const uint16_t red = 0xf800u;
+    const uint16_t red = OSD_PANEL_COLOR(0xf800u);
     const uint16_t green = 0x07e0u;
-    const uint16_t blue = 0x001fu;
-    const uint16_t yellow = 0xffe0u;
+    const uint16_t blue = OSD_PANEL_COLOR(0x001fu);
+    const uint16_t yellow = OSD_PANEL_COLOR(0xffe0u);
     const uint16_t dim = 0x2104u;
 
     for (int32_t y = 0; y < height; y++)
@@ -260,6 +283,8 @@ static void screen_test_pattern(int32_t width, int32_t height, uint16_t *dst)
 }
 #endif
 
+/* 24 bpp pixels (red, green, blue bytes) to what the panel takes: RGB565, or BGR565 while it runs in
+   BGR order (PSXE_SCREEN_BGR, see osd.h) */
 static void screen_repack_rgb24(const uint8_t *src, int32_t width, int32_t height, int32_t row_step,
                                 uint16_t *dst)
 {
@@ -284,12 +309,21 @@ static void screen_repack_rgb24(const uint8_t *src, int32_t width, int32_t heigh
 
             __builtin_memcpy(&p, s, 4);
 
+#if PSXE_SCREEN_BGR
+            d[x] = (uint16_t)(((p >> 8) & 0xf800u) | ((p & 0xfc00u) >> 5) | ((p & 0xf8u) >> 3));
+#else
             d[x] = (uint16_t)(((p & 0xf8u) << 8) | ((p & 0xfc00u) >> 5) | ((p & 0xf80000u) >> 19));
+#endif
         }
 
         for (; x < width; x++, s += 3)
+#if PSXE_SCREEN_BGR
+            d[x] = (uint16_t)(((uint32_t)(s[2] & 0xf8u) << 8) | ((uint32_t)(s[1] & 0xfcu) << 3) |
+                              ((uint32_t)s[0] >> 3));
+#else
             d[x] = (uint16_t)(((uint32_t)(s[0] & 0xf8u) << 8) | ((uint32_t)(s[1] & 0xfcu) << 3) |
                               ((uint32_t)s[2] >> 3));
+#endif
 
         screen_row_out(dst + (uint32_t)y * (uint32_t)width, width);
     }
@@ -382,6 +416,13 @@ void psxe_screen_init(psxe_screen_t *screen, psx_t *psx)
     // Initialize MCU display system
     DEMO_InitLcd();
 
+#if PSXE_SCREEN_BGR
+    /* from here on the panel takes its pixels in BGR order (osd.h): the scaler reads 15 bpp VRAM
+       as ARGB1555, blue where it expects red, and the LCDIF puts the two back */
+    LCDIF->CTRL2 = (LCDIF->CTRL2 & ~(LCDIF_CTRL2_EVEN_LINE_PATTERN_MASK | LCDIF_CTRL2_ODD_LINE_PATTERN_MASK)) |
+                   LCDIF_CTRL2_EVEN_LINE_PATTERN(5u) | LCDIF_CTRL2_ODD_LINE_PATTERN(5u);
+#endif
+
     // Initialize PXP hardware scaling
     psxe_screen_init_pxp();
 
@@ -423,7 +464,7 @@ void psxe_screen_reload(psxe_screen_t *screen)
     screen->backbuffer = (void *)DEMO_GetCurrentFrameBuffer();
 }
 
-int32_t psxe_screen_is_open(psxe_screen_t *screen)
+int32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psxe_screen_is_open(psxe_screen_t *screen)
 {
     return screen->open;
 }
@@ -545,10 +586,14 @@ static void psxe_screen_pace(void)
 
             Only so far: more than a few frames behind means the emulation simply
             is slower than real time here, and a schedule kept through that would
-            be a debt the next light scene pays back by running fast.
+            be a debt the next light scene pays back by running fast. The debt
+            is capped at four frames, not written off: written off, the very next
+            light vblank was early against the fresh schedule and waited - in a
+            scene too slow already, some 3 to 5 % of it (measured in Disney's
+            Atlantis), and the sound ran dry that much more often.
         */
         if ((uint32_t)late > (4u * period))
-            due = now;
+            due = now - (4u * period);
 
         return;
     }
@@ -979,6 +1024,7 @@ static void psxe_screen_poll_pxp(void)
     PXP_ClearStatusFlags(APP_PXP, kPXP_CompleteFlag);
 
     s_pxp_busy = 0;
+    g_psx_vram_reader = 0u;
 
     DEMO_SwapBuffers();
 }
@@ -986,6 +1032,8 @@ static void psxe_screen_poll_pxp(void)
 /* Present the frame PXP was working on (started during the previous update) */
 static void psxe_screen_finish_pxp(void)
 {
+    g_psx_vram_reader = 0u;
+
     if (!s_pxp_busy)
         return;
 
@@ -1003,6 +1051,20 @@ static void psxe_screen_finish_pxp(void)
     s_pxp_busy = 0;
 
     DEMO_SwapBuffers();
+}
+
+/* The GPU is about to write rows the scaler reads (gpu.c, g_psx_vram_reader): the frame is finished and
+   shown first. How often, and the core cycles it took, for a look through the probe. */
+volatile uint32_t __attribute__((used)) g_vram_reader_waits, g_vram_reader_wait_cyc;
+
+void psx_platform_vram_reader_wait(void)
+{
+    const uint32_t t0 = DWT->CYCCNT;
+
+    psxe_screen_finish_pxp();
+
+    g_vram_reader_waits++;
+    g_vram_reader_wait_cyc += DWT->CYCCNT - t0;
 }
 
 #if PSXE_GPU_REMOTE
@@ -1212,12 +1274,20 @@ static void psxe_screen_update_impl(psxe_screen_t *screen, uint32_t dirty_y0, ui
     }
 
     /*
-        VRAM is in the native PSX pixel format, which the scaler cannot read, so
-        the visible area is repacked into RGB565 first - from 15 bpp pixels
-        normally, from packed 24 bpp ones during full motion video.
+        A 15 bpp picture goes to the scaler straight out of VRAM: the PSX pixel
+        (mask, blue, green, red) read as ARGB1555 has blue where the scaler
+        expects red, and the panel, running BGR (PSXE_SCREEN_BGR), swaps them
+        back. Before, every frame was repacked into RGB565 in g_rgb24_stage -
+        read out of SDRAM and written back by the core, some 6 % of it in
+        Atlantis. A packed 24 bpp picture (full motion video) is still
+        repacked, the scaler has no such format.
     */
     const uint16_t *ps_buffer = src;
     uint32_t ps_pitch = PSX_GPU_FB_STRIDE;
+    uint32_t vram_rows = 0u; /* the rows of VRAM the scaler reads itself (g_psx_vram_reader) */
+    static int stage_valid = 0; /* g_rgb24_stage holds the picture made last time */
+
+    g_pxp_ps_config.pixelFormat = APP_PXP_PS_FORMAT;
 
 /* Set to 0 to feed 15 bpp frames to the scaler straight out of VRAM, as before
    the native format change. 24 bpp always needs the repack. */
@@ -1227,8 +1297,28 @@ static void psxe_screen_update_impl(psxe_screen_t *screen, uint32_t dirty_y0, ui
 
     const int32_t is_24bpp = psx_get_display_format(screen->psx) && !screen->debug_mode;
 
-    if (((src_width * src_height) <= SCREEN_STAGE_MAX_PIXELS) &&
-        (is_24bpp || PSXE_SCREEN_USE_STAGING))
+    if (PSXE_SCREEN_BGR && !is_24bpp && !PSXE_SCREEN_TEST_PATTERN)
+    {
+        /* every other row of a 480 line picture, as the repack below does it */
+        const int32_t row_step = (src_height > 272) ? 2 : 1;
+
+        src_height /= row_step;
+        ps_pitch = (uint32_t)row_step * PSX_GPU_FB_STRIDE;
+        g_pxp_ps_config.pixelFormat = kPXP_PsPixelFormatARGB1555;
+        stage_valid = 0;
+
+        {
+            const uint32_t y0 = screen->debug_mode ? 0u : (uint32_t)screen->psx->gpu->disp_y;
+            uint32_t y1 = screen->debug_mode ? 512u : (y0 + (uint32_t)(src_height * row_step));
+
+            if (y1 > 512u)
+                y1 = 512u;
+
+            vram_rows = y0 | (y1 << 16);
+        }
+    }
+    else if (((src_width * src_height) <= SCREEN_STAGE_MAX_PIXELS) &&
+             (is_24bpp || PSXE_SCREEN_USE_STAGING || PSXE_SCREEN_TEST_PATTERN))
     {
 #if PSXE_SCREEN_TEST_PATTERN
         screen_test_pattern(src_width, src_height, g_rgb24_stage);
@@ -1262,7 +1352,7 @@ static void psxe_screen_update_impl(psxe_screen_t *screen, uint32_t dirty_y0, ui
         const uint32_t win_x = screen->psx->gpu->disp_x;
         const uint32_t win_y = screen->psx->gpu->disp_y;
 
-        if (!screen->debug_mode && (staged_x == win_x) && (staged_y == win_y) && (staged_w == src_width) &&
+        if (!screen->debug_mode && stage_valid && (staged_x == win_x) && (staged_y == win_y) && (staged_w == src_width) &&
             (staged_h == src_height) && (staged_24 == is_24bpp) && (staged_step == row_step) &&
             (dirty_y0 < dirty_y1))
         {
@@ -1282,6 +1372,7 @@ static void psxe_screen_update_impl(psxe_screen_t *screen, uint32_t dirty_y0, ui
         staged_h = src_height;
         staged_24 = is_24bpp;
         staged_step = row_step;
+        stage_valid = 1;
 
 #if PSXE_AUTOTEST
         g_diag_stage_rows += (uint32_t)(row1 - row0);
@@ -1379,6 +1470,9 @@ static void psxe_screen_update_impl(psxe_screen_t *screen, uint32_t dirty_y0, ui
     PXP_SetOutputBufferConfig(APP_PXP, &g_pxp_output_config);
 
     PXP_Start(APP_PXP);
+
+    /* from here on until the frame is finished, the GPU waits before it writes these rows */
+    g_psx_vram_reader = vram_rows;
 
 #if PSXE_AUTOTEST
     g_diag_pxp_start = DWT->CYCCNT;

@@ -34,7 +34,7 @@ void psx_ic_init(psx_ic_t *ic, psx_cpu_t *cpu)
     ic->cpu = cpu;
 }
 
-uint32_t psx_ic_read32(psx_ic_t *ic, uint32_t offset)
+uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_ic_read32(psx_ic_t *ic, uint32_t offset)
 {
     PSX_IO_TRACE(0xF0000020u + offset, (offset == 0) ? ic->stat : ic->mask, 0, 32);
 
@@ -51,7 +51,7 @@ uint32_t psx_ic_read32(psx_ic_t *ic, uint32_t offset)
     return 0x0;
 }
 
-uint16_t psx_ic_read16(psx_ic_t *ic, uint32_t offset)
+uint16_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_ic_read16(psx_ic_t *ic, uint32_t offset)
 {
     uint16_t result;
     switch (offset)
@@ -103,7 +103,7 @@ uint8_t psx_ic_read8(psx_ic_t *ic, uint32_t offset)
     return 0x0;
 }
 
-void psx_ic_write32(psx_ic_t *ic, uint32_t offset, uint32_t value)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_ic_write32(psx_ic_t *ic, uint32_t offset, uint32_t value)
 {
     PSX_IO_TRACE(0xF0000000u + offset, value, 1, 32);
 
@@ -134,7 +134,7 @@ void psx_ic_write32(psx_ic_t *ic, uint32_t offset, uint32_t value)
     }
 }
 
-void psx_ic_write16(psx_ic_t *ic, uint32_t offset, uint16_t value)
+void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_ic_write16(psx_ic_t *ic, uint32_t offset, uint16_t value)
 {
     log_debug("IC 16-bit write at offset %08x: %04x", offset, value);
     switch (offset)

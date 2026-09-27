@@ -232,6 +232,13 @@ struct psx_gpu_t
     int32_t draw_in_window; /* the drawing area lies wholly inside the display window */
     int32_t skip_prims;   /* both: polygons, rectangles and lines are left out */
 
+    /* The last solid rectangle fill, [fill_x0, fill_x1) x [fill_y0, fill_y1) in the rows skip_rows
+       allowed, while nothing else has written VRAM since (fill_key 0: none, see gpu_render_rect):
+       a fill inside it in the same colour and rows changes no pixel and is left out - Atlantis
+       clears its picture and then a band of it again, every frame. */
+    uint32_t fill_key;
+    int32_t fill_x0, fill_y0, fill_x1, fill_y1;
+
     /*
         The share of the drawing area this board rasterizes, when two boards
         divide the work: band_share is 0 to 256 (256 = all of it) and band_top
@@ -278,6 +285,11 @@ void psx_gpu_set_field(psx_gpu_t *, uint32_t field);
 /* 1: the frontend shows only the field of a 480 line picture that starts at
    disp_y (see one_field in psx_gpu_t), 0: it shows every row */
 void psx_gpu_set_one_field(psx_gpu_t *, int32_t on);
+
+/* rows [y0, y1) of VRAM a frontend's scaler is still reading, as y0 | y1 << 16 (0: none), and its wait for
+   it to finish - the GPU calls that before it writes those rows (gpu.c) */
+extern volatile uint32_t g_psx_vram_reader;
+void psx_platform_vram_reader_wait(void);
 
 /* the share of the drawing area this board draws (see band_share in psx_gpu_t) */
 void psx_gpu_set_band(psx_gpu_t *, int32_t share, int32_t top);

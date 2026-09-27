@@ -575,6 +575,25 @@ static inline int psx_jit_writes_reg(uint32_t op, uint32_t r)
     return 1;
 }
 
+/*
+    Whether `op`, in the load delay slot of a load into `rt`, is an MFC2 / CFC2 into
+    `rt`: those apply a pending load before anything else (DO_PENDING_LOAD) and read
+    no general register, so the first value may as well be written at once and the
+    MFC2 translated as usual. Atlantis does "LW t6 ; MFC2 t6" in an inner loop, and
+    leaving the load pending sent the MFC2 - and, it being a load itself, the
+    instruction after it - through the interpreter, some 25 000 instructions a second.
+
+    Not so a load after a load: the interpreter drops the first value (psx_cpu_i_lh
+    & co. replace a pending load of the same register), and the instruction after
+    the second load still sees what the register held before the first.
+*/
+static inline int psx_jit_applies_pending(uint32_t op, uint32_t rt)
+{
+    return (PSX_OP(op) == 0x12u) && !(op & 0x02000000u) && ((PSX_RS(op) == 0x00u) || (PSX_RS(op) == 0x02u)) &&
+           (PSX_RT(op) == rt);
+}
+
+
 /* Forgets what is known about every register this instruction may write */
 static inline void psx_jit_kill_written(psx_jit_ctx_t *c, uint32_t op)
 {
@@ -1223,7 +1242,8 @@ static inline int psx_jit_translate_cop2(psx_jit_ctx_t *c, uint32_t op)
             else if (g->rd == PSX_GTE_RD_U16)
                 psx_emit_ldrh_imm(e, PSX_R0, PSX_JIT_CPU, g->off);
 
-            if (psx_jit_reads_reg(c->next_op, rt) || psx_jit_writes_reg(c->next_op, rt))
+            if (psx_jit_reads_reg(c->next_op, rt) ||
+                (psx_jit_writes_reg(c->next_op, rt) && !psx_jit_applies_pending(c->next_op, rt)))
             {
                 psx_emit_mov_imm8(e, PSX_R1, rt);
                 psx_emit_strd_imm(e, PSX_R1, PSX_R0, PSX_JIT_CPU, PSX_JIT_OFF_LOAD_D);
@@ -1713,7 +1733,8 @@ static inline int psx_jit_translate_mem(psx_jit_ctx_t *c, uint32_t op)
     {
         const uint32_t rt = PSX_RT(op);
 
-        if (psx_jit_reads_reg(c->next_op, rt) || psx_jit_writes_reg(c->next_op, rt))
+        if (psx_jit_reads_reg(c->next_op, rt) ||
+            (psx_jit_writes_reg(c->next_op, rt) && !psx_jit_applies_pending(c->next_op, rt)))
         {
             flags |= PSX_JIT_MEM_PENDING;
             c->force_next = 1;

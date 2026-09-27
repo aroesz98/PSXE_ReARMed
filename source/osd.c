@@ -9,7 +9,7 @@
 
 #define OSD_CHARS 16
 
-static char s_text[OSD_LINES][OSD_CHARS];
+static char __attribute__((section(".bss.$BOARD_SDRAM"))) s_text[OSD_LINES][OSD_CHARS]; /* not ITCM: the recompiler's hot tier wants that */
 static uint16_t s_color[OSD_LINES];
 static int s_changed = 1;
 
@@ -54,7 +54,7 @@ const uint16_t *osd_buffer(void)
     for (int i = 0; i < OSD_LINES; i++)
         if (s_text[i][0])
             ui_text(&ui_font_small, 3, 6 + ui_font_small.ascent + (i * ui_font_small.line_height), OSD_W - 4,
-                    s_text[i], s_color[i]);
+                    s_text[i], OSD_PANEL_COLOR(s_color[i]));
 
     return s_buf;
 }

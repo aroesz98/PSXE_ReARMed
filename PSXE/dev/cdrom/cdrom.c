@@ -636,6 +636,14 @@ void cdrom_handle_read(psx_cdrom_t *cdrom)
 
 void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cdrom_update(psx_cdrom_t *cdrom, int32_t cycles)
 {
+    if (cdrom->read_resume > 0)
+    {
+        cdrom->read_resume -= cycles;
+
+        if (cdrom->read_resume < 1)
+            cdrom->read_resume = 1;
+    }
+
     if (cdrom->delay > 0)
     {
         cdrom->delay -= cycles;
@@ -674,15 +682,18 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cdrom_update(psx_cdrom_t
         }
 
         // Switching to read mode after executing a command
-        // has a 500ms penalty
+        // has a 500ms penalty - but not after a status command, which
+        // the drive answers while it reads on (cdrom_write_cmd)
         if (cdrom->state == CD_STATE_READ)
         {
             cdrom_process_setloc(cdrom);
 
             cdrom->state = CD_STATE_READ;
             cdrom->prev_state = CD_STATE_READ;
-            cdrom->delay = CD_DELAY_ONGOING_READ;
+            cdrom->delay = (cdrom->read_resume > 0) ? cdrom->read_resume : CD_DELAY_ONGOING_READ;
         }
+
+        cdrom->read_resume = 0;
     }
     break;
 
@@ -691,15 +702,17 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_cdrom_update(psx_cdrom_t
         cdrom_cmd_table[cdrom->pending_command](cdrom);
 
         // Switching to read mode after executing a command
-        // has a 500ms penalty
+        // has a 500ms penalty (see above)
         if (cdrom->state == CD_STATE_READ)
         {
             cdrom_process_setloc(cdrom);
 
             cdrom->state = CD_STATE_READ;
             cdrom->prev_state = CD_STATE_READ;
-            cdrom->delay = CD_DELAY_ONGOING_READ;
+            cdrom->delay = (cdrom->read_resume > 0) ? cdrom->read_resume : CD_DELAY_ONGOING_READ;
         }
+
+        cdrom->read_resume = 0;
     }
     break;
 
@@ -833,8 +846,43 @@ void cdrom_write_stat(psx_cdrom_t *cdrom, uint8_t data)
     cdrom->index = data & 3;
 }
 
+/*
+    Commands that only report: the drive answers them without stopping what it
+    is doing, so a read goes on at the disc's pace while they are answered.
+    Anything else (a new read, a seek, a pause, SetLoc, SetMode, ...) is still
+    followed by the restart below (CD_DELAY_ONGOING_READ).
+
+    Every command used to be: Atlantis asks for the position (GetlocP) in a
+    loop while it streams, faster than the 10 ms the drive then waited, so the
+    read never got to its next sector - its CD library timed out, retried, and
+    the game stood still while its music played on.
+*/
+static int cdrom_cmd_is_status(uint8_t cmd)
+{
+    switch (cmd)
+    {
+    case CDL_GETSTAT:
+    case CDL_MUTE:
+    case CDL_DEMUTE:
+    case CDL_SETFILTER:
+    case CDL_GETLOCL:
+    case CDL_GETLOCP:
+    case CDL_GETTN:
+    case CDL_GETTD:
+        return 1;
+    }
+
+    return 0;
+}
+
 void cdrom_write_cmd(psx_cdrom_t *cdrom, uint8_t data)
 {
+    if ((cdrom->state == CD_STATE_READ) && cdrom_cmd_is_status(data))
+        cdrom->read_resume = (cdrom->delay > 0) ? cdrom->delay : 1;
+    else if (!(((cdrom->state == CD_STATE_TX_RESP1) || (cdrom->state == CD_STATE_TX_RESP2)) &&
+               cdrom_cmd_is_status(data)))
+        cdrom->read_resume = 0;
+
     cdrom->prev_state = cdrom->state;
     cdrom->state = CD_STATE_TX_RESP1;
 

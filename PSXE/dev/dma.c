@@ -63,7 +63,7 @@ void psx_dma_init(psx_dma_t *dma, psx_bus_t *bus, psx_ic_t *ic)
     dma->dpcr = 0x07654321;
 }
 
-uint32_t psx_dma_read32(psx_dma_t *dma, uint32_t offset)
+uint32_t __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_read32(psx_dma_t *dma, uint32_t offset)
 {
     if (offset < 0x70)
     {
@@ -477,6 +477,13 @@ void __attribute__((section(".ramfunc.$SRAM_ITC"))) psx_dma_do_gpu_linked(psx_dm
 
     while (timeout--)
     {
+        /* The next packet's header, on its way while this packet is drawn: the list
+           lies scattered over guest RAM (SDRAM), and the walk used to wait for a
+           cache miss at every header. Not for an empty node (an ordering table
+           entry): nothing to overlap the fill with. */
+        if (size)
+            __builtin_prefetch(dma->bus->ram->buf + (hdr & 0x1ffffcu));
+
         while (size--)
         {
             addr = (addr + (CHCR_STEP(gpu) ? -4 : 4)) & 0x1ffffc;
